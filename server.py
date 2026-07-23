@@ -31,7 +31,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 # --- the one integration point -------------------------------------------
-from launch_agent import build_agent
+from launch_agent import build_agent, _require_api_key
+_require_api_key()
 agent = build_agent()
 # -------------------------------------------------------------------------
 
