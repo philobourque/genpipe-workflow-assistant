@@ -1,0 +1,17 @@
+# Core agent stack. biomni and langgraph are pinned exactly: genpipe_agent.py
+# reaches into LangGraph's snapshot/interrupt internals (see the docstring in
+# GenpipeA1._gate_status), which are not a stable public API across versions.
+# Bumping langgraph or biomni is a "re-verify the gate still pauses/resumes
+# correctly" event, not a routine upgrade -- run both test suites in tests/
+# after any change here.
+biomni==0.0.8
+langgraph==0.3.18
+langgraph-checkpoint-sqlite==2.0.11
+langchain-core==0.3.86
+langchain-anthropic==1.4.7
+python-dotenv==1.2.2
+
+# Optional web UI (server.py + index.html). Skip these two if you only use
+# the CLI (start_agent.sh).
+fastapi==0.138.2
+uvicorn==0.49.0

@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+*.swp
+*.swo
+*.swn
+*.swk
+*.swl
+.viminfo
+
+# Runtime artifacts the agent itself creates
+genpipe_checkpoints.sqlite
+job_output/
+runs.tsv
+biomni_data/
+
+# venv
+venv/
+.venv/
+biomni-venv/
