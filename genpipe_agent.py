@@ -29,13 +29,25 @@ Driving the gated graph (in this file):
 
 Monitoring a submitted run:
   On approval, resume() records the run's thread_id against the job list file
-  GenPipes just wrote (runs.tsv). check(thread_id) resolves that link and runs
+  GenPipes just wrote (runs.jsonl). check(thread_id) resolves that link and runs
   GenPipes' log_report to report the run's progress.
+
+Run tracking (runs.jsonl):
+  One JSON record per submission: name, thread_id (None for a manually tracked
+  run), job_list path, submitted_at, source ("agent" or "manual"), and a "gone"
+  flag. submissions() shows only live records, checking each job_list path on
+  disk first and quietly dropping ones that no longer exist -- no message, they
+  just stop appearing. Nothing is ever deleted, though: history() shows every
+  record, live or gone, so a run can still be found after Rorqual's copy of its
+  artifacts is cleaned up. track(name, job_list_path) adds a record for a run
+  launched outside the agent, with no thread_id behind it.
 """
 import os
 import re
 import sqlite3
 import uuid
+import json
+import datetime
 import display
 import time
 
@@ -143,30 +155,108 @@ class GenpipeA1(A1):
 
         self.app = workflow.compile(checkpointer=self.checkpointer)
     
-    def submissions(self):
-        """List every recorded submission: the run's name, and the job list it
-        points at.
+    # --------------------------------------------------------------------- #
+    #  Run tracking store: one JSON record per submission, in runs.jsonl.   #
+    #  A record carries a "gone" flag rather than ever being deleted, so a  #
+    #  submission whose job_list file has vanished from Rorqual (scratch    #
+    #  purge, manual cleanup) can drop out of submissions() silently while  #
+    #  still being visible through history().                              #
+    # --------------------------------------------------------------------- #
+    def _runs_path(self):
+        return os.path.join(self.path, "runs.jsonl")
 
-        Reads runs.tsv, which _record_submission appends to on each approval. Only
-        approved submissions appear here. A run that was rejected, or that only
-        generated a script, never produced a job list and so was never recorded --
-        this is a record of pipelines on the cluster, not of conversations with the
-        agent. Paused conversations live in the checkpoint, which is a separate
-        store answering a different question."""
-        record = os.path.join(self.path, "runs.tsv")
-        if not os.path.exists(record):
-            print("\n  No submissions recorded yet.\n")
+    def _load_runs(self):
+        path = self._runs_path()
+        if not os.path.exists(path):
+            return []
+        records = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
+    def _save_runs(self, records):
+        # Write to a temp file and rename over the original so a crash mid-write
+        # never leaves runs.jsonl half-written.
+        path = self._runs_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        os.replace(tmp, path)
+
+    def _add_run(self, name, job_list, thread_id=None, source="agent"):
+        records = self._load_runs()
+        records.append({
+            "name": str(name),
+            "thread_id": thread_id,
+            "job_list": job_list,
+            "submitted_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "source": source,
+            "gone": False,
+        })
+        self._save_runs(records)
+
+    def _prune_runs(self, records):
+        """Mark records whose job_list file no longer exists as gone, in place.
+        A record already marked gone is not re-checked -- once the file is gone
+        it stays gone, so a transient filesystem hiccup can't flicker it back to
+        live. Returns True if anything changed, so the caller knows to save."""
+        changed = False
+        for r in records:
+            if not r["gone"] and not os.path.exists(r["job_list"]):
+                r["gone"] = True
+                r["gone_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                changed = True
+        return changed
+
+    def track(self, name, job_list_path):
+        """Register a run launched outside the agent -- no thread_id, no prior
+        conversation -- so check()/submissions()/history() can find it by name
+        just like an agent-launched run."""
+        job_list_path = os.path.abspath(job_list_path)
+        if not os.path.exists(job_list_path):
+            print(f"\n  '{job_list_path}' does not exist -- nothing tracked.\n")
             return
+        self._add_run(name, job_list_path, thread_id=None, source="manual")
+        print(f"\n  Tracking '{name}' -> {job_list_path}\n")
+
+    def submissions(self):
+        """List every LIVE recorded submission: the run's name, and the job list
+        it points at. A record whose job_list file no longer exists is pruned
+        first, silently -- see history() to find it anyway.
+
+        Only approved submissions and track()'d runs appear here. A run that
+        was rejected, or that only generated a script, never produced a job
+        list and so was never recorded -- this is a record of pipelines on the
+        cluster, not of conversations with the agent. Paused conversations live
+        in the checkpoint, which is a separate store answering a different
+        question."""
+        records = self._load_runs()
+        if self._prune_runs(records):
+            self._save_runs(records)
         seen = {}
-        for line in open(record):
-            if "\t" not in line:
-                continue
-            name, path = line.rstrip("\n").split("\t", 1)
-            seen[name] = path          # last wins, so a resubmitted name shows its newest
+        for r in records:
+            if not r["gone"]:
+                seen[r["name"]] = r["job_list"]   # last live match wins per name
         if not seen:
             print("\n  No submissions recorded yet.\n")
             return
         display.submissions(seen)
+
+    def history(self):
+        """List every recorded run, live and gone, newest first. Unlike
+        submissions(), nothing is hidden -- this is how you find a run again
+        after its job_list file has been cleaned up from Rorqual."""
+        records = self._load_runs()
+        if self._prune_runs(records):
+            self._save_runs(records)
+        if not records:
+            print("\n  No runs recorded yet.\n")
+            return
+        display.history(records)
 # --------------------------------------------------------------------- #
     #  Driving layer: gated replacements for A1.go that survive the pause.   #
     # --------------------------------------------------------------------- #
@@ -403,22 +493,19 @@ class GenpipeA1(A1):
             return          # zero jobs created -> no list written -> record nothing
 
         newest = max(lists, key=os.path.getmtime)
-        record = os.path.join(self.path, "runs.tsv")
-        with open(record, "a") as f:
-            f.write(f"{thread_id}\t{newest}\n")
+        self._add_run(thread_id, newest, thread_id=str(thread_id), source="agent")
 
     def job_list_for(self, thread_id):
-        """Look up the job list file recorded for a run's thread_id. Returns the
-        path, or None if this run has no recorded submission."""
-        record = os.path.join(self.path, "runs.tsv")
-        if not os.path.exists(record):
-            return None
+        """Look up the job list file recorded for a name (a thread_id, or a name
+        given to track()). Returns the path, or None if there's no live record --
+        a gone record is never returned, since there is nothing left to check."""
+        records = self._load_runs()
+        if self._prune_runs(records):
+            self._save_runs(records)
         found = None
-        # Keep the LAST match, so a resubmitted thread_id returns its newest run.
-        for line in open(record):
-            name, path = line.rstrip("\n").split("\t", 1)
-            if name == str(thread_id):
-                found = path
+        for r in records:
+            if r["name"] == str(thread_id) and not r["gone"]:
+                found = r["job_list"]        # last live match wins
         return found
 
     def check(self, thread_id):

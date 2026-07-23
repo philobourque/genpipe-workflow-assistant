@@ -30,8 +30,8 @@ teaches the model GenPipes' invocation shape, config layering, and file formats.
 ## Setup
 
 ```bash
-git clone https://github.com/philobourque/genpipe-prototype
-cd genpipe-prototype
+git clone https://github.com/philobourque/genpipe-workflow-assistant
+cd genpipe-workflow-assistant
 
 module load python/3.12.4      # or whatever gives you Python 3.12+ on your cluster
 python -m venv ~/scratch/biomni-venv
@@ -60,13 +60,22 @@ agent.resume("patient-42", approved=True)
 agent.resume("patient-42", approved=False, feedback="use steps 6-12 instead")
 agent.check("patient-42")
 agent.submissions()
+agent.history()
+agent.track("some-other-run", "/path/to/Pipeline.protocol.job_list.TIMESTAMP")
 ```
 
 Name every run (`thread_id`). The name is how you approve it and how you check on it later — runs
 can pause for approval and be resumed in a completely separate session, and submitted jobs
 obviously outlive the conversation.
 
-By default the agent's working directory (checkpoint database, `runs.tsv`, Biomni's own data
+`submissions()` lists every approved run whose job list file is still on disk. If that file has
+since been removed from Rorqual (a scratch purge, manual cleanup), the run quietly drops out of
+`submissions()` — nothing is deleted, though; `history()` still shows it, marked `gone`.
+`track(name, job_list_path)` registers a run you launched outside the agent entirely, so
+`check()`/`submissions()`/`history()` can find it by name too, with no `thread_id` or prior
+conversation required.
+
+By default the agent's working directory (checkpoint database, `runs.jsonl`, Biomni's own data
 folder) is `~/scratch`. Override with `GENPIPE_AGENT_WORKDIR` if that's not the right place on your
 cluster.
 

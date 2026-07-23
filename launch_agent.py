@@ -8,7 +8,7 @@ from genpipe_agent import GenpipeA1
 HERE = Path(__file__).resolve().parent
 GRAMMAR_PATH = HERE / "genpipes.md"
 
-# Working directory for the agent (checkpoint db, biomni_data/, runs.tsv, ...).
+# Working directory for the agent (checkpoint db, biomni_data/, runs.jsonl, ...).
 # Override with GENPIPE_AGENT_WORKDIR if ~/scratch isn't the right place on your
 # cluster; defaults to ~/scratch since that's writable and persistent on DRAC.
 DEFAULT_WORKDIR = os.environ.get("GENPIPE_AGENT_WORKDIR", os.path.expanduser("~/scratch"))

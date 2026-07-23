@@ -80,6 +80,9 @@ def banner():
           f"approved={AMBER}False{RESET}, feedback={GREEN}\"...\"{RESET})")
     print(f"  {BOLD}progress{RESET}   agent.check({GREEN}\"name-this-run\"{RESET})")
     print(f"  {BOLD}list{RESET}       agent.submissions()")
+    print(f"  {BOLD}history{RESET}    agent.history()")
+    print(f"  {BOLD}track{RESET}      agent.track({GREEN}\"name\"{RESET}, "
+          f"{GREEN}\"path/to/job_list\"{RESET})")
     print()
     print(f"  {GREY}Name each run. The name is how you approve it, and how you check{RESET}")
     print(f"  {GREY}on it days later.{RESET}")
@@ -382,4 +385,19 @@ def submissions(runs):
         print(f"  {DIM}\u258c   {os.path.basename(path)}{RESET}")
     print(f"  {DIM}\u258c{RESET}")
     print(f"  {DIM}\u258c   agent.check(\"<name>\") for progress{RESET}")
+    print()
+
+
+def history(records):
+    """List every recorded run, live and gone, newest first. Unlike
+    submissions(), a gone entry is shown too -- marked as such -- so a run can
+    still be found after its job_list file has been cleaned up from Rorqual."""
+    print()
+    for r in sorted(records, key=lambda r: r.get("submitted_at", ""), reverse=True):
+        tag = f"{DIM}gone{RESET}" if r.get("gone") else f"{GREEN}live{RESET}"
+        print(f"  {DIM}\u258c{RESET} {BOLD}{r['name']}{RESET}  {DIM}\u00b7{RESET}  {tag}"
+              f"  {DIM}\u00b7{RESET}  {DIM}{r.get('source', 'agent')}{RESET}")
+        print(f"  {DIM}\u258c   {os.path.basename(r['job_list'])}{RESET}")
+        print(f"  {DIM}\u258c   {DIM}{r.get('submitted_at', '')}{RESET}")
+    print(f"  {DIM}\u258c{RESET}")
     print()
