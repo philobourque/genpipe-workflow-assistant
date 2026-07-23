@@ -16,10 +16,13 @@ __pycache__/
 # Runtime artifacts the agent itself creates
 genpipe_checkpoints.sqlite
 job_output/
-runs.tsv
+runs.jsonl
 biomni_data/
 
 # venv
 venv/
 .venv/
 biomni-venv/
+
+# Working notes, not part of the repo
+TODO.md
