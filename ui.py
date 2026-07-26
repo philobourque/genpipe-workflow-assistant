@@ -480,6 +480,168 @@ class Prompt:
         return line
 
 
+_ELSEWHERE = object()          # sentinel for the free-text row
+
+
+def choose(question, options, note="", free_text=True, free_label="Something else"):
+    """A numbered choice panel. Returns the chosen value, or None if cancelled.
+
+    `options` are slots.Option-shaped: anything with .value, .label and
+    .description. When free_text is on, a final row opens an editable prompt, so
+    the panel narrows the answer without ever being a dead end -- the thing that
+    makes a menu feel helpful rather than like a form.
+
+    Digits select immediately when there are nine or fewer rows, because that is
+    the whole appeal of a numbered list. Past nine the digits become ambiguous
+    (does "1" mean 1 or the start of 12?), so they move the highlight and enter
+    confirms. The hint line says which mode is in force rather than leaving it
+    to be discovered.
+
+    Falls back to a printed list and input() with no terminal, so the panel
+    works over a pipe and in tests.
+    """
+    rows = list(options)
+    if free_text:
+        rows = rows + [_FreeRow(free_label)]
+    if not rows:
+        return None
+
+    quick = len(rows) <= 9
+
+    if not sys.stdin.isatty():
+        return _choose_headless(question, rows, note, quick)
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    cursor = 0
+    painted = 0
+
+    def block():
+        out = []
+        out.append(f"  {display.GREEN}▌{display.RESET} "
+                   f"{display.BOLD}{question}{display.RESET}")
+        out.append("")
+        for i, row in enumerate(rows):
+            here = i == cursor
+            mark = f"{display.GREEN}❯{display.RESET}" if here else " "
+            num = f"{display.DIM}{i + 1:>2}{display.RESET}"
+            label = (f"{display.BOLD}{display.WHITE}{row.label}{display.RESET}"
+                     if here else row.label)
+            line = f"  {mark} {num}  {label}"
+            if row.description:
+                line += f"   {display.DIM}{row.description}{display.RESET}"
+            out.append(line)
+        out.append("")
+        if note:
+            out.append(f"     {display.DIM}{note}{display.RESET}")
+        keys = ("1-9 to pick" if quick else "digits move, enter picks")
+        out.append(f"     {display.DIM}↑↓ · {keys} · esc cancels{display.RESET}")
+        return out
+
+    def paint():
+        nonlocal painted
+        if painted:
+            sys.stdout.write(f"\033[{painted}A")
+        lines = block()
+        for line in lines:
+            sys.stdout.write(f"\r{line}\033[K\r\n")
+        painted = len(lines)
+        sys.stdout.flush()
+
+    chosen = None
+    try:
+        tty.setraw(fd)
+        print()
+        paint()
+        reader = _Reader(fd)
+        while True:
+            key = reader.key()
+            if isinstance(key, tuple):            # a paste; ignore in a menu
+                continue
+            if key in ("\r", "\n"):
+                chosen = rows[cursor]
+                break
+            if key == "\x03":
+                raise KeyboardInterrupt
+            # _Reader.key() names a bare Escape "escape" rather than returning
+            # the raw byte, so matching on "\x1b" here would never fire and the
+            # panel would be inescapable.
+            if key in ("escape", "\x1b", "\x04"):
+                break
+            if key == "up":
+                cursor = (cursor - 1) % len(rows)
+            elif key == "down":
+                cursor = (cursor + 1) % len(rows)
+            elif key in ("home", "\x01"):
+                cursor = 0
+            elif key in ("end", "\x05"):
+                cursor = len(rows) - 1
+            elif key.isdigit() and key != "0":
+                index = int(key) - 1
+                if index < len(rows):
+                    cursor = index
+                    if quick:
+                        chosen = rows[cursor]
+                        break
+            paint()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    if chosen is None:
+        print()
+        return None
+    if chosen.value is _ELSEWHERE:
+        return ask(question) or None
+    return chosen.value
+
+
+class _FreeRow:
+    """The 'something else' row. Shaped like slots.Option so the panel does not
+    need a special case for it until the moment it is chosen."""
+
+    __slots__ = ("value", "label", "description")
+
+    def __init__(self, label):
+        self.value = _ELSEWHERE
+        self.label = label
+        self.description = "type your own"
+
+
+def _choose_headless(question, rows, note, quick):
+    """No terminal: print the list, read a number or free text.
+
+    Deliberately accepts the option *text* as well as its number, so a scripted
+    test reads as what it means -- "somatic_ensemble" rather than "5".
+    """
+    print(f"\n{question}")
+    for i, row in enumerate(rows):
+        tail = f"   {row.description}" if row.description else ""
+        print(f"  {i + 1:>2}  {row.label}{tail}")
+    if note:
+        print(f"      {note}")
+    try:
+        answer = input("choice: ").strip()
+    except EOFError:
+        return None
+    if not answer:
+        return None
+    if answer.isdigit():
+        index = int(answer) - 1
+        if 0 <= index < len(rows):
+            row = rows[index]
+            if row.value is _ELSEWHERE:
+                try:
+                    return input(f"{question} ").strip() or None
+                except EOFError:
+                    return None
+            return row.value
+        return None
+    for row in rows:
+        if row.value is not _ELSEWHERE and str(row.value) == answer:
+            return row.value
+    return answer                        # treat anything else as free text
+
+
 def ask(label, default=""):
     """A short follow-up question, with an editable suggested answer.
 
