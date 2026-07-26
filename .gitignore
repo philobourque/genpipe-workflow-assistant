@@ -1,5 +1,7 @@
-# Secrets
-.env
+# Secrets. .env* rather than .env: a stray .env.bak or .env.local holds a real
+# key just as surely as .env does, and the negation keeps the template tracked.
+.env*
+!.env.example
 
 # Python
 __pycache__/
@@ -18,6 +20,8 @@ genpipe_checkpoints.sqlite
 job_output/
 runs.jsonl
 biomni_data/
+# The generation artifact: whatever a `genpipes ... -g` call wrote last.
+cmd.sh
 
 # venv
 venv/
