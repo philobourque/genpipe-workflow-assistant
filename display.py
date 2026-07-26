@@ -16,11 +16,21 @@ Nothing is hidden. Every part of every message is shown -- the visual hierarchy
 just makes clear what matters most:
 
   GATE      heavy red box. The one moment the run stops and needs a human.
-  SOLUTION  green. Where the model commits to a claim; read it closely.
-  RUN       amber. Code about to hit the machine.
-  OUT       bright label, grey body. The machine talking back -- present, quiet.
-  PLAN      cyan, bold. The model's checklist, ticking over as the run proceeds.
+  ASSISTANT green. Where the agent commits to a claim; read it closely.
+  GENERATE  amber. Writing the pipeline script.        } one <execute> block,
+  SUBMIT    amber. Putting it on the scheduler.        } labelled by what it
+  SCHEDULER amber. Asking Slurm or GenPipes how it is. } is actually doing --
+  CODE      amber. Anything else about to run.         } see _code_label
+  TERMINAL  bright label, grey body. The machine talking back -- present, quiet.
+  answered  one dim line. The receipt for a choice panel.
   note      thin rule, grey. The model's connective prose. Present, but quiet.
+
+Two things are parsed and then not drawn -- a documentation lookup and its output,
+and the model's checklist. See render() for why.
+
+The person's own turns are labelled with their name (see who()), and the agent's
+with ASSISTANT. Two named speakers, which is what a transcript of a conversation
+is -- "YOU" and "SOLUTION" described the two halves of a form.
 
 Labels are always bright; bodies are dimmed only where the content is long and
 secondary (machine output, connective prose). The signal is in the labels.
@@ -28,6 +38,7 @@ secondary (machine output, connective prose). The signal is in the labels.
 
 import getpass
 import os
+import random
 import re
 import shutil
 import textwrap
@@ -88,6 +99,26 @@ def _helix():
             for row in _HELIX]
 
 
+def who():
+    """What to call the person at the keyboard.
+
+    GENPIPE_USER is what they told us to call them (asked for once at first
+    launch, changed with /user, persisted in .env like the API key). The Unix
+    username is the fallback: it is nearly always right and always available, so
+    a fresh install is not addressed as "you" while it waits to be introduced.
+
+    Read from the environment at every call rather than cached, so /user takes
+    effect on the next line of the conversation instead of the next launch.
+    """
+    name = (os.environ.get("GENPIPE_USER") or "").strip()
+    if not name:
+        try:
+            name = os.environ.get("USER") or getpass.getuser()
+        except Exception:              # no passwd entry for this uid
+            name = ""
+    return (name or "you")[:24]
+
+
 def _tilde(path):
     home = os.path.expanduser("~")
     return "~" + path[len(home):] if path.startswith(home) else path
@@ -135,10 +166,10 @@ def _left_column(user, source, model, path):
 
 
 def _right_column(w):
-    arrow = f"{GREY}\u2500\u2500\u25b6{RESET}"
     lines = [""]
     lines.append(f"{BOLD}Getting started{RESET}")
-    lines += _wrap("Type what you want in plain English, then give the run a name:", w)
+    lines += _wrap("Talk to it in plain English -- ask it something, or ask "
+                   "for a run:", w)
     lines.append(f"  {WHITE}run dnaseq germline_snv on my readset, all steps{RESET}")
     lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
     lines.append(f"{GREY}Press {RESET}{GREEN}/{RESET}{GREY} to see every command, "
@@ -146,17 +177,16 @@ def _right_column(w):
     lines += _wrap("/help brings the full list back at any time.", w)
     lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
     lines.append(f"{BOLD}Once it's running{RESET}")
-    lines += _wrap("/check is the run, /jobs is each Slurm job inside it, "
-                   "/why diagnoses a failure.", w)
+    lines += _wrap("You can monitor it, stop it, or work out what went wrong:", w)
+    lines.append(f"  {GREEN}/check{RESET}  {GREEN}/jobs{RESET}  "
+                 f"{GREEN}/cancel{RESET}  {GREEN}/why{RESET}")
     lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
-    lines.append(f"{BOLD}The one rule{RESET}")
-    lines.append(f"{GREY}ask{RESET} {arrow} {GREY}generate{RESET} {arrow} "
-                 f"{RED}{BOLD}GATE{RESET} {arrow} {GREY}submit{RESET} {arrow} "
-                 f"{GREY}watch{RESET}")
-    lines.append(f"                      {RED}\u25b2{RESET}")
-    lines.append(f"                      {RED}you{RESET}")
-    lines += _wrap("Generation and read-only checks run freely. Anything that would "
-                   "submit to Slurm stops there for your approval.", w)
+    # The one thing a person needs to believe before typing anything here. It
+    # used to be a five-line ASCII diagram of the pipeline; the sentence says
+    # the same thing, and a first screen is not the place to spend five lines
+    # drawing an arrow.
+    lines += _wrap("Nothing reaches Slurm without your approval. Anything that "
+                   "would submit stops and asks you first.", w, style=WHITE)
     return lines
 
 
@@ -168,7 +198,7 @@ def banner(source=None, model=None):
     answer is "not decided": the key prompt appears below this banner and picks
     them. ready() states them again once they're settled.
     """
-    user = os.environ.get("USER") or getpass.getuser()
+    user = who()
     path = os.path.dirname(os.path.abspath(__file__))
     try:
         cols = shutil.get_terminal_size((80, 24)).columns
@@ -179,11 +209,10 @@ def banner(source=None, model=None):
     left_w = 32
     right_w = total - left_w - 7
 
-    # Two lines in the right column can't be reflowed -- the example command
-    # and the pipeline diagram -- and 51 columns is what the wider of them
-    # needs. Below that the two-column layout is being forced, so stack
-    # instead: same content, no box.
-    if right_w < 51:
+    # One line in the right column can't be reflowed -- the example command --
+    # and 49 columns is what it needs. Below that the two-column layout is being
+    # forced, so stack instead: same content, no box.
+    if right_w < 49:
         print()
         for line in _left_column(user, source, model, path):
             print(f"  {line}" if line else "")
@@ -236,15 +265,113 @@ def help_text(commands):
             print(f"    {GREEN}/{name}{RESET}{DIM}{f' {args}' if args else ''}{RESET}"
                   f"{' ' * (width - len(left))}{GREY}{desc}{RESET}")
         print()
-    print(f"  {DIM}Anything that isn't a /command is a task -- you'll be offered a "
-          f"name for it.{RESET}")
-    print(f"  {DIM}The name is how you approve it, and how you check on it days "
+    print(f"  {DIM}Anything that isn't a /command is talk. It goes to the agent, "
+          f"which keeps the thread{RESET}")
+    print(f"  {DIM}and asks you when it needs something. A run gets its name when "
+          f"it reaches the gate;{RESET}")
+    print(f"  {DIM}that name is how you approve it, and how you check on it days "
           f"later.{RESET}")
     print()
 
 # ---------------------------------------------------------------------------
 # Layer 1 -- the parser. Text in, structured events out. No printing.
 # ---------------------------------------------------------------------------
+
+_ASK_ONLY = re.compile(r"^ask\s*\(.*\)$", re.DOTALL)
+
+# Fingerprints of the user-role messages nobody typed. Three are written by this
+# codebase (the observation wrapper, the gate's rejection note, genpipe_agent's
+# NUDGE) and one by biomni's generate node, which corrects a model that replied
+# without a tag. Matched by content because that is all a message carries -- the
+# API has no notion of "the graph said this", and a role is the only field there
+# is. Kept here rather than imported so this module stays stdlib-only.
+_NUDGE = "[continue]"                                   # genpipe_agent.NUDGE
+_CONTEXT_MARK = "--- context for you, not typed by the user ---"  # intake.CONTEXT_MARK
+
+_CORRECTION = re.compile(r"Each response must include thinking process")
+_ANSWER = re.compile(r"The user (?:answered|declined)")
+
+_MACHINERY = re.compile(
+    r"<observation>"
+    r"|" + re.escape(_NUDGE) +
+    r"|The proposed submission was not approved"
+    r"|Each response must include thinking process"
+    r"|Execution terminated due to repeated parsing errors")
+
+
+def _is_help_only(code):
+    """Is this block nothing but a request for documentation?
+
+    Split on the shell's own separators, because the real shape of these is
+    `module load mugqic/genpipes/6.1.1 && genpipes rnaseq_light --help`: a setup
+    command and a question. Every part has to be one or the other for the block to
+    count, so a `--help` bolted onto something that also does work stays visible.
+    """
+    parts = [p.strip() for p in re.split(r"&&|\|\||;|\n", code) if p.strip()]
+    parts = [p for p in parts if not p.startswith("#")]
+    if not parts:
+        return False
+    for part in parts:
+        if part.startswith(("module load", "module purge", "export ", "set ",
+                            "cd ", "source ")):
+            continue
+        if re.search(r"(?:^|\s)(?:--help|-h)(?:\s|$)", part):
+            continue
+        return False
+    return True
+
+
+def _code_label(code):
+    """What a block of code is, in the terms this tool is about.
+
+    Every <execute> block used to be labelled RUN, which is true and useless: the
+    things that actually happen here -- writing the pipeline script, putting it on
+    the scheduler, asking the scheduler how it is going -- are different enough
+    that seeing which one you are looking at is most of the value of the
+    transcript. The words are chosen to match what the person asked for, not what
+    the shell is doing: GENERATE, SUBMIT, SCHEDULER.
+
+    HELP is the one label that means "do not draw this at all" (see render). A
+    competent agent reads `genpipes <pipeline> --help` constantly -- it is how it
+    avoids asserting a step number it half-remembers -- and fifty lines of usage
+    text per turn buries the conversation it was in service of.
+
+    Anything else is CODE. Deliberately: an unrecognised command is exactly the
+    one you want to read closely, and dressing it up as something familiar would
+    be the wrong kind of help.
+    """
+    low = code.lower()
+    if _is_help_only(low):
+        return "HELP"
+    if "genpipes" in low and re.search(r"(?:^|\s)(?:-g\b|--genpipes_file\b)", low):
+        return "GENERATE"
+    if (re.search(r"\b(?:bash|sh)\s+\S+\.sh\b", low)
+            or "chunk_genpipes" in low or "submit_genpipes" in low
+            or re.search(r"\bsbatch\b", low)):
+        return "SUBMIT"
+    if (re.search(r"\b(?:squeue|sacct|sinfo|scontrol|scancel)\b", low)
+            or "log_report" in low):
+        return "SCHEDULER"
+    return "CODE"
+
+
+def _observations(body):
+    """The <observation> blocks in a message, split into two kinds.
+
+    An observation is whatever came back from the last <execute>, and it is
+    normally terminal output. But the ask node answers a question through the same
+    channel -- it is the shape the model is already prompted to read -- and
+    "TERMINAL: The user answered: rnaseq_light" says the wrong thing twice: it was
+    not a terminal, and the panel that asked is two lines above. So an answer gets
+    its own kind and one quiet line.
+    """
+    events = []
+    for block in re.findall(r"<observation>(.*?)</observation>", body, re.DOTALL):
+        text = block.strip()
+        events.append({"kind": "answer" if _ANSWER.match(text) else "observation",
+                       "text": text})
+    return events
+
 
 def parse(message):
     """Turn one agent message into a list of events.
@@ -265,9 +392,38 @@ def parse(message):
     content = getattr(message, "content", "") or ""
     kind = type(message).__name__
 
-    # The user's own prompt, or the feedback text sent back on a rejection.
+    # A user-role message that the user did not write. Everything the graph says
+    # back to the model travels on this channel -- command output, the answer to a
+    # panel, a rejection sent back to be reworked, biomni's own scolding when a
+    # reply arrives with no tag in it, the nudge that keeps a conversation from
+    # ending on the assistant's turn -- and labelling any of it with the person's
+    # name puts words in their mouth. They fall through to be parsed like any
+    # other message, so an <observation> in one renders as OUT and the rest
+    # renders as quiet prose. Nothing is hidden; it is just not attributed.
     if kind == "HumanMessage":
-        return [{"kind": "prompt", "text": content.strip()}]
+        if not _MACHINERY.search(content):
+            # Their line as they typed it. intake.brief appends the facts it could
+            # establish -- what the sentence states, what is in the working
+            # directory -- and marks where that starts; showing it back under
+            # their name reads as if they had typed an inventory of their files.
+            return [{"kind": "prompt",
+                     "text": content.split(_CONTEXT_MARK)[0].strip()}]
+        if content.strip() == _NUDGE or _CORRECTION.search(content):
+            # Pure plumbing. The nudge carries nothing; the correction is the
+            # harness telling the model off for replying without a tag, which is a
+            # conversation between the graph and the model about the graph's own
+            # rules. Neither is something a person can act on, and the reply that
+            # provoked it is shown immediately above either way.
+            return []
+        # Machine-authored. Command output is structured and drawn as TERMINAL;
+        # everything else is plain prose and is deliberately NOT run through the
+        # tag parser below -- biomni's messages quote the words "<execute>" and
+        # "<solution>", and parsing one would draw half of its own instructions as
+        # code the agent is about to run.
+        blocks = _observations(content)
+        if blocks:
+            return blocks
+        return [{"kind": "note", "text": content.strip()}]
 
     # Tolerate an unclosed tag, which happens when a message is cut short.
     body = content
@@ -284,13 +440,31 @@ def parse(message):
             "items": [(text.strip(), mark.strip() != "") for mark, text in plan],
         })
 
-    # Code the model wants to run.
+    # Code the model wants to run -- except an <execute> block that only asks
+    # the user a question. That block is not code and never runs; the panel it
+    # opens is its rendering, and printing `RUN ask(slot="protocol")` just above
+    # the panel would show the plumbing instead of the question.
+    #
+    # This is a rendering rule, not a second copy of ask()'s grammar: it drops a
+    # block that is nothing but a call, and gate_rules.ask_request remains the
+    # only thing that decides what such a call means. A block that mixes an ask
+    # with real code fails this test and is shown in full, which is the right
+    # way round -- the router will not treat it as an ask either.
     for block in re.findall(r"<execute>(.*?)</execute>", body, re.DOTALL):
-        events.append({"kind": "code", "text": block.strip()})
+        # Comment lines are dropped before the test, because the model habitually
+        # opens a block with "#!BASH" -- which the router ignores when it decides
+        # what the block means, so the renderer has to ignore it too or the two
+        # disagree about whether this is a question.
+        bare = "\n".join(line for line in block.splitlines()
+                         if line.strip() and not line.strip().startswith("#"))
+        if _ASK_ONLY.match(bare.strip()):
+            continue
+        code = block.strip()
+        events.append({"kind": "code", "text": code,
+                       "label": _code_label(code)})
 
     # What the machine said back.
-    for block in re.findall(r"<observation>(.*?)</observation>", body, re.DOTALL):
-        events.append({"kind": "observation", "text": block.strip()})
+    events += _observations(body)
 
     # The model's final answer -- always shown in full.
     for block in re.findall(r"<solution>(.*?)</solution>", body, re.DOTALL):
@@ -330,39 +504,105 @@ def _rule(colour, mark, label, text, dim_body=False):
     print()
 
 
+def _clipped(text, head=10, tail=4):
+    """Machine output, shortened in the middle when it runs long.
+
+    The one place this module does not show everything, and it earns the
+    exception: `genpipes --help` is fifty lines, a GenPipes log tail can be
+    hundreds, and a screen of it buries the reply that follows. Head and tail are
+    both kept because the two ends are where the information is -- what the
+    command was doing, and how it ended.
+
+    Only the display is clipped. The model reads the full observation, and the
+    full text is in self.log, so nothing is lost to anything but the eye.
+    """
+    lines = (text or "").splitlines()
+    if len(lines) <= head + tail + 1:
+        return text
+    hidden = len(lines) - head - tail
+    return "\n".join(lines[:head] + [f"… {hidden} more lines …"] + lines[-tail:])
+
+
 def _draw(event):
     """Draw one parsed event."""
     k = event["kind"]
 
     if k == "prompt":
-        _rule(CYAN, "\u258c", "YOU", event["text"])
+        # Their own name, not "YOU". Upper-cased to sit in the same column of
+        # labels as RUN and OUT -- it is a speaker label, and a transcript where
+        # one name is styled differently from the others reads as a mistake.
+        _rule(CYAN, "\u258c", who().upper(), event["text"])
 
     elif k == "note":
         # Connective prose. No label, thin rule, grey. Present but subordinate.
         _rule(GREY, "\u2502", "", event["text"], dim_body=True)
 
-    elif k == "plan":
-        print(f"{CYAN}\u258f {BOLD}PLAN{RESET}")
-        for text, done in event["items"]:
-            box = f"{GREEN}\u2713{RESET}" if done else f"{GREY}\u00b7{RESET}"
-            print(f"{CYAN}\u258f{RESET}   [{box}]{text}")
-        print()
-
     elif k == "code":
-        _rule(AMBER, "\u258c", "RUN", event["text"])
+        _rule(AMBER, "\u258c", event.get("label") or "CODE", event["text"])
 
     elif k == "observation":
         # Bright label so it is easy to find; grey body because machine output is
         # long and you are usually scanning it, not reading every line.
-        _rule(CYAN, "\u258f", "OUT", event["text"], dim_body=True)
+        _rule(CYAN, "\u258f", "TERMINAL", _clipped(event["text"]), dim_body=True)
+
+    elif k == "answer":
+        # One quiet line. The panel above it is the event; this is the receipt.
+        print(f"{CYAN}{DIM}\u258f {_answer_line(event['text'])}{RESET}\n")
 
     elif k == "solution":
-        _rule(GREEN, "\u258c", "SOLUTION", event["text"])
+        # "SOLUTION" is Biomni's word for the tag, and it made every reply sound
+        # like the answer to an exercise. Most of what arrives in one now is the
+        # agent talking -- an answer to a question, an explanation, a refusal --
+        # so it is labelled as the speaker it is.
+        _rule(GREEN, "\u258c", "ASSISTANT", event["text"])
+
+
+def _answer_line(text):
+    """"The user answered: stringtie" as the receipt for a panel."""
+    first = (text or "").splitlines()[0].strip()
+    if _ANSWER.match(first) and "declined" in first:
+        return "no answer given -- carrying on with a default"
+    return re.sub(r"^The user answered:\s*", "answered: ", first)
+
+
+# Labels whose block AND its output are not drawn at all. Just HELP: an agent
+# that reads `genpipes <pipeline> --help` before writing a command is doing the
+# right thing, and doing it on most turns, but the person asked the question in
+# the line above and does not need fifty lines of usage text to see the answer.
+_HIDDEN = ("HELP",)
+
+# Whether the observation about to arrive belongs to a block that was hidden.
+# Module state because the two arrive as separate messages: the code block is
+# rendered, the command runs, and the output turns up on the next call.
+_swallowing = False
 
 
 def render(message):
-    """Parse a message and draw everything it contains."""
+    """Parse a message and draw what is worth drawing.
+
+    Two things are deliberately not drawn, and both are the same judgement --
+    that a transcript is for following the work, not for auditing the agent:
+
+      the model's checklist   It re-emits the whole list every turn with one more
+                              box ticked, which is six lines of repetition for one
+                              line of news. What it is doing now is on screen
+                              anyway, in the block underneath.
+      documentation lookups   see _HIDDEN.
+
+    Everything else -- prose, code, output, answers, conclusions -- is shown.
+    """
+    global _swallowing
     for event in parse(message):
+        kind = event["kind"]
+        if kind == "plan":
+            continue
+        if kind == "code":
+            _swallowing = event.get("label") in _HIDDEN
+            if _swallowing:
+                continue
+        elif kind == "observation" and _swallowing:
+            _swallowing = False
+            continue
         _draw(event)
 
 # ---------------------------------------------------------------------------
@@ -377,40 +617,77 @@ def render(message):
 # selected and pasted without dragging a border character along with them.
 # ---------------------------------------------------------------------------
 
-def farewell(pending=()):
+# The last line of the session. One sentence, and it is about the work rather
+# than about the tool: nobody opens a terminal to run a pipeline, they open it to
+# find something out. Sampled so that a tool used ten times a day does not say the
+# same thing ten times.
+_GOODBYES = (
+    "Goodbye -- and thank you for advancing biology.",
+    "See you next time. Thank you for advancing biology.",
+    "Until next time. The science is better for it.",
+    "Goodbye. Somewhere a genome is better understood for this.",
+    "That's all for now -- thank you for moving biology forward.",
+    "Goodbye, and thank you for the work you do.",
+    "See you soon. Biology moves one run at a time.",
+    "Take care -- and thank you for advancing biology.",
+)
+
+
+def farewell():
     """Printed on the way out.
 
-    A held run is the one thing that must not leave quietly: its approval is
-    still outstanding, it survives in the checkpoint, and the name needed to
-    resume it was only ever on screen.
+    Held runs used to be listed here as a last reminder. They are not any more:
+    the list is the first thing shown at startup, which is where a decision you
+    still owe is actually actionable, and the goodbye is a better goodbye for
+    being only that.
     """
     print()
+    print(f"  {GREEN}{DIM}{random.choice(_GOODBYES)}{RESET}\n")
+
+
+def fresh(pending=()):
+    """Printed by /new: the conversation is gone, the runs are not.
+
+    Worth stating explicitly, because the two are easy to conflate and the
+    consequence of getting it wrong runs in both directions -- believing a run
+    was discarded with the conversation, or believing a conversation still
+    remembers a run it can no longer see.
+    """
+    print()
+    print(f"  {GREEN}▌{RESET} {BOLD}New conversation.{RESET} "
+          f"{DIM}The agent starts from nothing here.{RESET}")
     if pending:
-        names = ", ".join(getattr(p, "name", str(p)) for p in pending)
-        print(f"  {AMBER}▌{RESET} {len(pending)} run(s) still held at the gate: "
-              f"{WHITE}{names}{RESET}")
-        print(f"  {DIM}  They keep their place. Reopen and /approve or /reject "
-              f"when you have decided.{RESET}")
-    print(f"  {DIM}bye{RESET}\n")
+        names = ", ".join(r["name"] for r in pending)
+        print(f"  {DIM}  {len(pending)} run(s) still held and still yours: "
+              f"{RESET}{WHITE}{names}{RESET}")
+    print(f"  {DIM}  Every run you have started keeps its name. /list to see "
+          f"them.{RESET}")
+    print()
 
 
 def environment(findings):
     """Environment problems, at startup. Silent when there are none.
 
-    Warnings and blockers are drawn the same way apart from colour, because the
-    distinction that matters is stated in words -- "jobs will not run" versus
-    "mail will bounce" -- and a person who has to decode a colour to learn which
-    is which has been told nothing.
+    A blocker gets two lines and says so in words -- "jobs will not run" is worth
+    stopping on, and a person who has to decode a colour to learn that has been
+    told nothing. A warning gets one, because it is the same warning every launch
+    until it is fixed and it is competing with the prompt for attention.
+
+    Both carry the fix. A check that reports a problem and not its remedy has
+    only moved the work.
     """
     if not findings:
         return
     print()
     for finding in findings:
-        colour = RED if finding.blocking else AMBER
-        tag = "BLOCKS SUBMISSION" if finding.blocking else "heads up"
-        print(f"  {colour}{BOLD}{finding.variable}{RESET} "
-              f"{colour}{tag}{RESET}  {DIM}{finding.problem}{RESET}")
-        print(f"      {DIM}fix:{RESET} {WHITE}{finding.fix}{RESET}")
+        if finding.blocking:
+            print(f"  {RED}{BOLD}{finding.variable}{RESET} "
+                  f"{RED}BLOCKS SUBMISSION{RESET}  {DIM}{finding.problem}{RESET}")
+            print(f"      {DIM}fix:{RESET} {WHITE}{finding.fix}{RESET}")
+        else:
+            print(f"  {AMBER}▌{RESET} {DIM}{finding.variable}: "
+                  f"{finding.problem}{RESET}  {DIM}fix:{RESET} "
+                  f"{WHITE}{finding.fix}{RESET}")
     print()
 
 
@@ -831,24 +1108,28 @@ def triage(name, report):
 
 
 def pending(records):
-    """Held runs, surfaced at startup.
+    """Held runs, surfaced at startup -- in one line, however many there are.
 
     This exists because of the tool's worst failure mode: the gate pauses a run,
     the terminal closes, and the only record of a decision you still owe was the
     name in your head. Everything else in the interface can wait until asked.
     This cannot.
+
+    But it is a reminder, not a report. Printing every held command turned a
+    fortnight of experiments into the largest thing on a fresh screen, and pushed
+    the one line that matters -- the prompt -- to the bottom of the scrollback.
+    Names first three, count for the rest, /list for the commands.
     """
     if not records:
         return
     n = len(records)
+    names = ", ".join(r["name"] for r in records[:3])
+    if n > 3:
+        names += f", +{n - 3} more"
     print()
-    print(f"  {RED}{REVERSE}{BOLD} {n} HELD {RESET}  "
-          f"{RED}waiting for your approval{RESET}")
-    for r in records:
-        cmd = ((r.get("proposal") or {}).get("command") or "?").strip()
-        print(f"      {BOLD}{r['name']}{RESET}   {DIM}{cmd}{RESET}")
-    print(f"      {DIM}{'approve':<10}{RESET}/approve {WHITE}<name>{RESET}")
-    print(f"      {DIM}{'see it':<10}{RESET}/list")
+    print(f"  {AMBER}▌{RESET} {AMBER}{n} run{'s' if n > 1 else ''} held{RESET}"
+          f"{DIM}, waiting on you:{RESET} {WHITE}{names}{RESET}"
+          f"   {DIM}/list{RESET}")
     print()
 
 

@@ -64,6 +64,10 @@ class App:
             env.pop(var, None)
         env["GENPIPE_LLM_SOURCE"] = "Anthropic"
         env["GENPIPE_LLM_MODEL"] = "claude-sonnet-5"
+        # Already introduced, so the app goes straight to the prompt. Without
+        # this it would stop at "what should I call you?" and every send() below
+        # would be answering that question instead.
+        env["GENPIPE_USER"] = "tester"
 
         self.proc = subprocess.Popen(
             [sys.executable, os.path.join(ROOT, "launch_agent.py"),
@@ -184,7 +188,7 @@ def main():
         r.contains("greets the user", screen, "Welcome back")
         r.contains("shows the model", screen, "claude-sonnet-5")
         r.contains("shows where it lives", screen, "genpipe-workflow-assistant")
-        r.contains("states the one rule", screen, "GATE")
+        r.contains("promises the gate in words", screen, "without your approval")
         r.contains("dev mode is announced, not hidden", screen, "dev mode")
         r.contains("...naming what is simulated", screen, "fake cluster")
         r.check("and it never asked for an API key",

@@ -1,5 +1,10 @@
 # Test cases
 
+Looking for something to try by hand while changing how the agent behaves? See
+[SCENARIOS.md](SCENARIOS.md) — five conversations to hold with it, each the
+shortest path to a distinct piece of machinery, with the expected observation for
+every line you type.
+
 Three scenarios, in ascending order of what they cost and what they prove. They
 are not unit tests — the suites in `tests/` cover the parts. These walk the
 whole product the way a person walks it, and they exist so that "does it still

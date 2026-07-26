@@ -21,6 +21,7 @@ below rather than lost.
 """
 
 import io
+import glob
 import os
 import select
 import shutil
@@ -34,6 +35,13 @@ import display
 
 # Braille dots: ten frames, all the same visual weight, so the spinner reads as
 # motion rather than as a character that keeps changing shape.
+#
+# Two attempts at making it bigger were both worse and are recorded so they are
+# not tried a third time. The dense braille set (⣾⣽⣻) fills a 2-wide-by-4-tall dot
+# matrix, so it reads as a vertical bar rather than a bigger spinner. Quadrant
+# blocks (▛▜▟▙) are square but far too heavy -- a solid block pulsing next to a
+# line of dim text is the loudest thing on the screen, which is exactly backwards
+# for a progress indicator. Ten small dots at speed is the right amount of motion.
 FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 # Escape sequences we care about. Both the CSI ([) and SS3 (O) forms are here:
@@ -162,8 +170,12 @@ _MARK = "❯"
 
 
 class _Editor:
-    def __init__(self, commands, history, initial=""):
+    def __init__(self, commands, history, initial="", arguments=None):
         self.commands = commands
+        # Called with a command name, returns [(value, hint), ...] for its first
+        # argument. Supplied by the app rather than known here: the values are run
+        # names out of the registry, and this module has no business reading it.
+        self.arguments = arguments or (lambda name: [])
         self.history = history
         self.text = initial
         self.cur = len(initial)   # caret position within self.text
@@ -191,9 +203,32 @@ class _Editor:
         low = word.lower()
         return [c for c in self.commands if c[0].startswith(low)]
 
+    def arg_matches(self):
+        """Values the first argument could still become, or None when we are not
+        typing one.
+
+        Only the FIRST argument, and only while it is the last word on the line.
+        `/reject patient-42 use steps 6-12` is prose after that point, and a menu
+        of run names trying to complete "steps" would be noise.
+
+        The empty list is meaningful and distinct from None: it means this command
+        does take a name, and there is not one to offer -- which is worth saying,
+        because "no run is waiting for approval" is the actual answer to what the
+        person is trying to do.
+        """
+        if not self.text.startswith("/") or " " not in self.text:
+            return None
+        name, _, rest = self.text[1:].partition(" ")
+        if " " in rest:
+            return None
+        values = self.arguments(name.lower())
+        if values is None:
+            return None
+        low = rest.strip().lower()
+        return [v for v in values if v[0].lower().startswith(low)]
+
     def menu_open(self):
-        m = self.matches()
-        return bool(m)
+        return bool(self.matches()) or bool(self.arg_matches())
 
     def _arghint(self):
         """Once a command is typed and the arguments begin, the menu is done --
@@ -247,7 +282,27 @@ class _Editor:
                            f"{display.RESET}")
             return out
 
+        values = self.arg_matches()
+        if values:
+            namew = max(len(v[0]) for v in values) + 2
+            for i, (value, note) in enumerate(values[:MAX_MENU]):
+                on = i == self.sel
+                mark = f"{display.GREEN}{_MARK}{display.RESET}" if on else " "
+                weight = display.BOLD if on else ""
+                room = self.span - 6 - namew
+                note = note if len(note) <= room else note[:max(0, room - 1)] + "…"
+                out.append(f"  {mark} {weight}{display.WHITE}{value}{display.RESET}"
+                           f"{' ' * (namew - len(value))}"
+                           f"{display.GREY}{note}{display.RESET}")
+            if len(values) > MAX_MENU:
+                out.append(f"    {display.DIM}+{len(values) - MAX_MENU} more"
+                           f"{display.RESET}")
+            return out
+
         hint = self._arghint()
+        if values is not None and not values:
+            # The command takes a run name and there is no run to name.
+            out.append(f"    {display.DIM}no run matches{display.RESET}")
         if hint:
             name, args, desc = hint
             out.append(f"    {display.GREY}/{name} {args}{display.RESET}  "
@@ -343,7 +398,7 @@ class _Editor:
         self._changed()
 
     def select(self, by):
-        m = self.matches() or []
+        m = self.matches() or self.arg_matches() or []
         shown = min(len(m), MAX_MENU)
         if shown:
             self.sel = (self.sel + by) % shown
@@ -367,23 +422,64 @@ class _Editor:
         between them. Completing to the common prefix first means Tab never
         guesses when the answer is still genuinely ambiguous."""
         m = self.matches()
-        if not m:
+        if m:
+            word = self.text[1:]
+            shared = os.path.commonprefix([c[0] for c in m])
+            if len(shared) > len(word):
+                self.set("/" + shared)
+                return
+            name, args, _ = m[min(self.sel, len(m) - 1)]
+            self.set("/" + name + (" " if args else ""))
             return
-        word = self.text[1:]
-        shared = os.path.commonprefix([c[0] for c in m])
-        if len(shared) > len(word):
-            self.set("/" + shared)
+
+        values = self.arg_matches()
+        if not values:
             return
-        name, args, _ = m[min(self.sel, len(m) - 1)]
-        self.set("/" + name + (" " if args else ""))
+        self.set(f"/{self.text[1:].partition(' ')[0]} {self.pick()}")
+
+    def completes_on_enter(self):
+        """Should Enter finish the argument first?
+
+        Only when there is something unambiguous to finish: a run-name menu is
+        open, and what has been typed is not already one of the names in it. A
+        name typed in full, or pasted, submits as itself.
+        """
+        values = self.arg_matches()
+        if not values:
+            return False
+        typed = self.text[1:].partition(" ")[2].strip()
+        return typed.lower() not in [v[0].lower() for v in values]
+
+    def pick(self):
+        """The argument value Tab or Enter should settle on.
+
+        Run names share long prefixes -- rnaseq-light-0726 and
+        rnaseq-light-0726-2 differ in the last two characters -- so completing to
+        the common prefix, which is what Tab does for commands, stopped at
+        "rnaseq-" and looked like nothing had happened. Worse, the completion
+        counted as a text change, which reset the highlighted row, so the next Tab
+        chose the first candidate rather than the one under the cursor.
+
+        So this resolves to a whole name, always: the highlighted row when there
+        is a choice, and the only row when there isn't. Tab and Enter both go
+        through it, which is what makes the arrow keys mean what they look like
+        they mean.
+        """
+        values = self.arg_matches() or []
+        if not values:
+            return ""
+        return values[min(self.sel, len(values) - 1)][0]
 
 
 class Prompt:
     """The app's input line. One instance, reused for every turn, so history
     accumulates across the session."""
 
-    def __init__(self, commands=()):
+    def __init__(self, commands=(), arguments=None):
         self.commands = list(commands)
+        # See _Editor.arguments: a callable that turns a command name into the
+        # values its first argument could take.
+        self.arguments = arguments
         self.history = []
 
     def read(self, initial="", allow_empty=False):
@@ -401,7 +497,8 @@ class Prompt:
 
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
-        ed = _Editor(self.commands, self.history, initial=initial)
+        ed = _Editor(self.commands, self.history, initial=initial,
+                     arguments=self.arguments)
         try:
             tty.setraw(fd)
             # Ask the terminal to bracket pastes. Without this a pasted newline
@@ -422,6 +519,15 @@ class Prompt:
                 if key in ("\r", "\n"):
                     if not ed.text.strip() and not allow_empty:
                         continue
+                    # A highlighted run name is accepted by Enter, not just by
+                    # Tab. With the menu open and a row picked out with the arrow
+                    # keys, Enter meaning "submit the two characters I typed" is
+                    # indefensible -- it produced "No run named 'rn'" with the
+                    # right name sitting highlighted on the screen. Only ever
+                    # replaces a partial name with a real one: an argument that
+                    # already matches a candidate exactly is left alone.
+                    if ed.completes_on_enter():
+                        ed.complete()
                     ed.finish()
                     break
                 if key == "\t":
@@ -642,6 +748,41 @@ def _choose_headless(question, rows, note, quick):
     return answer                        # treat anything else as free text
 
 
+def _complete_path(text, cur):
+    """Tab inside a free-text answer: finish the filename being typed.
+
+    The question this exists for is "which readset file?" with nothing matching in
+    the working directory, which leaves the person typing an absolute path by hand
+    -- and typing /home/pbourque/scratch/lighttest/readset.rnaseq.txt correctly,
+    from memory, is not a reasonable thing to ask of anybody.
+
+    Completes to the longest common prefix, exactly like a shell, and appends a
+    slash on a directory so the next Tab carries on into it. No listing of the
+    alternatives: this prompt owns a single line that it repaints in place, and
+    printing a column of candidates underneath would tear it apart. A prefix that
+    stops advancing is the signal that there is more than one answer.
+    """
+    head, sep, token = text[:cur].rpartition(" ")
+    if not token:
+        return text, cur
+    expanded = os.path.expanduser(token)
+    try:
+        hits = glob.glob(expanded + "*")
+    except Exception:
+        return text, cur
+    if not hits:
+        return text, cur
+    shared = hits[0] if len(hits) == 1 else os.path.commonprefix(hits)
+    if len(hits) == 1 and os.path.isdir(shared) and not shared.endswith(os.sep):
+        shared += os.sep
+    if token.startswith("~") and shared.startswith(os.path.expanduser("~")):
+        shared = "~" + shared[len(os.path.expanduser("~")):]
+    if len(shared) <= len(token):
+        return text, cur
+    completed = head + sep + shared
+    return completed + text[cur:], len(completed)
+
+
 def ask(label, default=""):
     """A short follow-up question, with an editable suggested answer.
 
@@ -687,6 +828,8 @@ def ask(label, default=""):
                 raise KeyboardInterrupt
             elif key == "\x04" and not text:
                 raise EOFError
+            elif key == "\t":
+                text, cur = _complete_path(text, cur)
             elif key in ("\x7f", "\x08"):
                 if cur:
                     text = text[:cur - 1] + text[cur:]
@@ -778,6 +921,7 @@ class Activity:
         self._t0 = 0.0
         self._real = None
         self._thread = None
+        self._paused = False
 
     def __enter__(self):
         if self.on:
@@ -808,6 +952,34 @@ class Activity:
         with self._lock:
             self.label = label
 
+    def pause(self):
+        """Give the terminal back to something that needs to own it.
+
+        The agent asks questions in the middle of a turn, and a choice panel
+        repaints itself by moving the cursor up over its own lines. A spinner
+        ticking away underneath would be erasing rows the panel is counting on,
+        so the spinner stops and stdout goes back to the real one -- the panel
+        must not be writing through the proxy either.
+
+        Idempotent, and a no-op when there is no terminal at all.
+        """
+        if not self.on or self._paused:
+            return
+        with self._lock:
+            self._paused = True
+            self._erase()
+            sys.stdout = self._real
+            self._real.flush()
+
+    def resume(self):
+        """Take it back and start ticking again."""
+        if not self.on or not self._paused:
+            return
+        with self._lock:
+            sys.stdout = _Proxy(self, self._real)
+            self._at_bol = True
+            self._paused = False
+
     def _erase(self):
         if self._drawn:
             self._real.write("\r\033[K")
@@ -819,8 +991,9 @@ class Activity:
             with self._lock:
                 # Mid-line output means the cursor is parked somewhere we
                 # can't safely overwrite; sit the frame out rather than
-                # scribble over half a line.
-                if not self._at_bol:
+                # scribble over half a line. Paused means something else owns
+                # the screen entirely.
+                if self._paused or not self._at_bol:
                     continue
                 frame = FRAMES[self._frame % len(FRAMES)]
                 self._frame += 1

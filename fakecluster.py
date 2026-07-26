@@ -65,6 +65,7 @@ pass on a laptop and mislead on the cluster.
 """
 import contextlib
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -567,26 +568,45 @@ class DevLLM:
                   if type(m).__name__ == "HumanMessage"]
         task = theirs[0] if theirs else ""
         feedback = [t for t in theirs[1:] if "was not approved" in t]
+        answers = [t for t in theirs[1:] if "The user answered" in t]
 
         # A /why investigation. Its prompt carries the facts already, so the
         # answer is written from those rather than invented.
         if "Diagnose the cause" in task:
             return AIMessage(content=f"<solution>{_diagnosis(task)}</solution>")
 
+        # What the person has actually typed, as opposed to what the graph fed
+        # back to itself. One conversation now spans many turns, so the request
+        # is the accumulation of their own lines -- and a turn that is just talk
+        # is answered with talk, never with a pipeline nobody asked for.
+        spoken = [_typed(t) for t in theirs
+                  if not t.lstrip().startswith("<observation>")
+                  and "was not approved" not in t]
+        if spoken and not _wants_a_run(" ".join(spoken), spoken[-1]):
+            return AIMessage(content=f"<solution>{_chat(spoken[-1])}</solution>")
+
         generations = sum(1 for m in mine if "genpipes" in m and "-g" in m)
         submissions = sum(1 for m in mine if "bash cmd.sh" in m)
+        asked = sum(1 for m in mine if "ask(" in m)
 
-        # Rejected: regenerate, honouring whatever change was asked for.
-        if len(feedback) >= generations:
+        # Rejected: regenerate, honouring whatever change was asked for. The
+        # `feedback and` guard matters: without it a first turn (no feedback, no
+        # generations) satisfies 0 >= 0 and the stand-in opens the conversation
+        # by announcing it is "regenerating with that change".
+        if feedback and len(feedback) >= generations:
             return AIMessage(content=(
                 "Understood -- regenerating with that change.\n"
-                + _gen_block(task, feedback)))
+                + _gen_block(task, feedback, answers)))
 
         if generations == 0:
+            question = _next_question(theirs) if asked < 2 else None
+            if question:
+                return AIMessage(content=(
+                    "One thing I need before I can build this.\n" + question))
             return AIMessage(content=(
                 "I'll generate the pipeline script first, so you can see the "
                 "commands before anything is submitted.\n"
-                + _gen_block(task, feedback)))
+                + _gen_block(task, feedback, answers)))
 
         if submissions < generations:
             return AIMessage(content=(
@@ -597,6 +617,79 @@ class DevLLM:
             "<solution>The pipeline was submitted. Use /check to follow its "
             "progress, /jobs to see the individual Slurm jobs, and /why if "
             "anything fails.</solution>"))
+
+
+def _typed(message):
+    """Only the part of a message the person actually typed.
+
+    intake.brief appends what the request already states and what is lying around
+    in the working directory. Useful to a model, ruinous here: a brief that
+    mentions "possible readset: readset.tsv" would make "hi" read as a request to
+    run something. It marks where its own text starts (intake.CONTEXT_MARK).
+    """
+    import intake as _intake
+    return message.split(_intake.CONTEXT_MARK, 1)[0]
+
+
+# A request to put work on the cluster, as opposed to a question about it. Verbs
+# only, plus the pipeline names -- naming a pipeline is itself an instruction
+# ("rnaseq stringtie on my readset"), whereas nothing else anyone types is.
+_RUN_VERBS = re.compile(
+    r"\b(run|runs|launch|submit|resubmit|rerun|generate|process|analyse|analyze)\b",
+    re.I)
+
+
+# A question about GenPipes, as opposed to an instruction to use it.
+_QUESTION = re.compile(
+    r"^\s*(?:what|how|which|why|when|where|who|is|are|does|do|did|can|could|"
+    r"should|would|tell me|explain|remind me|difference)\b", re.I)
+
+
+def _wants_a_run(said, latest):
+    """Has the person asked for work to be done, or are they talking?
+
+    Dev mode needs this because the real model now has it in its system prompt
+    (see genpipe_agent.TALK_PROTOCOL): talk is the default, and building a
+    pipeline is what you do when you were asked to. A stand-in that generated a
+    submission in reply to "hi" would be evidence about nothing except itself.
+
+    `said` is everything they have said, `latest` only the last line, and the two
+    are read differently on purpose. A run verb anywhere means a run was asked for
+    at some point and the conversation is still about it. But a pipeline NAME is
+    only an instruction when the sentence around it is one -- "what does
+    rnaseq_light do?" names a pipeline and orders nothing, and answering it with a
+    submission is precisely the behaviour this stand-in exists to catch.
+    """
+    if _RUN_VERBS.search(said):
+        return True
+    stripped = (latest or "").strip()
+    if _QUESTION.match(stripped) or stripped.endswith("?"):
+        return False
+    import intake as _intake
+    return bool(_intake.find_pipeline(said))
+
+
+def _chat(latest):
+    """A plain conversational reply -- dev mode's stand-in for just talking.
+
+    Deliberately says what it is. The scripted model has no knowledge to answer
+    a real GenPipes question with, and inventing a confident-sounding paragraph
+    here would make dev mode a worse test than no test: someone would read it and
+    believe the pipeline documentation had been consulted.
+    """
+    text = latest.strip()
+    low = text.lower()
+    if re.match(r"^(hi|hey|hello|yo|salut|bonjour|good (morning|afternoon))\b", low):
+        return ("Hi. I'm your GenPipes assistant. Ask me anything about the "
+                "pipelines, or tell me what you want to run -- something like "
+                "\"run rnaseq stringtie steps 1-5 on my readset\" -- and I'll "
+                "build the command and show it to you before anything is "
+                "submitted.")
+    if low.startswith(("thanks", "thank", "merci", "ok", "cool", "nice")):
+        return "Any time. Tell me when you want to run something."
+    return ("(dev mode: the scripted stand-in can't answer GenPipes questions -- "
+            "the real model does that.) Ask me to run a pipeline and I'll build "
+            "the command, hold it at the gate, and let you approve it.")
 
 
 def _diagnosis(prompt):
@@ -621,17 +714,50 @@ def _diagnosis(prompt):
             f"the step's resources and its inputs.")
 
 
-def _gen_block(task, feedback=()):
+def _next_question(said, limit=2):
+    """The ask() block a competent model would emit next, or None.
+
+    Driven by slots.gaps() rather than by a script of its own, which is the
+    only way dev mode can be evidence about the real thing: the stand-in asks
+    when a real model with the same tables would have to ask, and stays quiet
+    when it would not. An rnaseq request gets no protocol question because
+    rnaseq has a documented default; a dnaseq one gets all seven options.
+
+    Everything the user has said is read, answers included, so a question
+    already answered is not asked twice -- the same accumulation a real model
+    does by reading its own history.
+    """
+    import intake as _intake
+    import slots as _slots
+
+    stated = _intake.read(" ".join(said))
+    gaps = _slots.gaps(**stated)
+    if not gaps:
+        return None
+    gap = gaps[0]
+    args = [f'slot="{gap.slot}"']
+    if stated.get("pipeline"):
+        args.append(f'pipeline="{stated["pipeline"]}"')
+    if stated.get("protocol"):
+        args.append(f'protocol="{stated["protocol"]}"')
+    return f"<execute>\nask({', '.join(args)})\n</execute>"
+
+
+def _gen_block(task, feedback=(), answers=()):
     """A genpipes generation command for whatever was asked for.
 
     Built to satisfy the stub's validation, so dev mode exercises the success
     path. A `-s` range mentioned in the request is honoured, and the most recent
     mention wins -- which is what makes a rejection like "use steps 6-12
     instead" visibly change the command in the approval box.
+
+    Answers to the agent's own questions are read alongside the request, so a
+    protocol chosen in a panel reaches the command line and shows up in the
+    approval box. A panel whose answer changed nothing would be theatre.
     """
     import re as _re
 
-    text = " ".join([task, *feedback]).lower()
+    text = " ".join([task, *feedback, *answers]).lower()
 
     # Longest name first, so rnaseq_denovo_assembly is not read as rnaseq, and
     # on a word boundary so it is a request rather than an incidental mention.
@@ -650,11 +776,26 @@ def _gen_block(task, feedback=()):
     if ranges:
         steps = ranges[-1].replace(" ", "")
 
+    # A file named anywhere in the request or in an answer reaches the command
+    # line, so that choosing one in a panel visibly changes what gets approved.
+    # The stub validates that it exists, which is the check that would catch a
+    # panel handing back something the run cannot use.
+    files = _intake_files(" ".join([task, *feedback, *answers]))
+
     flag = f"-t {protocol} " if protocol else ""
+    readset = f"-r {files['readset']} " if files.get("readset") else ""
+    design = f"-d {files['design']} " if files.get("design") else ""
+    pairs = f"-p {files['pairs']} " if files.get("pairs") else ""
     return ("<execute>\n#!BASH\n"
             f"module load {GENPIPES_MODULE} && genpipes {pipeline} "
-            f"{flag}-s {steps} -g cmd.sh\n"
+            f"{flag}{readset}{design}{pairs}-s {steps} -g cmd.sh\n"
             "</execute>")
+
+
+def _intake_files(text):
+    """intake.find_files, imported lazily to keep this module's import cheap."""
+    import intake as _intake
+    return _intake.find_files(text)
 
 
 # Imported lazily by the module that needs it, to keep this file stdlib-only at

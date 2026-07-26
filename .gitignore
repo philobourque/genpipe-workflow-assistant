@@ -22,6 +22,21 @@ runs.jsonl
 biomni_data/
 # The generation artifact: whatever a `genpipes ... -g` call wrote last.
 cmd.sh
+*_cmd.sh
+# GenPipes' own output, for when the app was launched from inside the repo. It
+# should not be -- launch it from the directory the run belongs in -- but it
+# happens, and one CIT run leaves a gigabyte of trimmed reads here. Ignored
+# rather than tolerated: `git add -A` in a directory like that is one keystroke.
+trim/
+alignment/
+kallisto/
+metrics/
+report/
+tracks/
+variants/
+methylation/
+peak_call/
+*.config.trace.ini
 # What the last cluster test case recorded. Useful locally, not shared history.
 testcases/last-run-*.json
 

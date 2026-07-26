@@ -157,6 +157,49 @@ class Gap:
         return f"<Gap {self.slot}>"
 
 
+def as_data(gap):
+    """A Gap as plain JSON-safe data, and from_data() is the way back.
+
+    Needed because a question crosses a boundary that only carries JSON. The ask
+    node pauses the graph with interrupt(), and LangGraph writes that payload
+    into the SQLite checkpoint through its JSON serializer -- which refuses an
+    object it does not recognise:
+
+        TypeError: Object of type Gap is not serializable
+
+    That refusal happened after the model had already decided to ask, so the turn
+    died on the way to drawing the panel. Converting here rather than teaching the
+    serializer about our classes keeps the pause durable in the way that matters:
+    the payload is data, so a question can be re-read by a different process, or
+    by a version of this code whose Gap has different fields.
+    """
+    if gap is None:
+        return None
+    return {
+        "slot": gap.slot,
+        "question": gap.question,
+        "free_text": bool(gap.free_text),
+        "note": gap.note,
+        "options": [{"value": o.value, "label": o.label,
+                     "description": o.description} for o in gap.options],
+    }
+
+
+def from_data(data):
+    """Rebuild a Gap from as_data()'s output. Tolerant of missing keys, so a
+    payload written by an older version still opens a usable panel."""
+    if not data:
+        return None
+    if isinstance(data, Gap):
+        return data
+    return Gap(data.get("slot"),
+               data.get("question") or "",
+               [Option(o.get("value"), o.get("label"), o.get("description", ""))
+                for o in data.get("options") or ()],
+               free_text=bool(data.get("free_text", True)),
+               note=data.get("note") or "")
+
+
 def protocols(pipeline):
     """Legal -t values for a pipeline, or [] if it takes none."""
     return list(PIPELINES.get(pipeline, []))
@@ -184,6 +227,97 @@ def expected_inis(pipeline, protocol):
     return None if proto is None else proto.inis
 
 
+# ---------------------------------------------------------------------------
+# One builder per slot. Both callers below go through these, so a question is
+# worded once no matter whether it was reached by sweeping a request for
+# everything missing or by the agent asking for one specific thing.
+# ---------------------------------------------------------------------------
+
+def _pipeline_gap(stated=None):
+    question = ("Which pipeline?" if not stated else
+                f"{stated!r} is not a pipeline on this install. Which one?")
+    return Gap("pipeline", question,
+               [Option(name, name, _pipeline_blurb(name))
+                for name in sorted(PIPELINES)],
+               free_text=False)
+
+
+def _protocol_gap(pipeline, stated=None):
+    """None when the pipeline takes no -t at all -- there is nothing to ask."""
+    choices = PIPELINES.get(pipeline) or []
+    if not choices:
+        return None
+    question = (f"Which {pipeline} protocol?" if not stated else
+                f"{stated!r} is not a {pipeline} protocol. Which one?")
+    return Gap("protocol", question,
+               [Option(p.name, p.name, p.blurb) for p in choices],
+               free_text=False)
+
+
+def _readset_gap(candidates=()):
+    return Gap("readset", "Which readset file?",
+               [Option(path, path) for path in candidates],
+               free_text=True,
+               note="Tab-separated, one row per readset. Required by every "
+                    "pipeline.")
+
+
+def _design_gap(pipeline, protocol, candidates=()):
+    who = f"{pipeline} {protocol}".strip()
+    return Gap("design", f"{who} needs a design file. Which one?".lstrip(),
+               [Option(path, path) for path in candidates],
+               free_text=True,
+               note="Columns are contrasts; 1 is control, 2 is treatment, 0 or "
+                    "blank excludes the sample.")
+
+
+def _pairs_gap(pipeline, protocol, candidates=()):
+    who = f"{pipeline} {protocol}".strip()
+    return Gap("pairs", f"{who} needs a pairs file. Which one?".lstrip(),
+               [Option(path, path) for path in candidates],
+               free_text=True,
+               note="Comma-separated, mapping each tumour sample to its matched "
+                    "normal.")
+
+
+def gap_for(slot, pipeline=None, protocol=None, question=None,
+            readset_candidates=(), design_candidates=(), pairs_candidates=()):
+    """The one question the agent asked for, as a Gap.
+
+    This is the seam the ask node uses, and the whole point of it is the
+    division of labour: the model names a slot, and the options come from the
+    table above. A model asked to list dnaseq's protocols will eventually list
+    an eighth one and sound entirely confident doing it; a model asked only
+    *when* to raise the question cannot.
+
+    `question` is the model's own wording. It is used as-is when there is no
+    slot -- an agent must be able to ask about things this table has never
+    heard of -- and ignored when there is one, because the table's wording is
+    the wording CI checks.
+
+    Returns None only when there is genuinely nothing to ask, which happens for
+    exactly one case worth guarding: a protocol for a pipeline that takes none.
+    """
+    if slot == "pipeline":
+        return _pipeline_gap()
+    if slot == "protocol":
+        if not pipeline:
+            # Asked about a protocol without saying whose. The pipeline is the
+            # real gap, and answering it first is what the ordering in gaps()
+            # exists to enforce.
+            return _pipeline_gap()
+        return _protocol_gap(pipeline)
+    if slot == "readset":
+        return _readset_gap(readset_candidates)
+    if slot == "design":
+        return _design_gap(pipeline or "", protocol or "", design_candidates)
+    if slot == "pairs":
+        return _pairs_gap(pipeline or "", protocol or "", pairs_candidates)
+    if question:
+        return Gap(None, question, (), free_text=True)
+    return None
+
+
 def gaps(pipeline=None, protocol=None, readset=None, design=None, pairs=None,
          readset_candidates=(), design_candidates=(), pairs_candidates=()):
     """Everything still missing, in the order it should be asked.
@@ -194,80 +328,37 @@ def gaps(pipeline=None, protocol=None, readset=None, design=None, pairs=None,
 
     The *_candidates arguments are real paths the caller found on disk. They
     become the numbered options; the free-text entry covers everything else.
+
+    Still used on the way in to a conversation (as a brief for the model) and
+    on the way out of one (as the gate's completeness check), even though the
+    questions themselves are now asked by the agent through gap_for().
     """
     found = []
 
     if not pipeline:
-        found.append(Gap(
-            "pipeline",
-            "Which pipeline?",
-            [Option(name, name, _pipeline_blurb(name))
-             for name in sorted(PIPELINES)],
-            free_text=False,
-        ))
-        return found                      # nothing below is decidable yet
-
+        return [_pipeline_gap()]          # nothing below is decidable yet
     if not known(pipeline):
-        found.append(Gap(
-            "pipeline",
-            f"{pipeline!r} is not a pipeline on this install. Which one?",
-            [Option(name, name, _pipeline_blurb(name))
-             for name in sorted(PIPELINES)],
-            free_text=False,
-        ))
-        return found
+        return [_pipeline_gap(stated=pipeline)]
 
     choices = PIPELINES[pipeline]
     if choices and not protocol:
         default = DEFAULTS.get(pipeline)
         if not default:
-            found.append(Gap(
-                "protocol",
-                f"Which {pipeline} protocol?",
-                [Option(p.name, p.name, p.blurb) for p in choices],
-                free_text=False,
-            ))
-            return found                  # design/pairs depend on the answer
+            return [_protocol_gap(pipeline)]   # design/pairs depend on this
         protocol = default
 
     proto = find_protocol(pipeline, protocol) if choices else None
     if choices and proto is None:
-        found.append(Gap(
-            "protocol",
-            f"{protocol!r} is not a {pipeline} protocol. Which one?",
-            [Option(p.name, p.name, p.blurb) for p in choices],
-            free_text=False,
-        ))
-        return found
+        return [_protocol_gap(pipeline, stated=protocol)]
 
     if not readset:
-        found.append(Gap(
-            "readset",
-            "Which readset file?",
-            [Option(path, path) for path in readset_candidates],
-            free_text=True,
-            note="Tab-separated, one row per readset. Required by every pipeline.",
-        ))
+        found.append(_readset_gap(readset_candidates))
 
     needs = proto.needs if proto else None
     if needs == DESIGN and not design and pipeline not in _DESIGN_OPTIONAL:
-        found.append(Gap(
-            "design",
-            f"{pipeline} {proto.name} needs a design file. Which one?",
-            [Option(path, path) for path in design_candidates],
-            free_text=True,
-            note="Columns are contrasts; 1 is control, 2 is treatment, 0 or "
-                 "blank excludes the sample.",
-        ))
+        found.append(_design_gap(pipeline, proto.name, design_candidates))
     if needs == PAIRS and not pairs:
-        found.append(Gap(
-            "pairs",
-            f"{pipeline} {proto.name} needs a pairs file. Which one?",
-            [Option(path, path) for path in pairs_candidates],
-            free_text=True,
-            note="Comma-separated, mapping each tumour sample to its matched "
-                 "normal.",
-        ))
+        found.append(_pairs_gap(pipeline, proto.name, pairs_candidates))
 
     return found
 

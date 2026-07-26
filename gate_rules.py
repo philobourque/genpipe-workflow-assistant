@@ -1,8 +1,18 @@
-"""The submission gate's decision logic, as pure functions.
+"""The router's decision logic, as pure functions.
 
-This is the safety-critical part of the whole tool: the code that decides
-whether something the model wrote is about to submit work to a scheduler. It
-lives in its own module, importing nothing but the standard library, for two
+Two questions are answered here, both asked of the same thing -- the code the
+model just wrote inside an <execute> block -- and both answered before that code
+runs:
+
+    is_submission(code)   is this about to put work on the scheduler?
+    ask_request(code)     is this the agent asking the user a question?
+
+The first is the safety-critical one and the reason this module exists. The
+second rides along because it is decided at the same moment, by the same router,
+from the same text; keeping them apart would mean two parsers disagreeing about
+what a code block is.
+
+It lives in its own module, importing nothing but the standard library, for two
 reasons.
 
   1. It can be tested anywhere. genpipe_agent.py imports biomni, which drags in
@@ -207,6 +217,173 @@ def is_submission(code):
         return False
     stripped = executable_lines(code)
     return any(re.search(p, stripped) for p in _SUBMIT_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# ask(): the agent's way of putting a question to the person at the keyboard.
+#
+# It travels inside <execute> rather than as a tag of its own, and that is not a
+# shortcut -- it is the only shape that does not require forking Biomni. A1's
+# generate node recognises exactly three tags (<think>, <execute>, <solution>);
+# anything else falls into its parsing-error branch, where the model is scolded
+# and told to regenerate. Riding inside <execute> means generate needs no change
+# at all: it routes to "execute" as usual, and routing_function -- already the
+# place where "what kind of action is this?" is decided -- diverts asks to the
+# ask node the same way it diverts submissions to the gate.
+#
+# The call is parsed, never evaluated. Nothing here executes model-written code.
+# ---------------------------------------------------------------------------
+
+_ASK_CALL = re.compile(r"\bask\s*\(\s*(.*?)\s*\)", re.DOTALL)
+
+# A quoted string, allowing the prefixes a model reaches for out of habit --
+# f"...", r'...'. The prefix matters more than it looks: ask(question=f"Which
+# steps of {pipeline}?") parsed as zero arguments, which used to mean "not an ask"
+# and sent the call to the Python interpreter, where it died as
+# NameError: name 'ask' is not defined.
+_QUOTED = r"(?:[rbfuRBFU]{0,2})(\"[^\"]*\"|'[^']*')"
+
+# key="value", the shape the prompt asks for.
+_ASK_ARG = re.compile(r"(\w+)\s*=\s*" + _QUOTED)
+
+# A bare string, for the model that writes ask("Which steps?") positionally.
+# Applied only after the keyword arguments have been cut out of the text.
+_ASK_POSITIONAL = re.compile(_QUOTED)
+
+# What the panel can build a real menu for. Anything else is still askable --
+# it just arrives as a plain question with no options, which is the honest
+# rendering of a question this tool has no table for.
+ASK_SLOTS = ("pipeline", "protocol", "readset", "design", "pairs")
+
+
+def ask_request(code):
+    """Parse an ask() call out of a code block, or None if there isn't one.
+
+    Returns a dict of its keyword arguments, e.g.
+
+        ask(slot="protocol", pipeline="dnaseq")
+            -> {"slot": "protocol", "pipeline": "dnaseq"}
+        ask(question="Which steps?")
+            -> {"slot": None, "question": "Which steps?"}
+        ask("Which steps?")
+            -> {"slot": None, "question": "Which steps?"}
+
+    ONCE THE CALL IS THERE, THIS ALWAYS RETURNS A REQUEST. That is the rule the
+    whole function is arranged around, and it was learned the hard way: an
+    argument list this could not parse used to return None, which the router reads
+    as "not a question", which sends `ask(...)` to the Python interpreter, which
+    answers `NameError: name 'ask' is not defined` -- twice, because the model then
+    tries again. A question that arrives in an unexpected shape must degrade to a
+    plainer question, never to an error.
+
+    So keyword arguments are read where they are given, a positional string is
+    accepted as the question (or as the slot, if it happens to name one), and an
+    unrecognised slot becomes prose rather than nothing.
+
+    Two rules survive from before, both about not asking when something else is
+    going on. It is matched against executable_lines(), for exactly the reason
+    is_submission() is: the model narrates its own work constantly, and
+    `print("ask(slot='protocol')")` or an echoed summary must not open a panel.
+    And a block that also submits is not an ask -- if both appear the caller must
+    treat it as a submission. That check lives in the router, but the asymmetry is
+    stated here too, because a question is a fine thing to get wrong and an
+    ungated submission is not.
+    """
+    if not code:
+        return None
+    runnable = executable_lines(code)
+    if not runnable:
+        return None
+    m = _ASK_CALL.search(runnable)
+    if not m:
+        return None
+
+    inside = m.group(1)
+    args = {k: v[1:-1] for k, v in _ASK_ARG.findall(inside)}
+    # Whatever is left once the keyword arguments are removed. A model that calls
+    # ask("Which steps should this run?") is asking a perfectly good question.
+    leftover = _ASK_ARG.sub("", inside)
+    positional = [v[1:-1] for v in _ASK_POSITIONAL.findall(leftover)]
+
+    slot = (args.get("slot") or "").strip().lower()
+    if not slot:
+        slot = next((p.strip().lower() for p in positional
+                     if p.strip().lower() in ASK_SLOTS), "")
+
+    question = args.get("question") or next(
+        (p for p in positional if p.strip().lower() not in ASK_SLOTS), None)
+    if not question and slot and slot not in ASK_SLOTS:
+        # An invented slot is not discarded silently -- `slot="genome"` becomes
+        # "Which genome?", so the model still gets to ask.
+        question = f"Which {slot}?"
+
+    return {
+        "slot": slot if slot in ASK_SLOTS else None,
+        "pipeline": args.get("pipeline") or None,
+        "protocol": args.get("protocol") or None,
+        "question": question or None,
+    }
+
+
+# Commands that mean the block is shell, not Python. Biomni decides which
+# interpreter to use from a marker on the first line of an <execute> block --
+# "#!BASH" for a shell script, nothing for Python -- and a model that forgets the
+# marker gets its shell command handed to exec(). For a submission that is a
+# silent, expensive failure: the person approves `bash cmd.sh`, and what comes back
+# is "Error: name 'bash' is not defined".
+#
+# Only the first executable line is consulted, which is the convention anyway: a
+# block opens with what it is. `print("bash x")` is not in this set, and neither is
+# `import` or any name followed by a bracket, so Python stays Python.
+_SHELL_WORDS = frozenset("""
+    bash sh zsh module genpipes sbatch squeue sacct scancel sinfo scontrol srun
+    salloc chunk_genpipes submit_genpipes validate_genpipes
+    ls cat head tail wc cp mv mkdir rmdir touch chmod chown ln readlink realpath
+    grep egrep zgrep awk sed sort uniq cut tr diff find xargs tee
+    echo printf pwd cd export source which env date df du hostname whoami
+    tar gzip gunzip zcat unzip rsync scp curl wget make python python3 Rscript
+""".split())
+
+
+def needs_bash_marker(code):
+    """Should this block be run as shell even though it is not marked as such?
+
+    True for a submission unconditionally -- that is the one case where guessing
+    wrong costs a person their approval -- and otherwise when the first thing the
+    block does is run a program.
+    """
+    if not code:
+        return False
+    stripped = code.strip()
+    if stripped.startswith(("#!BASH", "#!CLI", "#!R", "# Bash script", "# R code",
+                            "# R script")):
+        return False                      # already declared, leave it alone
+    if is_submission(code):
+        return True
+    lines = executable_lines(code).splitlines()
+    if not lines:
+        return False
+    first = lines[0].strip().split()
+    return bool(first) and first[0] in _SHELL_WORDS
+
+
+def mark_shell(content):
+    """Add the #!BASH marker to an <execute> block that needs one.
+
+    Rewrites the message rather than the code so the change lands where biomni
+    looks -- its execute node re-extracts the block from the last message's text
+    and inspects the first line itself. Returns the content unchanged when there
+    is nothing to do, so the caller can tell whether anything happened.
+    """
+    if not content:
+        return content
+    m = re.search(r"<execute>(.*?)</execute>", content, re.DOTALL)
+    if not m:
+        return content
+    code = m.group(1)
+    if not needs_bash_marker(code):
+        return content
+    return content[:m.start(1)] + "\n#!BASH\n" + code.strip() + "\n" + content[m.end(1):]
 
 
 def flag_value(cmd, flag):

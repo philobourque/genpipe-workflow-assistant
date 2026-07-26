@@ -79,11 +79,23 @@ def main():
     r.section("held runs, surfaced at startup")
     out = drawn(display.pending, [
         {"name": "patient-42", "proposal": {"command": "bash cmd.sh"}}])
-    r.contains("counts them", out, "1 HELD")
+    r.contains("counts them", out, "1 run held")
     r.contains("names them", out, "patient-42")
-    r.contains("and says what to do", out, "/approve")
+    r.contains("and says where to look", out, "/list")
     r.equal("nothing at all when nothing is held",
             drawn(display.pending, []).strip(), "")
+
+    # A startup notice is a reminder, not a report. Nine held runs from a
+    # fortnight of experiments must not be nine lines above the prompt.
+    many = drawn(display.pending,
+                 [{"name": f"run-{i}", "proposal": {"command": "bash cmd.sh"}}
+                  for i in range(9)])
+    r.equal("nine held runs still take one line",
+            len([l for l in many.splitlines() if l.strip()]), 1)
+    r.contains("the count is all of them", many, "9 runs held")
+    r.contains("naming the first few", many, "run-0")
+    r.contains("and saying how many it left out", many, "+6 more")
+    r.check("no commands are echoed", "bash cmd.sh" not in many)
 
     # ---------------------------------------------------------------- #
     r.section("/list distinguishes held from live")
@@ -267,6 +279,125 @@ def main():
     r.equal("and unticked ones are not", plan["items"][1][1], False)
     r.check("drawing all of it raises nothing",
             drawn(display.render, Msg("<solution>ok</solution>")) is not None)
+
+    # ---------------------------------------------------------------- #
+    r.section("a question is rendered as a panel, never as code")
+
+    # An <execute> block that only asks something never reaches an interpreter.
+    # Printing `RUN ask(slot="protocol")` just above the panel would show the
+    # plumbing instead of the question.
+    events = display.parse(Msg(
+        'I need to know which one.\n<execute>\nask(slot="protocol", '
+        'pipeline="dnaseq")\n</execute>'))
+    kinds = [e["kind"] for e in events]
+    r.check("the ask block is not drawn as code", "code" not in kinds,
+            f"got={kinds}")
+    r.check("the prose around it survives", "note" in kinds, f"got={kinds}")
+    r.check("and nothing of the call leaks into it",
+            "ask(" not in drawn(display.render, Msg(
+                'Which one?\n<execute>\nask(slot="protocol")\n</execute>')))
+
+    # The answer does show. A transcript that hid both the question and the
+    # answer would leave the model's next move unexplained.
+    r.check("the answer comes back visibly",
+            "stringtie" in drawn(display.render, Msg(
+                "<observation>The user answered: stringtie</observation>")))
+
+    # A block mixing an ask with real code is not an ask -- the router will not
+    # treat it as one either -- so it must be shown in full.
+    mixed = display.parse(Msg('<execute>\nask(slot="protocol")\nbash cmd.sh\n</execute>'))
+    r.check("a block that also runs something is shown",
+            "code" in [e["kind"] for e in mixed])
+
+    # ---------------------------------------------------------------- #
+    r.section("a block is titled by what it does, not by the fact that it runs")
+
+    def label(code):
+        return display.parse(Msg(f"<execute>\n{code}\n</execute>"))[0]["label"]
+
+    r.equal("writing the script is GENERATE",
+            label("module load mugqic/genpipes/6.1.1 && genpipes rnaseq "
+                  "-t stringtie -s 1-5 -g cmd.sh"), "GENERATE")
+    r.equal("running it is SUBMIT", label("bash cmd.sh"), "SUBMIT")
+    r.equal("so is the DRAC pair",
+            label("./chunk_genpipes.sh chunks && ./submit_genpipes chunks"),
+            "SUBMIT")
+    r.equal("reading the scheduler is SCHEDULER",
+            label("sacct -j 1234 --format=State"), "SCHEDULER")
+    r.equal("and GenPipes' own progress report too",
+            label("genpipes tools log_report cmd.sh.job_list"), "SCHEDULER")
+    # An unrecognised command is the one to read closely; dressing it up as
+    # something familiar would be the wrong kind of help.
+    r.equal("anything else stays CODE", label("python summarise.py"), "CODE")
+    r.equal("a documentation lookup is HELP",
+            label("module load mugqic/genpipes/6.1.1 && genpipes rnaseq --help"),
+            "HELP")
+    r.contains("and the label is what gets drawn", drawn(
+        display.render, Msg("<execute>\nbash cmd.sh\n</execute>")), "SUBMIT")
+
+    # ---------------------------------------------------------------- #
+    r.section("long machine output is clipped at both ends, not one")
+    flood = "<observation>" + "\n".join(f"line {i}" for i in range(60)) + "</observation>"
+    out = drawn(display.render, Msg(flood))
+    r.contains("the start survives", out, "line 0")
+    r.contains("the end survives -- where an error is", out, "line 59")
+    r.contains("and it says how much it left out", out, "more lines")
+    r.check("the middle is gone", "line 30" not in out)
+    short = drawn(display.render, Msg("<observation>one\ntwo</observation>"))
+    r.contains("short output is untouched", short, "two")
+    r.check("with nothing about lines left out", "more lines" not in short)
+
+    # ---------------------------------------------------------------- #
+    r.section("what the graph says to itself is never put in the user's mouth")
+
+    # Every message the graph sends the model is user-role -- the API has no
+    # other channel for it. Drawing any of it under the person's name would be
+    # claiming they typed it.
+    me = display.who().upper()
+
+    scold = drawn(display.render, HumanMessage(
+        "Each response must include thinking process followed by either "
+        "<execute> or <solution> tag. But there are no tags in the current "
+        "response. Please follow the instruction, fix and regenerate."))
+    # Not attributed, and in fact not drawn at all: it is the harness telling the
+    # model off about the harness's own tagging rules, and the reply that provoked
+    # it is on screen immediately above.
+    r.equal("biomni's correction is not drawn", scold.strip(), "")
+    r.check("least of all as code about to run", "CODE" not in scold)
+
+    rejected = drawn(display.render, HumanMessage(
+        "The proposed submission was not approved. use steps 6-12 instead. "
+        "Regenerate the command accordingly."))
+    r.check("nor is the rejection sent back", me not in rejected)
+    r.contains("though the feedback is visible", rejected, "steps 6-12")
+
+    # Command output arrives as a user turn now (the Anthropic API rejects a
+    # conversation that ends on the assistant's side), so it must render as OUT
+    # from either role.
+    from_machine = drawn(display.render,
+                         HumanMessage("<observation>Generated cmd.sh</observation>"))
+    r.contains("output on the user channel is still TERMINAL", from_machine,
+               "TERMINAL")
+    r.check("and is not attributed to them", me not in from_machine)
+
+    r.equal("the continue nudge is not drawn at all",
+            display.parse(HumanMessage("[continue]")), [])
+
+    # intake.brief appends what it could establish about the request. It is for
+    # the model; showing it back reads as if they had typed an inventory.
+    import intake
+    briefed = drawn(display.render, HumanMessage(
+        intake.brief("run rnaseq stringtie with readset.tsv", ".")))
+    r.contains("their own words are shown", briefed, "run rnaseq stringtie")
+    r.check("the appended context is not", "do not ask again" not in briefed)
+    r.contains("and it is still their turn", briefed, me)
+
+    text = drawn(display.fresh, [])
+    r.check("/new says the conversation is gone", "New conversation" in text)
+    r.check("and that the runs are not", "keeps its name" in text)
+    held = drawn(display.fresh, [{"name": "rnaseq-stringtie-0726"}])
+    r.check("a held run is named on the way out",
+            "rnaseq-stringtie-0726" in held)
 
     # ---------------------------------------------------------------- #
     r.section("environment findings, and the gate's refusal to offer approval")

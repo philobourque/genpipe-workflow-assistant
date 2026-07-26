@@ -174,14 +174,29 @@ class Registry:
         """Runs paused at the gate, waiting for a decision."""
         return [r for r in self.live() if r["status"] == HELD]
 
+    def held_for_thread(self, thread_id):
+        """The run this conversation already has waiting at the gate, if any.
+
+        A conversation is one thread and can produce many runs, so the thread is
+        not the run's identity -- but while a run is held, its thread is parked
+        on that interrupt and cannot start another. This is what lets the gate
+        recognise "the same run, rethought after a rejection" and update it in
+        place instead of minting a second name for the same pending decision.
+        """
+        if thread_id is None:
+            return None
+        for r in self.held():
+            if r["thread_id"] == str(thread_id):
+                return r
+        return None
+
     def unique_name(self, wanted):
         """`wanted` if it's free, else the first `wanted-2`, `wanted-3`, ... that is.
 
-        Reusing a name is not merely untidy: the name is the LangGraph thread
-        key, and Biomni's AgentState has no message reducer, so re-running an
-        existing name replaces that thread's conversation -- including a pending
-        interrupt. A held submission can be destroyed by a typo. Callers offer
-        this instead.
+        A name has to identify exactly one run, because it is what /approve,
+        /check and /why are given. One conversation routinely produces several
+        runs of the same pipeline, so the obvious derived name collides on the
+        second one; this is what keeps them apart without asking anybody.
         """
         taken = {r["name"] for r in self.load()}
         if wanted not in taken:
@@ -705,10 +720,11 @@ def suggest_name(task, when=None):
 
         "run dnaseq germline_snv on my readset, all steps"  ->  dnaseq-germline-snv-0725
 
-    Naming a run is mandatory -- it is the handle for approving and checking it
-    later, possibly from another session -- but being made to invent one before
-    you have seen anything is friction at the worst moment. So the prompt is
-    pre-filled with this and Enter accepts it.
+    A run needs a name -- it is the handle for approving and checking it later,
+    possibly from another session -- but nobody should be made to invent one
+    before they have seen what is being proposed. So no one is asked: the name
+    is derived here at the gate, from what the run turned out to be, and shown
+    in the approval box next to the command it belongs to.
 
     The date suffix is what keeps names distinct in practice: the same pipeline
     gets run repeatedly, and the day is usually how a person remembers which

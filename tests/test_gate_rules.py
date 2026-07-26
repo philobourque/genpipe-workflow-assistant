@@ -144,6 +144,70 @@ def main():
     r.equal("the revised steps are shown", p["slots"]["steps"], "6-12")
     r.check("not the stale ones", p["slots"]["steps"] != "1-5")
 
+    # ---------------------------------------------------------------------
+    r.section("ask(): the agent putting a question to the user")
+
+    got = g.ask_request('ask(slot="protocol", pipeline="dnaseq")')
+    r.equal("the slot is read", (got or {}).get("slot"), "protocol")
+    r.equal("and the pipeline it is about", (got or {}).get("pipeline"), "dnaseq")
+
+    r.equal("single quotes work too",
+            (g.ask_request("ask(slot='readset')") or {}).get("slot"), "readset")
+    r.equal("whitespace inside the call is fine",
+            (g.ask_request('ask( slot = "pairs" )') or {}).get("slot"), "pairs")
+    r.equal("a call split over lines still parses",
+            (g.ask_request('ask(\n  slot="design",\n  pipeline="rnaseq",\n)')
+             or {}).get("slot"), "design")
+
+    free = g.ask_request('ask(question="Which steps should this run?")')
+    r.equal("a free-form question has no slot", (free or {}).get("slot"), None)
+    r.equal("but keeps its wording",
+            (free or {}).get("question"), "Which steps should this run?")
+
+    # An invented slot is not silently dropped. The panel has no table for
+    # "genome", but the question is still worth putting to a human, so it
+    # degrades to free text rather than to nothing happening.
+    made_up = g.ask_request('ask(slot="genome")')
+    r.equal("an unknown slot gets no menu", (made_up or {}).get("slot"), None)
+    r.equal("and becomes a plain question",
+            (made_up or {}).get("question"), "Which genome?")
+
+    r.equal("no ask, no request", g.ask_request("genpipes rnaseq -g cmd.sh"), None)
+    r.equal("nothing at all", g.ask_request(""), None)
+    # Once the call is there, this ALWAYS returns a request. Returning None for an
+    # argument list it could not read is what used to send `ask(...)` to the Python
+    # interpreter, where it came back as "NameError: name 'ask' is not defined".
+    bare = g.ask_request("ask()")
+    r.truthy("a bare ask() is still recognised as a question", bare is not None)
+    r.equal("with nothing to ask about", (bare or {}).get("question"), None)
+
+    positional = g.ask_request('ask("Which steps should this run?")')
+    r.equal("a positional question is read as the question",
+            (positional or {}).get("question"), "Which steps should this run?")
+    r.equal("a positional slot name is read as the slot",
+            (g.ask_request('ask("protocol")') or {}).get("slot"), "protocol")
+    r.equal("an f-string value is not a parse failure",
+            (g.ask_request('ask(question=f"Which steps of {p}?")') or {}
+             ).get("question"), "Which steps of {p}?")
+
+    # The same inertness rules the gate lives by. The model narrates its own
+    # work constantly, and a described ask must not open a real panel.
+    r.equal("an ask inside print() is not an ask",
+            g.ask_request('print("ask(slot=\'protocol\')")'), None)
+    r.equal("an ask inside echo is not an ask",
+            g.ask_request("echo ask(slot='protocol')"), None)
+    r.equal("an ask in a comment is not an ask",
+            g.ask_request('# ask(slot="protocol") would be the next move'), None)
+
+    # The asymmetry that matters. A block doing both is a submission, and the
+    # router tests is_submission first for exactly this reason -- an ask() must
+    # never be a way to route work past the gate.
+    both = 'ask(slot="protocol")\nbash cmd.sh'
+    r.truthy("a block that also submits is still a submission",
+             g.is_submission(both))
+    r.truthy("even though an ask can be parsed out of it",
+             g.ask_request(both) is not None)
+
     return r.finish()
 
 

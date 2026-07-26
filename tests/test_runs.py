@@ -63,6 +63,28 @@ def main():
                 reg.get("patient-42")["proposal"]["command"], "bash cmd2.sh")
 
         # ---------------------------------------------------------------- #
+        r.section("a conversation is not a run, and can produce several")
+
+        # One thread, two runs. This is what per-conversation threading buys and
+        # what the registry has to keep straight: the name identifies the run
+        # forever, the thread only says which conversation produced it.
+        reg.hold("second-run", "patient-42",
+                 {"command": "bash other.sh", "slots": {}}, workdir)
+        both = [x["name"] for x in reg.held()]
+        r.equal("both runs are held", sorted(both), ["patient-42", "second-run"])
+
+        # held_for_thread is what stops a rejected-and-rethought run acquiring a
+        # second name, so it must answer with a run, not with the thread.
+        found = reg.held_for_thread("patient-42")
+        r.truthy("the thread maps back to a held run", found is not None)
+        r.contains("and it is one of them", str(sorted(both)), found["name"])
+        r.equal("a thread with nothing waiting maps to nothing",
+                reg.held_for_thread("chat-nothing-here"), None)
+        r.equal("and neither does no thread at all",
+                reg.held_for_thread(None), None)
+        reg.mark_submitted("second-run", None, workdir=workdir)
+
+        # ---------------------------------------------------------------- #
         r.section("approval promotes held -> submitted")
         listing = os.path.join(workdir, "job_output", "RnaSeq.stringtie.job_list.2026")
         make_job_list(listing, [

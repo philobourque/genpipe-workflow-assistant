@@ -1,3 +1,4 @@
+import datetime
 import getpass
 import os
 import re
@@ -12,8 +13,7 @@ from pathlib import Path
 import display
 import intake
 import preflight
-import runs
-import slots
+import runs as runs_store
 import ui
 from biomni.llm import get_llm
 from genpipe_agent import GenpipeA1
@@ -240,6 +240,107 @@ def _require_api_key():
     _prompt_for_api_key()
 
 
+def _prompt_for_name():
+    """Ask what to call them, and remember it.
+
+    Asked once, at the first launch that has no name saved, in the same spirit as
+    the API key prompt: one question, answered, never asked again. The Unix
+    username is pre-typed rather than offered as a default to press enter on, so
+    the common case is one keystroke and a correction is an edit rather than a
+    retype.
+
+    Skipped silently when there is no terminal to ask on -- a piped or scripted
+    launch keeps the username and asks nothing, which is what makes this safe to
+    put in main().
+    """
+    if not sys.stdin.isatty():
+        return
+    suggestion = (os.environ.get("USER") or "").strip()
+    print(f"\n  {display.BOLD}{display.GREEN}One thing first.{display.RESET}"
+          f"  {display.GREY}Change it any time with /user.{display.RESET}")
+    try:
+        name = (ui.ask("What should I call you?", default=suggestion) or "").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    _set_name(name or suggestion)
+
+
+def _set_name(name):
+    """Apply a name for this session and save it for the next one."""
+    name = " ".join((name or "").split())[:24]
+    if not name:
+        return
+    os.environ["GENPIPE_USER"] = name
+    _write_env_var("GENPIPE_USER", name)
+
+
+def _require_name():
+    """Ensure we know what to call the user, asking once if we don't."""
+    if not (os.environ.get("GENPIPE_USER") or "").strip():
+        _prompt_for_name()
+
+
+def _cmd_user(agent, args):
+    """/user [name] -- show or change what the agent calls you.
+
+    Same shape as /model: no argument reports, an argument sets. The name is
+    cosmetic -- it labels their turns in the transcript and greets them at
+    launch -- so this needs no confirmation and takes effect on the next line.
+    """
+    if not args:
+        print(f"\n  {display.DIM}Calling you{display.RESET} "
+              f"{display.WHITE}{display.who()}{display.RESET}"
+              f"   {display.GREY}/user <name> to change it{display.RESET}\n")
+        return
+    _set_name(" ".join(args))
+    # The transcript label reads the environment every time, so it is already
+    # current; the model's system prompt is not, and has to be told.
+    agent.address_user(display.who())
+    display.done(f"Noted -- {display.who()} it is.")
+
+
+def _drop_sampling_params(llm, source):
+    """Clear temperature/top_p/top_k on an Anthropic model, and return it.
+
+    Biomni's get_llm defaults temperature to 0.7 (biomni/llm.py) and passes it
+    to ChatAnthropic unconditionally. Every Claude model from Opus 4.7 onward --
+    which includes the Sonnet 5 this app defaults to -- rejects the parameter
+    outright:
+
+        BadRequestError: 400 ... `temperature` is deprecated for this model.
+
+    It fails on the first real call, so a fresh install looks like it works
+    right up until the moment it is asked to do anything.
+
+    Clearing the attribute is enough to remove it: langchain_anthropic builds
+    its request payload and then filters out every None value (chat_models.py,
+    _get_request_payload), so a None temperature is not sent at all rather than
+    being sent as null.
+
+    Dropping it rather than picking a supported value is deliberate. Nothing
+    here wants a particular sampling temperature -- 0.7 is biomni's default, not
+    a choice this project made -- and the set of models that accept it shrinks
+    with every release. Letting the API apply its own default is the version of
+    this that does not need a model table to keep up to date.
+
+    Scoped to Anthropic because it is the provider whose current models reject
+    it; the OpenAI, Gemini and Groq paths are left exactly as biomni built them.
+    """
+    if (source or "").lower() != "anthropic":
+        return llm
+    for name in ("temperature", "top_p", "top_k"):
+        if getattr(llm, name, None) is not None:
+            try:
+                setattr(llm, name, None)
+            except (AttributeError, ValueError, TypeError):
+                # A pydantic model with validation that refuses None. Not worth
+                # failing the launch over -- the request may still go through on
+                # an older model, and the 400 above says exactly what happened.
+                pass
+    return llm
+
+
 def build_agent(path=None, llm=None, source=None):
     """Construct a fully configured GenpipeA1 agent: the gated graph, with the
     GenPipes grammar registered as software.
@@ -281,6 +382,23 @@ def build_agent(path=None, llm=None, source=None):
     with contextlib.redirect_stdout(io.StringIO()):
         agent.add_software({"genpipes": content})
 
+    # 4. Strip the sampling parameters biomni set for us. Must happen after
+    #    construction: A1.__init__ is what calls get_llm, so there is no
+    #    argument we could have passed to prevent it.
+    _drop_sampling_params(agent.llm, source)
+
+    # 5. Switch off biomni's tool retriever, which is on by default.
+    #
+    #    It spends an extra model call at the top of every turn asking which of
+    #    biomni's ~200 wet-lab tools and data-lake files are relevant, prints
+    #    "Using prompt-based retrieval with the agent's LLM" while doing it, and
+    #    then injects the winners into the system prompt. Nothing in this
+    #    application uses any of them: the tools here are GenPipes, Slurm, and
+    #    the person at the keyboard. What the retrieval actually achieved was to
+    #    put a data lake in front of a model that then went looking through it
+    #    for something to do.
+    agent.use_tool_retriever = False
+
     return agent
 
 
@@ -296,11 +414,11 @@ def _apply_llm(agent, source, model):
     (verified against Biomni's a1.py), so reassigning this attribute is
     enough on its own.
     """
-    agent.llm = get_llm(
-        model,
-        stop_sequences=["</execute>", "</solution>"],
-        source=source,
-    )
+    agent.llm = _drop_sampling_params(
+        get_llm(model,
+                stop_sequences=["</execute>", "</solution>"],
+                source=source),
+        source)
     print(f"  {display.GREEN}Using{display.RESET} {source} · {model}\n")
 
 
@@ -364,20 +482,20 @@ def _label_for(message):
     events = display.parse(message)
     kinds = {e["kind"] for e in events}
 
+    # The classification itself lives in display._code_label, which the transcript
+    # already uses to title the block. One classifier, two consumers: the label on
+    # screen and the spinner's commentary cannot disagree about what is happening.
     for event in events:
         if event["kind"] != "code":
             continue
         code = event["text"]
-        if "genpipes" in code and "-g" in code:
-            return "generating the script"
-        if "log_report" in code:
-            return "asking GenPipes"
-        if "sacct" in code or "squeue" in code:
-            return "asking Slurm"
+        phrase = {"GENERATE": "generating the script",
+                  "SUBMIT": "submitting",
+                  "SCHEDULER": "asking the scheduler"}.get(event.get("label"))
+        if phrase:
+            return "asking GenPipes" if "log_report" in code else phrase
         if "genpipes" in code and "-h" in code:
             return "reading genpipes -h"
-        if re.search(r"\b(?:bash|sh)\s+\S+\.sh\b", code):
-            return "submitting"
         first = next((w for w in code.split() if w.isalpha()), None)
         return f"running {first}" if first else "running"
 
@@ -404,9 +522,15 @@ def _cmd_approve(agent, args):
     # resume() renders each step as it streams, but reports its outcome only as
     # a returned status dict -- the old raw Python REPL printed returned values
     # for free, and this loop doesn't, so the confirmation is explicit here.
+    #
+    # Conditional on the outcome, which it was not: /approve on a name that does
+    # not exist printed "No run named 'rn'" and then, two lines later, "rn ·
+    # submitted". A confirmation that appears whatever happened is worse than
+    # none, because this is the one message that says something reached Slurm.
     with ui.Activity("submitting") as act:
-        agent.resume(args[0], approved=True, on_step=_narrate(act))
-    display.post_approve(args[0], True)
+        status = agent.resume(args[0], approved=True, on_step=_narrate(act))
+    if (status or {}).get("status") == "done":
+        display.post_approve(args[0], True)
 
 
 def _cmd_reject(agent, args):
@@ -415,9 +539,10 @@ def _cmd_reject(agent, args):
         return
     name, *rest = args
     with ui.Activity("reworking") as act:
-        agent.resume(name, approved=False, feedback=" ".join(rest),
-                     on_step=_narrate(act))
-    display.post_approve(name, False)
+        status = agent.resume(name, approved=False, feedback=" ".join(rest),
+                              on_step=_narrate(act))
+    if (status or {}).get("status") != "unknown":
+        display.post_approve(name, False)
 
 
 def _cmd_check(agent, args):
@@ -515,9 +640,12 @@ def _cmd_help(agent, args):
 # alphabetical list stops being a reference. The groups follow the order things
 # happen in, so the workflow is legible from the help itself.
 #
-# /exit has no handler because the loop has to break rather than return; it is
-# listed anyway so it shows up in the menu and in /help like everything else.
+# /exit and /new have no handler because both act on the loop's own state --
+# breaking out of it, and swapping the conversation thread -- rather than on the
+# agent. They are listed anyway so they show up in the menu and in /help like
+# everything else.
 COMMAND_SPECS = [
+    ("new",     "",                   "start a fresh conversation",              "talking",  None),
     ("approve", "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve),
     ("reject",  "<name> [why...]",    "send it back with feedback instead",      "deciding", _cmd_reject),
     ("list",    "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list),
@@ -528,6 +656,7 @@ COMMAND_SPECS = [
     ("cancel",  "<name>",             "scancel a run's remaining jobs",          "fixing",   _cmd_cancel),
     ("track",   "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track),
     ("where",   "",                   "which directories this is using",         "setup",    _cmd_where),
+    ("user",    "[name]",             "show or change what it calls you",        "setup",    _cmd_user),
     ("model",   "[provider [model]]", "show or switch the model behind this",    "setup",    _cmd_model),
     ("key",     "",                   "add or rotate an API key",                "setup",    _cmd_key),
     ("help",    "",                   "this list",                               "setup",    _cmd_help),
@@ -551,68 +680,165 @@ def _resolve(word):
     return hits[0] if len(hits) == 1 else None
 
 
-def _name_run(agent, task):
-    """Ask what to call this run, offering a name derived from the task.
-
-    Two things happen here that both exist to protect a run from its own name.
-
-    The suggestion removes the friction of being made to invent an identifier
-    before you have seen anything -- it is pre-typed and editable, so Enter
-    accepts it and a keystroke changes it.
-
-    The collision check is the important one. The name is the LangGraph thread
-    key, and Biomni's AgentState declares `messages` with no reducer, so starting
-    a new run under an existing name would REPLACE that thread's state -- erasing
-    the earlier conversation and, if it were parked at the gate, the pending
-    approval with it. A run can be destroyed by a typo. So a taken name is
-    silently advanced to the next free one, and the user is told.
-
-    Returns the name, or None if the user cancelled.
-    """
-    suggestion = runs.suggest_name(task)
-    try:
-        wanted = ui.ask("name this run", agent.registry.unique_name(suggestion)).strip()
-    except (EOFError, KeyboardInterrupt):
-        display.nothing("Cancelled.")
-        return None
-    if not wanted:
-        display.problem("A run needs a name -- it's how you approve it later.")
-        return None
-    unique = agent.registry.unique_name(wanted)
-    if unique != wanted:
-        display.nothing(
-            f"'{wanted}' is taken -- using {display.BOLD}{unique}{display.RESET} instead.",
-            "the earlier run keeps its name, its jobs and its history.")
-    return unique
-
-
 def _panel(gap):
-    """Render one gap as a question. The seam intake.resolve() asks through.
+    """Render one gap as a question. The seam the agent's ask() arrives through.
 
     A panel with nothing to offer is worse than a plain question: it costs a
     keystroke to reach the free-text row and implies there were alternatives
-    worth reading. So when nothing on disk matches, this degrades to a one-line
-    prompt with the note as its hint.
+    worth reading. So when there is nothing to choose between -- a free-form
+    question, or a file role with nothing matching on disk -- this degrades to a
+    one-line prompt with the note as its hint.
     """
     if not gap.options:
         if gap.note:
             print(f"  {display.DIM}{gap.note}{display.RESET}")
         try:
-            return ui.ask(gap.question).strip() or None
+            answer = ui.ask(gap.question)
         except (EOFError, KeyboardInterrupt):
             return None
+        return answer.strip() or None
     return ui.choose(gap.question, gap.options,
                      note=gap.note, free_text=gap.free_text)
 
 
+def _asker(activity):
+    """Wrap the panel so the spinner gets out of its way and comes back after.
+
+    Activity paints on the same line the panel is about to draw over, so
+    without this the question appears with a spinner ticking through it.
+    """
+    def ask(gap):
+        activity.pause()
+        try:
+            return _panel(gap)
+        finally:
+            activity.resume()
+    return ask
+
+
+def _conversation_id():
+    """A fresh conversation key. Not shown to anyone: runs get real names at
+    the gate, and this only has to be unique in the checkpoint database."""
+    return f"chat-{datetime.datetime.now():%m%d-%H%M%S}"
+
+
+def _turn(agent, thread, text):
+    """One exchange: the user's line in, the agent's work out.
+
+    A conversation parked at the gate is the one case that cannot take a turn.
+    LangGraph would start a fresh superstep and discard the pending interrupt,
+    losing an approval that is still outstanding -- so the run is named instead,
+    along with the two commands that resolve it. The agent refuses this as well
+    (see GenpipeA1.run); saying it here is what makes the refusal legible.
+    """
+    waiting = agent.registry.held_for_thread(thread)
+    if waiting:
+        display.problem(
+            f"'{waiting['name']}' is still waiting for your decision.",
+            f"/approve {waiting['name']}  ·  /reject {waiting['name']} <what to "
+            f"change>  ·  /new to start a separate conversation")
+        return
+    print()
+    try:
+        with ui.Activity("thinking") as act:
+            agent.on_ask = _asker(act)
+            agent.run(text, thread_id=thread, on_step=_narrate(act))
+    except KeyboardInterrupt:
+        display.problem("Stopped.", "Nothing has reached the scheduler.")
+    except Exception as e:
+        display.problem(f"{type(e).__name__}: {e}")
+    finally:
+        agent.on_ask = None
+
+
+# Commands whose first argument is the name of an existing run. The two groups
+# differ in what is worth offering: a decision applies only to a run that is
+# waiting for one, and everything else applies only to a run that has actually
+# been submitted. Offering the wrong set is how you end up typing /check on a run
+# that has not run.
+_DECIDE = ("approve", "reject")
+_WATCH = ("check", "jobs", "why", "cancel")
+
+
+def _run_names(agent, command):
+    """Values to complete the first argument of `command` with, or None.
+
+    None means "this command's argument is not a run name" -- /track's first
+    argument is a name being invented, and /model's is a provider. An empty list
+    means it is a run name and there are none, which the prompt says out loud
+    rather than silently offering nothing.
+    """
+    try:
+        if command in _DECIDE:
+            records = agent.registry.held()
+        elif command in _WATCH:
+            records = [r for r in agent.registry.live()
+                       if r["status"] != runs_store.HELD]
+        else:
+            return None
+    except Exception:
+        return []          # a broken registry must not break the input line
+    # Newest first, because the registry is append-only and therefore oldest
+    # first, and the run you mean is almost always the one you just made. It is
+    # also the row Enter takes when you have not moved the selection.
+    return [(r["name"], _run_note(r)) for r in reversed(records)]
+
+
+def _run_note(record):
+    """One phrase saying what this run is, for the completion menu."""
+    slots = (record.get("proposal") or {}).get("slots") or {}
+    what = " ".join(str(slots[k]) for k in ("pipeline", "protocol")
+                    if slots.get(k)) or (record.get("proposal") or {}).get("command", "")
+    check = record.get("last_check") or {}
+    return f"{what}  {check.get('verdict', '')}".strip()
+
+
+def _briefed(line, already_sent):
+    """The line to send the agent, plus the directory brief that went with it.
+
+    Every turn is briefed now, not just the opening one, and the change came from
+    a real failure. The request "run rnaseq_light on readset.rnaseq.txt" arrived
+    third in a conversation, so it carried no brief; the model had never been told
+    what was in the working directory, took the filename on trust, and got
+    `can't open 'readset.rnaseq.txt'` back. Its next move was `find / -iname
+    readset.rnaseq.txt`, which is the wrong answer to the right question.
+
+    The original reason for briefing only once was that repeating a list of
+    filenames every turn keeps putting stale paths in front of the model. So the
+    brief is deduplicated instead of rationed: an unchanged context block is
+    dropped and only the line is sent, and a readset that appears in the directory
+    an hour into the conversation is mentioned once, when it appears.
+    """
+    briefed = intake.brief(line, os.getcwd())
+    if intake.CONTEXT_MARK not in briefed:
+        return line, already_sent
+    context = briefed.split(intake.CONTEXT_MARK, 1)[1].strip()
+    if context == (already_sent or ""):
+        return line, already_sent
+    return briefed, context
+
+
 def _repl(agent):
-    """The application's actual interface. Bare text is a task -- named, then
-    run, since every run needs a name to /approve, /reject, or /check it later,
-    possibly in a separate session. Anything starting with / is a command.
+    """The application's actual interface: a conversation, with commands in it.
+
+    Bare text is talk. It goes to the agent on one continuous thread, so the
+    third thing you say lands after the first two rather than in front of a
+    blank agent -- ask a question, get an answer, refine it, and only then build
+    a run. The agent asks its own questions along the way, through _panel.
+
+    Anything starting with / is a command. Those exist because a decision about
+    the cluster should never be inferred from prose: /approve is typed, never
+    guessed at.
+
+    One conversation can produce any number of runs. Each is named at the gate
+    and lives on under that name -- /list, /check and /why are about runs, and
+    outlive the conversation that started them.
 
     The prompt is created once and kept, so history survives across turns.
     """
-    prompt = ui.Prompt(MENU)
+    prompt = ui.Prompt(MENU, arguments=lambda cmd: _run_names(agent, cmd))
+    thread = _conversation_id()
+    context = None              # the last directory brief sent on this thread
 
     while True:
         try:
@@ -632,6 +858,11 @@ def _repl(agent):
             cmd, args = _resolve(parts[0].lower()), parts[1:]
             if cmd in ("exit", "quit"):
                 break
+            if cmd == "new":
+                thread = _conversation_id()
+                context = None
+                display.fresh(agent.pending())
+                continue
             handler = COMMANDS.get(cmd)
             if handler is None:
                 print(f"  {display.RED}No such command: {line.split()[0]}{display.RESET}"
@@ -643,34 +874,13 @@ def _repl(agent):
                 print(f"  {display.RED}{type(e).__name__}: {e}{display.RESET}\n")
             continue
 
-        # Fill in what the request left out before the model sees it, so the
-        # panel's options come from the ini table rather than from a model's
-        # idea of what protocols exist.
         try:
-            stated, cancelled = intake.resolve(line, asker=_panel)
+            text, context = _briefed(line, context)
         except Exception as e:
             display.problem(f"{type(e).__name__}: {e}")
-            continue
-        if cancelled:
-            display.nothing("Cancelled.")
-            continue
-        task = intake.restate(line, stated)
+            text = line
 
-        try:
-            name = _name_run(agent, line)
-        except Exception as e:
-            display.problem(f"{type(e).__name__}: {e}")
-            continue
-        if name is None:
-            continue
-        print()
-        try:
-            with ui.Activity("thinking") as act:
-                agent.run(task, thread_id=name, on_step=_narrate(act))
-        except KeyboardInterrupt:
-            display.problem("Stopped.", "Nothing has reached the scheduler.")
-        except Exception as e:
-            display.problem(f"{type(e).__name__}: {e}")
+        _turn(agent, thread, text)
 
 
 def main(argv=None):
@@ -701,6 +911,10 @@ def main(argv=None):
     # states it once the key prompt has settled the question.
     display.banner(source=os.environ.get("GENPIPE_LLM_SOURCE"),
                    model=os.environ.get("GENPIPE_LLM_MODEL"))
+    # Who we are talking to. Asked before the key prompt because it is the
+    # cheaper question of the two and the answer is used immediately -- it
+    # labels their side of the conversation from the first line on.
+    _require_name()
     if fake_llm:
         # build_agent() constructs a real provider client even though dev mode
         # replaces it immediately below, and some providers refuse to construct
@@ -715,9 +929,6 @@ def main(argv=None):
     agent = build_agent()
     if fake_llm:
         agent.llm = fakecluster.DevLLM()
-        # Biomni's tool retriever would spend a real model call on resource
-        # selection before the scripted conversation even starts.
-        agent.use_tool_retriever = False
     # Confirm readiness right before the command loop takes over -- see
     # display.ready()'s docstring for why this matters.
     display.ready(os.environ.get("GENPIPE_LLM_SOURCE", DEFAULT_SOURCE),
@@ -727,15 +938,22 @@ def main(argv=None):
     # must not wait to be asked about: its name lived only in that session's
     # scrollback, and without this the decision is simply lost.
     display.pending(agent.pending())
-    # Environment problems that only surface at submit time, surfaced now. The
-    # blocking one is re-checked at the gate; this is the early warning.
+    # Environment problems that only surface at submit time, surfaced now --
+    # blockers only.
+    #
+    # A warning is shown nowhere any more, and that is deliberate. RAP_ID unset
+    # means every job in the run is rejected by Slurm, so it earns a place on a
+    # fresh screen and is re-checked at the gate besides. JOB_MAIL merely bounces
+    # notifications, and reprinting the same amber line at every launch until the
+    # day it is fixed is how a startup screen teaches you not to read it. The
+    # check still exists (preflight.check), it is just not shouted.
     if not fake_cluster:
-        display.environment(preflight.check())
+        display.environment([f for f in preflight.check() if f.blocking])
     try:
         _repl(agent)
     except KeyboardInterrupt:
         print()
-    display.farewell(agent.pending())
+    display.farewell()
 
     # Leave deliberately rather than falling off the end of main().
     #

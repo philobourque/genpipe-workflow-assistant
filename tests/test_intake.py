@@ -104,45 +104,82 @@ r.equal("an unknown protocol is None, not empty",
         slots.expected_inis("dnaseq", "nope"), None)
 
 # --------------------------------------------------------------------------
-r.section("resolve(): one question at a time, and escapable")
+r.section("gap_for(): the one question the agent asked for")
 
-asked = []
+gap = slots.gap_for("protocol", pipeline="dnaseq")
+r.equal("asking for a protocol gets the protocol gap", gap.slot, "protocol")
+r.equal("with every legal value and no others", len(gap.options), 7)
+r.truthy("still closed to freehand answers", not gap.free_text)
+r.truthy("the options come from the table, not the caller",
+         all(o.value in {p.name for p in slots.protocols("dnaseq")}
+             for o in gap.options))
 
+# The most likely malformed ask, and the one worth recovering from rather than
+# refusing: the pipeline is the real gap, and answering it first is the order
+# gaps() exists to enforce.
+gap = slots.gap_for("protocol")
+r.equal("a protocol asked of no pipeline asks the pipeline instead",
+        gap.slot, "pipeline")
 
-def answer_with(script):
-    def asker(gap):
-        asked.append(gap.slot)
-        return script.get(gap.slot)
-    return asker
+gap = slots.gap_for("readset", readset_candidates=["a.txt", "b.txt"])
+r.equal("candidates on disk become the options", len(gap.options), 2)
+r.truthy("a file gap always allows free text", gap.free_text)
+r.truthy("and explains what the file is", bool(gap.note))
 
+gap = slots.gap_for("readset")
+r.equal("nothing on disk means no options", len(gap.options), 0)
+r.truthy("but the question is still askable", bool(gap.question))
 
-asked.clear()
-stated, cancelled = intake.resolve(
-    "run a dnaseq somatic ensemble",
-    asker=answer_with({"protocol": "somatic_ensemble",
-                       "readset": "r.tsv", "pairs": "p.csv"}))
-r.truthy("not cancelled", not cancelled)
-r.equal("pipeline was read, not asked", stated["pipeline"], "dnaseq")
-r.equal("pairs came from the panel", stated["pairs"], "p.csv")
-r.truthy("protocol was never asked -- it was already in the sentence",
-         "protocol" not in asked)
+gap = slots.gap_for("pairs", pipeline="dnaseq", protocol="somatic_ensemble")
+r.contains("the question names what it is for", gap.question, "somatic_ensemble")
 
-asked.clear()
-stated, cancelled = intake.resolve("run dnaseq", asker=answer_with({}))
-r.truthy("declining an answer is not a cancellation", not cancelled)
-r.equal("and stops asking", len(asked), 1)
+gap = slots.gap_for(None, question="Which genome build?")
+r.equal("a question with no slot is still a gap", gap.slot, None)
+r.equal("worded by the model", gap.question, "Which genome build?")
+r.equal("with nothing to choose between", len(gap.options), 0)
 
+r.equal("a slotless, questionless ask has nothing to render",
+        slots.gap_for(None), None)
+r.equal("and a protocol for a pipeline that takes none has nothing to ask",
+        slots.gap_for("protocol", pipeline="covseq"), None)
 
-def refuser(gap):
-    raise KeyboardInterrupt
+# gaps() and gap_for() must word the same question the same way -- they share
+# the builders precisely so that the sweep and a single ask cannot diverge.
+r.equal("one wording, two callers",
+        slots.gaps(pipeline="dnaseq")[0].question,
+        slots.gap_for("protocol", pipeline="dnaseq").question)
 
+# --------------------------------------------------------------------------
+r.section("brief(): facts for the agent, not questions for the user")
 
-stated, cancelled = intake.resolve("run dnaseq", asker=refuser)
-r.truthy("Ctrl+C cancels the whole intake", cancelled)
+text = intake.brief("run rnaseq stringtie with readset.tsv", ".")
+r.contains("the original words survive verbatim", text, "run rnaseq stringtie")
+r.contains("what was stated is marked settled", text, "do not ask again")
+r.contains("including the pipeline", text, "pipeline: rnaseq")
+r.contains("and the file named in the sentence", text, "readset: readset.tsv")
 
-stated, cancelled = intake.resolve("run rnaseq stringtie with readset.tsv")
-r.truthy("no asker means no questions", not cancelled)
-r.equal("but the request is still read", stated["pipeline"], "rnaseq")
+# The distinction the wording has to carry: a file that looks like a readset is
+# a candidate, not a decision. Getting this backwards is how an agent silently
+# runs on the wrong samples.
+tmp = tempfile.mkdtemp(prefix="brief-")
+try:
+    for name in ("readset.rnaseq.txt", "design.rnaseq.txt", "notes.md"):
+        open(os.path.join(tmp, name), "w").close()
+    text = intake.brief("do the usual rnaseq thing", tmp)
+    r.contains("files on disk are offered", text, "readset.rnaseq.txt")
+    r.contains("as candidates", text, "candidates, not")
+    r.truthy("and are never presented as settled",
+             "do not ask again" not in text.split("candidates")[1])
+    r.truthy("an irrelevant file is left out", "notes.md" not in text)
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+
+empty = tempfile.mkdtemp(prefix="brief-empty-")
+try:
+    r.equal("nothing to add means the text is untouched",
+            intake.brief("hello", empty), "hello")
+finally:
+    shutil.rmtree(empty, ignore_errors=True)
 
 # --------------------------------------------------------------------------
 r.section("Candidates come from the working directory")
@@ -164,15 +201,15 @@ finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
 # --------------------------------------------------------------------------
-r.section("restate() adds answers without discarding the words")
+r.section("The intent that was never in a field survives")
 
-original = "run the thing Marie asked about"
-text = intake.restate(original, {"pipeline": "rnaseq", "readset": "r.tsv",
-                                 "protocol": None, "design": None, "pairs": None})
-r.contains("the original request survives verbatim", text, original)
-r.contains("the answer is appended", text, "readset: r.tsv")
-r.equal("nothing new means nothing appended",
-        intake.restate("run rnaseq", intake.read("run rnaseq")), "run rnaseq")
+# The reason brief() appends instead of rewriting. A request rebuilt from
+# parsed fields loses "the thing Marie asked about", and that clause is often
+# the part that decides whether the answer is any use.
+original = "run the rnaseq thing Marie asked about"
+text = intake.brief(original, ".")
+r.contains("the whole sentence is still there", text, original)
+r.truthy("and comes first", text.startswith(original))
 
 # --------------------------------------------------------------------------
 r.section("slots.py and genpipes.md still agree")

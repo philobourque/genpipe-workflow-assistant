@@ -25,6 +25,8 @@ sys.path.insert(0, ROOT)
 from harness import Report                      # noqa: E402
 from test_app import App                        # noqa: E402
 
+import display                                  # noqa: E402 -- for _GOODBYES
+
 
 def run():
     r = Report("case 1 -- the interface, end to end")
@@ -223,7 +225,11 @@ def run():
 
         app.line("/exit")
         app.pump(1.0)
-        r.check("25 the farewell is printed", "bye" in app.emitted())
+        # One of several goodbyes, sampled at random -- so the assertion is that
+        # the app said one of them, not that it said any particular one.
+        emitted = app.emitted()
+        r.check("25 the farewell is printed",
+                any(line in emitted for line in display._GOODBYES))
         # wait(), not poll(). The app exits via os._exit while the pty master is
         # still open, and poll() kept returning None for a process whose
         # /proc/<pid>/cmdline was already empty -- i.e. reporting a dead process
