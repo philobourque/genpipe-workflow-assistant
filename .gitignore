@@ -22,6 +22,8 @@ runs.jsonl
 biomni_data/
 # The generation artifact: whatever a `genpipes ... -g` call wrote last.
 cmd.sh
+# What the last cluster test case recorded. Useful locally, not shared history.
+testcases/last-run-*.json
 
 # venv
 venv/

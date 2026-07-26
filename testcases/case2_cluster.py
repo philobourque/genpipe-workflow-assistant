@@ -57,10 +57,21 @@ def preconditions(r):
         print(f"      {finding.variable}: {finding.problem}")
     r.check("RAP_ID is a usable allocation", not blockers)
 
-    has_key = any(os.environ.get(v) for v in
-                  ("ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-                   "GEMINI_API_KEY", "GROQ_API_KEY"))
-    r.check("a real API key is configured", has_key)
+    # Either exported, or in the .env biomni loads at import. Checked by
+    # presence of the variable name only -- the value is never read here and
+    # never printed anywhere.
+    names = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+             "GROQ_API_KEY")
+    has_key = any(os.environ.get(v) for v in names)
+    if not has_key:
+        env_file = os.path.join(ROOT, ".env")
+        try:
+            with open(env_file) as fh:
+                has_key = any(f"{v}=" in line and not line.strip().startswith("#")
+                              for line in fh for v in names)
+        except OSError:
+            pass
+    r.check("a real API key is configured (env or .env)", has_key)
 
     probe = shell(f"module load {MODULE} && genpipes --version")
     r.check("the genpipes module loads", probe.returncode == 0,
@@ -201,8 +212,9 @@ def main():
     ap.add_argument("--workdir", default=os.path.expanduser("~/scratch/case2"))
     ap.add_argument("--steps", default="1-4",
                     help="CIT step range; keep it small (default 1-4)")
-    ap.add_argument("--skip-wait", action="store_true",
-                    help="submit but do not wait for completion")
+    ap.add_argument("--no-submit", action="store_true",
+                    help="generate and check the script, then stop. Free: "
+                         "generation consumes no allocation.")
     ap.add_argument("--production", action="store_true",
                     help="case 3: no cit.ini, real data, full step range")
     ap.add_argument("--pipeline", default="rnaseq")
@@ -247,7 +259,7 @@ def main():
     record = {"workdir": workdir, "command": command, "steps": args.steps,
               "production": args.production, "pipeline": args.pipeline}
 
-    if script and not args.skip_wait:
+    if script and not args.no_submit:
         job_list = submit(r, workdir, script)
         record["job_list"] = job_list
         if job_list:
