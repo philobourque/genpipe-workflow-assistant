@@ -1,220 +1,331 @@
-# GenPipes command grammar (v6.1.1, Rorqual / DRAC)
+# GenPipes on Rorqual (v6.1.1, DRAC)
 
-This document is the agent's model of GenPipes. It encodes the invariant grammar: the shape of a valid invocation, the config layering rule, the mapping from pipeline and protocol to required inputs, the two-stage generate-then-submit model, and the file formats. It deliberately does not carry step counts or step lists, because those change across versions and protocols and are authoritative only from `genpipes <pipeline> -h` on the live install. The grammar tells you which slots exist and how they combine; `-h` tells you the numbers that fill the `-s` slot. Knowing where to look is part of the grammar.
+This is the basis: what is true for every GenPipes run, and what `--help` cannot
+tell you. Everything pipeline-specific — flags, protocol values, step numbers,
+what each step does — comes from `--help` at the moment you need it.
 
-Every fact here is either a rule the agent applies or a signal the agent reads. Nothing here submits a job. Submission is a separate, explicit act described in the generation-versus-submission section, and it is the only consequential step.
+Nothing in this document submits a job. Submission is one explicit act, named in
+"Generate versus submit", and it is the only consequential step.
 
-## Environment contract
+## 1. How to find things out
 
-GenPipes v6 is a Python package, not a loadable set of Python modules, and it requires Python 3.12 or newer. On Rorqual it is delivered through CVMFS and made available with a module. Two facts follow that the agent must treat as hard rules.
+`genpipes <pipeline> --help` is authoritative and free. It prints the complete
+flag set, the legal `-t` protocol values, the **full numbered step list for every
+protocol**, and a description of what each step does. It is version-exact,
+because it is the install talking about itself.
 
-First, every `genpipes` invocation runs inside a subprocess that first loads the module, in the same shell, joined with `&&`:
+Read it before generating a command for a pipeline. Never state a step number
+from memory; take it from `--help`. If a generation is rejected for an
+out-of-range step, re-read `--help` before changing anything else.
+
+Reading is free. `--help`, `ls`, log inspection and `sacct` consume no
+allocation. So does generation itself — see section 3.
+
+## 2. Environment
+
+GenPipes v6 is a Python package delivered through CVMFS and reached with a
+module. It runs under its own Python 3.13, separate from this agent's
+interpreter. The module load is the boundary between them.
+
+Every invocation loads the module in the same subprocess, joined with `&&`:
 
 ```
 module load mugqic/genpipes/6.1.1 && genpipes <pipeline> ...
 ```
 
-The agent's own Python environment is 3.12.4 and is separate from the one GenPipes runs under. The `module load` prefix is the boundary between them. A bare `genpipes` call without the prefix is invalid and will fail.
+A bare `genpipes` call is invalid. `$GENPIPES_INIS` does not exist until the
+module is loaded, so write ini paths with the variable and let the loaded module
+resolve them — never expand it yourself, never hardcode an absolute config path.
 
-Second, `$GENPIPES_INIS` does not exist until the module is loaded. It is the variable that resolves the config directory, so every ini path is written relative to it and is only meaningful after the load in the same subprocess. Do not expand `$GENPIPES_INIS` yourself and do not hardcode an absolute config path; write the paths with the variable and let the loaded module resolve them.
+Four environment variables matter, normally set in `~/.bash_profile`:
 
-## Invocation skeleton
+| variable | what it is |
+|---|---|
+| `MUGQIC_INSTALL_HOME` | `/cvmfs/soft.mugqic/CentOS6`; roots the modulefiles, genomes and testdata |
+| `GENPIPES_INIS` | set by the module; roots every config path |
+| `RAP_ID` | the Alliance allocation jobs are billed to, e.g. `rrg-bourqueg-ad` |
+| `JOB_MAIL` | address for job notifications |
 
-Every generation command has this shape. Square brackets mark slots that depend on the pipeline and protocol.
+`RAP_ID` and `JOB_MAIL` are not GenPipes settings. `common_ini/rorqual.ini`
+interpolates them straight into every generated `sbatch` line:
+
+```ini
+cluster_other_arg = --mail-type=END,FAIL --mail-user=$JOB_MAIL -A $RAP_ID
+```
+
+GenPipes never validates them. An unset `RAP_ID` produces `-A` with nothing after
+it and every job is rejected at submit time — after generation, after approval.
+A wrong `JOB_MAIL` costs only notifications, silently.
+
+## 3. Generate versus submit
+
+These are two acts and the approval gate sits between them.
+
+**Generation** is `genpipes <pipeline> ... -g cmd.sh`. It reads the readset,
+the design or pairs, and the layered inis, resolves the requested steps, and
+writes a bash script. It consumes no allocation and submits nothing. It is safe
+to run and re-run, and it is the best probe available: it either succeeds or
+names exactly which step, input or config option it rejected.
+
+**Submission** is running that script. Two forms, both consequential, both
+gated:
+
+- `bash cmd.sh` sends every job to Slurm directly.
+- For large runs, `genpipes tools chunk_genpipes <script> <folder>` splits it
+  into scheduler-sized chunks, then `genpipes tools submit_genpipes <folder> -n N`
+  submits them under a queue cap, retrying submit-time failures and holding a
+  lock so two submitters cannot race. This is a distinct submission mechanism;
+  recognising only `bash cmd.sh` as the submit act misses every chunked run.
+
+**Submit exactly once.** A second `bash cmd.sh` silently queues a duplicate of
+every job. There is no warning and no deduplication.
+
+## 4. Command skeleton
 
 ```
 module load mugqic/genpipes/6.1.1 && \
 genpipes <pipeline> [-t <protocol>] \
-  -c $GENPIPES_INIS/<pipeline>/<pipeline>.base.ini [<feature>.ini ...] $GENPIPES_INIS/common_ini/rorqual.ini \
+  -c <ini> [<ini> ...] \
   -r <readset.tsv> [-d <design.tsv> | -p <pairs.csv>] \
-  -s <steps> [-j slurm] \
+  -s <steps> [-j slurm] [-o <outdir>] \
   -g <cmd.sh>
 ```
 
-The slots, in order of how often they are decided wrongly:
+`-t` selects a protocol; pipelines with only one do not take it. `-r` is
+required everywhere. `-d` and `-p` are mutually exclusive — never both. `-s`
+takes `1-5`, `3,6,7` or `2,4-8`, with the last number from `--help`. `-j`
+defaults to `slurm` on Rorqual. `-g` names the generation artifact; always use
+it, never the deprecated `> cmd.sh` redirect.
 
-`<pipeline>` is the pipeline token, for example `rnaseq`, `chipseq`, `dnaseq`. It is the first positional argument.
+## 5. The `-c` stack
 
-`-t <protocol>` selects a protocol within the pipeline. Whether it is required, and its legal values, are pipeline-specific and listed in the per-pipeline grammar below. Pipelines with a single protocol do not take `-t`.
+An ini is a plain settings file of `[section]` headers and `key = value` lines,
+where **a section is usually a step name** — the same names `--help` prints:
 
-`-c` takes the ordered list of ini files. Order is semantic. See the config layering rule.
-
-`-r <readset.tsv>` is required for every pipeline.
-
-`-d <design.tsv>` and `-p <pairs.csv>` are mutually exclusive and protocol-dependent. Most pipelines take neither, differential pipelines take `-d`, paired-somatic protocols take `-p`. Never supply both.
-
-`-s <steps>` is the step range, for example `1-N` for a whole protocol or `6-N` to resume from step 6, where the last step number N comes from `-h`, not from memory. See discovering steps.
-
-`-j` is the scheduler. On Rorqual it defaults to `slurm`, so it may be omitted; including `-j slurm` is harmless and explicit. Use `-j pbs` only on Abacus, `-j batch` only for local container runs.
-
-`-g <cmd.sh>` writes the generated commands to a script file. This is the generation artifact and the gate seam. Always generate with `-g`. Do not use the `> cmd.sh` redirect; it still works but is deprecated and it breaks the assumption that a named artifact file exists.
-
-## Config layering rule
-
-The `-c` list is applied left to right and later files override earlier ones, so order is meaning, not formatting. The rule is fixed:
-
-1. The pipeline base ini first: `$GENPIPES_INIS/<pipeline>/<pipeline>.base.ini`.
-2. Any protocol or feature inis in the middle, for example `$GENPIPES_INIS/dnaseq/dnaseq.cancer.ini` for somatic dnaseq, or `$GENPIPES_INIS/dnaseq/dnaseq.sv.ini` for the germline structural-variant protocol.
-3. The cluster ini last, always `$GENPIPES_INIS/common_ini/rorqual.ini` on Rorqual.
-
-The cluster ini goes last because it carries the site's scheduler and resource settings and must win over anything a pipeline default set earlier. Omitting the cluster ini is a common and silent error: the command may still generate but will not be correctly parameterized for Rorqual.
-
-## Discovering steps and protocol details
-
-`-s` is the one slot this document does not fill, because step numbers are version- and protocol-specific and go stale the moment either changes. The authoritative source is the pipeline's own help:
-
-```
-module load mugqic/genpipes/6.1.1 && genpipes <pipeline> -h
+```ini
+[gatk_haplotype_caller]
+nb_jobs=1
+cluster_walltime = 12:00:00
 ```
 
-The help output lists the legal `-t` protocol values with the default marked, the full ordered list of numbered steps for the pipeline, and the complete flag set. Read it to learn the last step number for the `-s` range, to confirm a protocol name before using it, and to confirm whether a flag like `-d` or `-p` applies. Prefer the numbered step list from `-h` over any count, because resuming needs the actual step boundary, not a total.
+GenPipes itself holds no numbers. Every module version, CPU count, memory
+request, walltime and reference path comes from the inis. `-c` takes several,
+applied left to right, later winning. Each layer answers a different question:
+
+1. **`<pipeline>.base.ini`** — how the pipeline works at all. Always first.
+2. **protocol feature ini** — what changes for this `-t`. See the table.
+3. **data-type overlay** — `dnaseq.exome.ini` and friends. Orthogonal to
+   protocol: it sets `experiment_type=exome` and touches both germline and
+   somatic sections, so it stacks *with* the feature ini when the reads are
+   capture rather than whole-genome.
+4. **cluster ini** — `common_ini/rorqual.ini` here. Carries partitions,
+   walltimes and the `RAP_ID`/`JOB_MAIL` line.
+5. **genome ini** — only for a non-default genome, at
+   `$MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/<Species>.<assembly>.ini`.
+6. **your own overrides** — last word.
+
+A private override ini is just a file with the sections you want to change,
+appended last. That is how to tune a resource. Never edit anything under
+`$GENPIPES_INIS`.
+
+Getting layer 2 wrong does not crash. It generates and runs, with the wrong
+parameters, for hours.
+
+### Feature inis by pipeline
+
+Confirm names against `ls $GENPIPES_INIS/<pipeline>/` if one does not resolve.
+
+| pipeline | protocols (`-t`) | feature ini between base and cluster | design / pairs |
+|---|---|---|---|
+| `dnaseq` | `germline_snv` | — | neither |
+| | `germline_sv` | `dnaseq.sv.ini` | neither |
+| | `germline_high_cov` | `dnaseq.high_cov.ini` | neither |
+| | `somatic_tumor_only` | — | neither |
+| | `somatic_fastpass` | `dnaseq.cancer.ini` | `-p` |
+| | `somatic_ensemble` | `dnaseq.cancer.ini` | `-p` |
+| | `somatic_sv` | `dnaseq.cancer.ini` | `-p` |
+| `rnaseq` | `stringtie` (default) | — | `-d` |
+| | `variants`, `cancer` | — | neither |
+| `chipseq` | `chipseq`, `atacseq` | — | `-d` conditional |
+| `methylseq` | `bismark`, `gembs` | — | `-d` |
+| | `hybrid` | `methylseq.hybrid.ini` | `-d` |
+| | `dragen` | `methylseq.dragen.ini` | `-d` |
+| `longread_dnaseq` | `nanopore`, `revio` | — | `-d` |
+| | `nanopore_paired_somatic` | `longread_dnaseq.cancer.ini` | `-p` |
+| `rnaseq_denovo_assembly` | `trinity`, `seq2fun` | — | `-d` |
+| `nanopore_covseq` | `default`, `basecalling` | `ARTIC_v4.ini` / `ARTIC_v4.1.ini` by primer scheme | `-d` |
+| `covseq` | none | `ARTIC_v4.ini` / `ARTIC_v4.1.ini` by primer scheme | `-d` |
+| `ampliconseq`, `rnaseq_light` | none | — | `-d` |
 
-This lookup is free. Introspection runs nothing on the cluster and consumes no allocation, and so does generation itself: a `-g` generation is a safe dry probe that either succeeds or reports exactly which step or input it rejected. Read `-h` once per pipeline and protocol at the start of a task and reuse the result across generations within that task rather than shelling out on every run. If a generation is later rejected for an out-of-range step, re-read `-h` before changing anything else; the step list has almost certainly shifted under a version bump.
+`<pipeline>.batch.ini` is a separate overlay for `-b` batch-effect correction,
+not a protocol ini. `cit.ini` is the test overlay — see section 10.
 
-## Generation versus submission
+## 6. Readset file
+
+Tab-separated, one readset per row, passed with `-r`. Required by every
+pipeline.
 
-GenPipes separates writing the pipeline from running it, and the agent must keep these two acts distinct because the human-approval gate sits between them.
+Mandatory: `Sample`, `Readset`, `RunType` (`PAIRED_END` or `SINGLE_END`), `Run`,
+`Lane`, and either `FASTQ1`/`FASTQ2` or `BAM`. Optional: `Library`, `Adapter1`,
+`Adapter2`, `QualityOffset`, `BED`.
 
-Generation is `genpipes <pipeline> ... -g cmd.sh`. It reads the readset, design or pairs, and the layered inis, resolves the requested steps, and writes a bash script. It consumes no allocation and submits nothing. It is safe to run and re-run.
-
-Submission is running that script, and there are two forms. Both are the consequential act and both must pass the approval gate.
-
-The simple form is `bash cmd.sh`, which sends every job to SLURM directly.
-
-The DRAC-aware form uses two GenPipes tools. `chunk_genpipes.sh` is run once against the generated script to split it into scheduler-sized job chunks in a `job_chunks` folder. Then `submit_genpipes` submits those chunks, managing queue limits, resubmitting jobs that fail to reach the scheduler up to ten times, and holding a lock so two submitters cannot run against the same chunk folder at once. This is the correct path for large runs on Rorqual and it is a distinct submission mechanism from `bash cmd.sh`. The gate and the watcher must recognize both `bash cmd.sh` and the `chunk_genpipes.sh` then `submit_genpipes` sequence as submission; treating only `bash cmd.sh` as the submit act misses every chunked run.
-
-## Per-pipeline grammar
-
-For every pipeline below, the step range comes from `genpipes <pipeline> -h`, not from this document. What is stated here is the stable grammar: protocol names, ini layering, and whether design or pairs applies.
-
-### rnaseq
-
-STAR-based RNA sequencing. Protocols under `-t` are `stringtie` (the default, differential expression), `variants` (variant calling from RNA), and `cancer` (variants plus gene-fusion detection). The `stringtie` protocol takes a design file with `-d` defining comparison groups and optionally a batch file with `-b` for batch-effect correction in the Ballgown differential analysis. Readset required. Inis: `rnaseq.base.ini` then `rorqual.ini`.
-
-### chipseq
-
-BWA alignment, MACS2 peak calling, HOMER annotation, DiffBind differential binding. Protocols under `-t` are `chipseq` and `atacseq`. A design file drives the differential-binding steps and is not required for a peak-calling-only run: if no valid design is supplied the differential-binding step is skipped rather than erroring, so treat `-d` as conditional, required only when the run should produce differential binding. The design format is chipseq-specific (see the design file section). For `atacseq` the mark column value must be `atac`. Readset required. Inis: `chipseq.base.ini` then `rorqual.ini`.
-
-### dnaseq
-
-DNA sequencing, variant calling. Protocol under `-t` is required and selects one of the germline or somatic workflows. The distinguishing grammar is the feature ini and whether pairs apply.
-
-Germline protocols take neither design nor pairs:
-`germline_snv` uses `dnaseq.base.ini` then `rorqual.ini`.
-`germline_sv` adds `dnaseq.sv.ini` between base and cluster.
-`germline_high_cov` adds `dnaseq.high_cov.ini` between base and cluster.
-
-Somatic protocols compare tumor against normal:
-`somatic_sv`, `somatic_fastpass`, and `somatic_ensemble` add `dnaseq.cancer.ini` between base and cluster and take a pairs file with `-p pairs.csv`.
-`somatic_tumor_only` runs without a normal, so it does not take `-p`; confirm its exact ini set with `genpipes dnaseq -h`, as it does not follow the paired-somatic ini pattern.
-
-### Other pipelines on the install
-
-`rnaseq_denovo_assembly` (Trinity de novo assembly, takes `-d` design), `rnaseq_light`, `longread_dnaseq` (protocols `nanopore` and `revio` under `-t`, no design, uses `-o` for output dir), `methylseq`, `covseq`, `nanopore_covseq`, `ampliconseq`, and `tools`. Do not assume their grammar. Query it with `genpipes <pipeline> --help` before generating.
-
-## Readset file
-
-Tab-separated, one readset per row. It describes samples and the location of their input sequence data and is required for every pipeline, passed with `-r`. Columns cover the sample name, the readset name, library, run, lane, adapter sequences, the quality-score offset, and the paths to the FASTQ or BAM input files. The exact column set is pipeline-specific; the long-read pipeline for instance expects paths to FASTQ, FAST5, or BAM. A malformed readset, a missing column or a path that does not exist, is a common generation failure and is diagnosable by comparing the file's header against what the pipeline expects.
-
-## Design file
-
-Tab-separated, describing the contrasts for a differential analysis. Required for the rnaseq `stringtie` differential run and used by chipseq differential binding; pipelines that do no differential analysis do not take one. The body is a membership matrix: the first column is the sample name, and for chipseq the second column is the mark or binding-protein name (`atac` for the atacseq protocol). Each remaining column is one named contrast, and each cell encodes that sample's role in that contrast: `1` for control, `2` for treatment, `0` or blank to exclude the sample from that contrast. A three-group comparison is expressed as several pairwise contrast columns rather than a single column. Each group in a contrast needs at least two samples or the differential step for that contrast is skipped.
-
-## Pairs file
-
-For paired somatic dnaseq protocols, a comma-separated file passed with `-p` that maps each tumor sample to its matched normal. Required by `somatic_sv`, `somatic_fastpass`, and `somatic_ensemble`. Not used by germline protocols or by `somatic_tumor_only`.
-
-## Resuming
-
-Resuming after a failure is a fresh generation with a later start step followed by a fresh submission, so it passes through both stages again and the submission is again the consequential one. To resume from step 6, regenerate with `-s 6-N`, where N is the protocol's last step from `-h`, then submit the new script. GenPipes tracks completed work: with smart restart it skips steps already finished, so re-running a range does not redo completed jobs. The step to resume from is located from the job status (see monitoring), not guessed.
-
-
-
-
-
-## Monitoring submitted jobs
-
-Reading job and pipeline state commits no resources and is always safe. None of these submit or modify anything. Only generation and submission consume allocation; reading logs and status is free.
-The correct, run-scoped way to check a pipeline's progress is GenPipes' own log_report tool, run against that run's job list file. In v6 this is a subcommand, not a standalone script, so it takes the module load prefix like any other genpipes call:
-module load mugqic/genpipes/6.1.1 && genpipes tools log_report --loglevel ERROR --tsv log.out <job_output_dir>/<Pipeline>.<protocol>.job_list.<TIMESTAMP>
-The job list file is written at submission time into the run's job_output directory, named <Pipeline>.<protocol>.job_list.<TIMESTAMP>, for example DnaSeq.germline_snv.job_list.2026-07-08T14.46.07. It lives wherever the submission ran from, so resolve its actual path rather than assuming; if it is not in the current directory's job_output, search for it with: find . -name "job_list". This file is the anchor that ties one pipeline run to its own job IDs.
-log_report reads that job list and prints a summary scoped to that single run: the number of jobs COMPLETED, PENDING, and the total, plus a per-step breakdown. This is how progress like "4 of 56 complete" is obtained, and how a failed step is located for a resume. Use --loglevel ERROR to suppress the routine warnings about pending jobs that have not yet written logs (those warnings are expected for jobs still queued, not errors), and --tsv <file> to write the detailed per-step table to a file.
-Prefer log_report over the raw scheduler commands for tracking a specific run, because the scheduler commands are account-wide and mix in unrelated jobs:
-squeue -u $USER lists the user's currently queued and running jobs across the whole account; it does not show completed jobs, since a finished job leaves the queue. Use it for a quick "what is active right now" view, not for per-run progress.
-sacct -j <jobid>[,<jobid>...] shows the state and exit status of specific jobs, including completed and failed ones. Scope it to a run's own job IDs, not to -u $USER, which returns every job on the account across unrelated runs and gives a misleading picture.
-scontrol show job <jobid> shows detail for a single pending or running job.
-Job states to expect: PENDING, RUNNING, COMPLETED, FAILED, CANCELLED, TIMEOUT, OUT_OF_MEMORY, NODE_FAIL, PREEMPTED. A job must pass through RUNNING before it can be COMPLETED, so a completed job that was never observed running simply finished between checks.
-
-
-## Success and failure signals
-
-A clean job reports `MUGQICexitStatus:0` or `Exit_status=0`. On failure the pipeline aborts and the cause is written into the `job_output` folder; the specific step's output file there holds the error. A successful run also leaves a report, for example `report/<Pipeline>.<protocol>.multiqc.html`, and pipeline-specific result folders such as `DGE` for rnaseq differential expression. When classifying an outcome, read the exit status first, then the `job_output` file for the failing step, then `log_report.py` for which step failed. These are the signals the retry loop keys on; do not infer success or failure from raw stdout alone.
-
-## Diagnosing a failed or timed-out job
-
-A job's SLURM state is the manner of death, not the cause. TIMEOUT means the scheduler killed the job at its walltime limit; it does not say why the job needed more time than it was given. FAILED means the job exited nonzero; it does not say what went wrong. Treating the state as the cause is the most common diagnostic error, and it produces fixes that do not work: raising a walltime when the real problem is that the tool was pointed at the wrong input only buys more time to do the wrong thing.
-
-First establish whether the run reached the scheduler at all. If there is no job_output directory for the run's timestamp, the failure happened at generation, before any job was submitted, and there are no per-job artifacts to read. GenPipes' own sanity check aborts generation for a malformed readset, a config path that does not exist, or a required parameter that is not set, and it names the offending section and option in its stderr. Diagnose this class from that message and the readset or ini it points to, not from job_output.
-
-For a run that reached the scheduler, five artifacts exist, each answering a different question. They are all tied together by one timestamp, the run's timestamp, which appears in every filename. Resolve artifacts by globbing on that timestamp. Never derive a path by splitting a job name on dots: the job name is not the step directory.
-
-log_report, run against the run's job list, says which pipeline step a job ID belongs to and what state it ended in. It is the only artifact that maps job IDs to steps. It is the starting point and nothing more. A diagnosis that reads only this is not a diagnosis.
-
-Two of the states log_report reports are not what they look like, because it derives status by reading the .o file's prologue and epilogue, not by asking the scheduler. RUNNING means a prologue was written but no epilogue: a live job, or a job killed so hard (out of memory, node failure) that it died before its epilogue ran. Never read RUNNING as "still alive" for a stalled run; confirm the terminal state with sacct. CANCELLED is often not a real cancel but a dependency cascade: log_report stamps a job CANCELLED when any job it depends on did not complete. Trace the dependency list before diagnosing a CANCELLED job, and never write a cause for a job that never ran; the fix is upstream.
-
-sacct -j <jobid> --format=JobID,JobName%40,State,ExitCode,Elapsed,Timelimit,MaxRSS,ReqMem says how the job died and by how much it missed its resources. Compare Elapsed to Timelimit and MaxRSS to ReqMem. A job killed at 3:00:06 against a 3:00:00 limit was working right up to the moment it was killed. A job that died at 0:00:33 hit an error.
-
-This split decides whether a resource change is the fix. A job whose MaxRSS sits at or near its ReqMem, or whose state is OUT_OF_MEMORY, died for lack of memory: raising cluster_mem for that step, sized from the observed MaxRSS, is the correct fix. A job killed at its walltime while working may genuinely need more time, or may be doing futile work it should not do at all, and the .sh and .o decide which. Raising a resource is right for a true shortfall and wrong for futile work; the state alone never tells you which, so do not carry one reflex across both.
-
-The .o log, at job_output/<step_dir>/<jobname>_<TIMESTAMP>.o, says what the tool itself was doing. It holds the tool's own output and any error message.
-
-The .sh script, at job_output/<step_dir>/<jobname>_<TIMESTAMP>.sh, says what the tool was told to do. This is the exact command GenPipes generated, with every flag and every input path. It is the artifact that distinguishes "the job needed more resources" from "the job was given the wrong input", and it is the one most often skipped. Read it before proposing any fix.
-
-The config trace, <Pipeline>.<protocol>.<TIMESTAMP>.config.trace.ini in the directory the pipeline was generated from, says which ini section and which value produced that command. A fix proposal must name the section and the current value, for example [verify_bam_id] cluster_walltime = 3:00:00. A value that cannot be traced to a config line is a guess and must not be presented as a fix. Note that the config trace can contain settings a step does not actually use, so cross-check any option against the .sh that really ran.
-
-Rules for reporting a diagnosis.
-
-State the manner and the cause as separate claims. The manner comes from the SLURM state and sacct. The cause requires the .o log and the .sh script.
-
-If the artifacts do not determine the cause, say so. "The logs do not show why" is a correct and acceptable answer. Do not construct a plausible explanation to fill the gap, and do not infer the internal behaviour of a tool whose documentation you do not have.
-
-Preserve uncertainty all the way to the surface. If an intermediate step concluded "likely", the final report says "likely". Never present a hedged inference as a settled fact.
-
-Do not propose a new resource value unless it can be computed from what was observed and traced to a config section. Quote the section and the current value.
-
-Worked example, from a real run.
-
-Job 15985499 ended in TIMEOUT. sacct shows it killed at 3:00:06 against a 3:00:00 limit at 99.2% CPU efficiency, so it was working when killed. log_report identifies it as step 20, metrics_verify_bam_id. The config trace shows [verify_bam_id] cluster_walltime = 3:00:00, which is the source of the limit.
-
-At that point the obvious fix is to raise the walltime, and it is wrong.
-
-The .sh script shows what the tool was actually told to do:
-  VerifyBamID --SVDPrefix $VERIFYBAMID_HOME/resource/1000g.phase3.100k.b38.vcf.gz.dat
-              --BamFile alignment/NA24385_chr19/NA24385_chr19.sorted.dup.cram
-A genome-wide 100,000-marker panel, against a file containing a single chromosome. The .o log confirms it: the tool was walking chr1 through chr6 when it was killed, searching for markers in chromosomes the file does not contain.
-
-The cause is therefore not an insufficient time limit. Raising the walltime would only pay for more of a futile search. The correct responses are to skip the step for chromosome-subsetted data, or to supply a marker panel that matches the data.
-
-This cause is visible only in the .sh script. It cannot be reached from log_report, from sacct, or from the config trace.
-
-That is the futile-work branch of timeout. Two other classes resolve elsewhere. Out of memory: sacct shows MaxRSS at 30G against a 30G ReqMem and the .o stops abruptly with no tool error, so the cause is the memory ceiling and the fix is a higher cluster_mem in that step's section. Generation failure: the command exits before submission with "Error: REQUIRED parameter [section] option is not defined" and no job_output exists for the run, so the cause and the fix are both in the config or readset the message names, and there is no per-job artifact to read.
-
-## Constraints and gotchas
-
-Always prefix with `module load mugqic/genpipes/6.1.1 &&` in the same subprocess; `$GENPIPES_INIS` is undefined otherwise.
-
-Always put the cluster ini (`rorqual.ini`) last in the `-c` list and the pipeline base ini first.
-
-Always generate with `-g cmd.sh`; do not use `> cmd.sh` (deprecated) and do not combine `-g` with `--clean` (use `>` for clean output instead).
-
-Never supply both `-d` and `-p`.
-
-Never take a step number from this document; there are none here by design. Read `-s` bounds from `genpipes <pipeline> -h`.
-
-## Self-tests
-
-These check comprehension, not transcription. The full answers are deliberately not written here; the document is sufficient only if the correct command can be assembled from the rules above.
-
-Test one. Build an rnaseq stringtie generation for a project with readset `readset.tsv` and design `design.tsv`, all steps, output script `rnaseq_cmd.sh`, layered for Rorqual. A correct answer must load the module, read the step range from `genpipes rnaseq -h` rather than assuming one, use `-t stringtie` or rely on it as the default, layer `rnaseq.base.ini` before `rorqual.ini`, include `-d design.tsv`, and end in `-g rnaseq_cmd.sh`. Then state that submission is a separate `bash rnaseq_cmd.sh`.
-
-Test two. Build a dnaseq somatic_ensemble generation with readset `readset.tsv` and pairs `pairs.csv`, all steps, output script `dnaseq_cmd.sh`, for Rorqual. A correct answer must use `-t somatic_ensemble`, layer three inis in the order `dnaseq.base.ini`, `dnaseq.cancer.ini`, `rorqual.ini`, include `-p pairs.csv` and no `-d`, take the step range from `-h`, and end in `-g dnaseq_cmd.sh`. If the somatic feature ini or the pairs flag is missing, the document was not internalized.
+**Sample names accept only `A-Z`, `a-z`, `0-9`, `-` and `_`.** A dot or space is
+a silent source of trouble downstream.
+
+ChIP-seq adds `MarkName` (the histone mark or binding protein) and `MarkType`
+(control versus treatment). Long-read pipelines expect FAST5 or BAM paths.
+
+A malformed readset is the most common generation failure. Validate rather than
+eyeball it — section 9.
+
+## 7. Design file
+
+Tab-separated, describing contrasts for a differential analysis. Required for
+rnaseq `stringtie`; used by chipseq differential binding, where an absent or
+invalid design skips that step rather than erroring.
+
+First column is `Sample`, and the names must match the readset exactly. For
+chipseq the second column is `MarkName` (`atac` under the `atacseq` protocol).
+Every remaining column is one named contrast, its header the contrast name, and
+each cell that sample's role in it:
+
+- `1` — control group
+- `2` — treatment group
+- `0` or blank — excluded from this contrast
+
+Three groups are expressed as several pairwise contrast columns, not one column
+with three values. A group with fewer than two samples is skipped.
+
+## 8. Pairs file
+
+Comma-separated, passed with `-p`, mapping each tumor sample to its matched
+normal. Used only by the paired somatic protocols in the table above.
+
+## 9. Pre-flight
+
+Two checks that cost nothing and catch most of what fails after approval:
+
+```
+genpipes tools validate_genpipes -p <pipeline> -r <readset.tsv> [-d <design.tsv>]
+genpipes <pipeline> ... --sanity-check
+```
+
+`validate_genpipes` checks readset and design structure. `--sanity-check`
+verifies that every input file the run needs actually exists. Prefer either over
+reasoning about a file's contents.
+
+## 10. Running something cheaply
+
+Every pipeline ships `$GENPIPES_INIS/<pipeline>/cit.ini`, the continuous-
+integration overlay. Appended **last** to `-c`, it repoints the genome to the
+chr19 subset, repoints annotations to `$MUGQIC_INSTALL_HOME/testdata/`, scopes
+callers to chr19, and cuts nearly every walltime to ten minutes.
+
+Matching inputs live in `$MUGQIC_INSTALL_HOME/testdata/<pipeline>/` — readsets,
+designs, pairs and raw reads, with absolute paths already in them.
+
+A CIT run is a real run: real generation, real layering, real submission, real
+job list, real Slurm states. Only the data and the walltimes are small. It is
+the right answer to "will this command work" when the honest answer needs a
+cluster.
+
+## 11. After submission
+
+Submission writes `job_output/<Pipeline>.<protocol>.job_list.<TIMESTAMP>`, for
+example `DnaSeq.germline_snv.job_list.2026-07-08T14.46.07`. That file ties one
+run to its own job IDs and is the anchor for everything below. It lands wherever
+the submission ran from; resolve its real path rather than assuming.
+
+Scoped to one run — prefer these:
+
+```
+genpipes tools log_report --loglevel ERROR --tsv log.out <job_list_path>
+```
+
+Per-step state and counts for that run alone. Use `--loglevel ERROR` to suppress
+routine warnings about queued jobs that have not written logs yet.
+
+Account-wide, and therefore mixed with unrelated work: `squeue -u $USER` for
+what is active now, `sacct -j <ids>` for terminal states of specific jobs.
+Never scope `sacct` with `-u $USER` when asking about one run.
+
+Success is `MUGQICexitStatus:0` or `Exit_status=0`. Output lands in `report/`
+(including `report/<Pipeline>.<protocol>.multiqc.html`) and pipeline-specific
+folders such as `DGE/` or `peak_call/`. Errors land in `job_output/`.
+
+## 12. Diagnosing a failure
+
+A Slurm state is the manner of death, not the cause. `TIMEOUT` says the job was
+killed at its walltime, not why it needed more. `FAILED` says it exited nonzero,
+not what broke. Treating state as cause produces fixes that do not work.
+
+First: did the run reach the scheduler at all? No `job_output` for the run's
+timestamp means it failed at generation, and the error is in the generation
+command's own stderr, which names the offending section or file. There are no
+per-job artifacts to read.
+
+For a run that did reach the scheduler, five artifacts, all tied by the run's
+timestamp. Glob on the timestamp; never derive a path by splitting a job name on
+dots.
+
+**`log_report`** maps job IDs to steps. Starting point only — a diagnosis that
+reads nothing else is not a diagnosis. Two of its states mislead, because it
+reads `.o` prologues and epilogues rather than asking Slurm: `RUNNING` can mean
+a job killed so hard it never wrote an epilogue, so confirm with `sacct`; and
+`CANCELLED` is usually a dependency cascade, not a real cancel — the fix is
+upstream, and a job that never ran has no cause of its own.
+
+**`sacct -j <id> --format=JobID,JobName%40,State,ExitCode,Elapsed,Timelimit,MaxRSS,ReqMem`**
+says how it died and by how much it missed. Killed at 3:00:06 against 3:00:00
+means it was working when killed; dead at 0:00:33 means it hit an error.
+
+**The `.o` log**, `job_output/<step_dir>/<jobname>_<TIMESTAMP>.o` — what the
+tool was doing, and its error message.
+
+**The `.sh` script**, same directory — what the tool was *told* to do, with
+every flag and input path. This distinguishes "needed more resources" from
+"given the wrong input". It is the artifact most often skipped and most often
+decisive. Read it before proposing any fix.
+
+**The config trace**, `<Pipeline>.<protocol>.<TIMESTAMP>.config.trace.ini` in the
+generation directory — which ini section produced that value. It can list
+options a step never used, so cross-check against the `.sh`.
+
+Reporting rules:
+
+- State manner and cause as separate claims. Manner from `sacct`; cause needs
+  the `.o` and the `.sh`.
+- "The logs do not show why" is a correct answer. Do not invent a plausible
+  cause to fill the gap.
+- Preserve uncertainty to the surface. If a step concluded "likely", say
+  "likely".
+- Never propose a resource value that cannot be computed from what was observed
+  and traced to a config section. Quote the section and its current value.
+
+Worked example. Job 15985499 ended `TIMEOUT`, killed at 3:00:06 against a
+3:00:00 limit at 99.2% CPU efficiency — working when killed. `log_report` puts
+it at step 20, `metrics_verify_bam_id`. The config trace shows
+`[verify_bam_id] cluster_walltime = 3:00:00`. The obvious fix is to raise the
+walltime, and it is wrong. The `.sh` shows `VerifyBamID` pointed at a
+genome-wide 100,000-marker panel against a single-chromosome CRAM, and the `.o`
+shows it walking chr1–chr6 hunting markers the file cannot contain. More time
+would only buy more futile search. The fix is to skip the step for
+chromosome-subsetted data or supply a matching panel — visible only in the
+`.sh`.
+
+The other two classes resolve elsewhere. Out of memory: `MaxRSS` at the `ReqMem`
+ceiling and a `.o` that stops mid-sentence, so raise `cluster_mem` for that
+section, sized from the observed `MaxRSS`. Generation failure: no `job_output`
+at all and an explicit "REQUIRED parameter ... is not defined" on stderr.
+
+## Hard rules
+
+- Prefix every call with `module load mugqic/genpipes/6.1.1 &&` in the same
+  subprocess.
+- Base ini first, cluster ini after the feature ini, `cit.ini` or private
+  overrides last.
+- Always generate with `-g`; never `> cmd.sh`; never combine `-g` with
+  `--clean`.
+- Never supply both `-d` and `-p`.
+- Never take a step number from this document. There are none here by design.
+- Never submit twice.
