@@ -26,8 +26,11 @@ Labels are always bright; bodies are dimmed only where the content is long and
 secondary (machine output, connective prose). The signal is in the labels.
 """
 
-import re
+import getpass
 import os
+import re
+import shutil
+import textwrap
 
 # ---------------------------------------------------------------------------
 # ANSI escape codes. \033[<n>m sets an attribute; \033[0m clears everything.
@@ -49,46 +52,194 @@ WIDTH = 74
 # ---------------------------------------------------------------------------
 # The startup banner. Written for a GenPipes user, not a builder: it answers
 # "can I trust this with my allocation?" before anything else, and shows where
-# the human sits in the pipeline. Model names, framework versions and file paths
-# are deliberately absent -- that is builder trivia, and it belongs in a README.
+# the human sits in the pipeline.
+#
+# Two columns, because the two things it has to say are different in kind. The
+# left is identity -- who you are, what this is, which model is behind it, where
+# it lives on disk. The right is orientation -- what to type, and the one rule
+# that makes this tool different from talking to a chatbot with a shell.
+#
+# Green throughout, and a helix rather than a logo: the whole point of the tool
+# is that the thing on the other end knows biology, and the first screen may as
+# well say so.
 # ---------------------------------------------------------------------------
 
-def banner():
-    """Print the startup banner. The little pipeline diagram is not decoration:
-    it teaches the whole idea before the user types anything -- what runs freely,
-    where it stops, and who decides. GATE is the same red it will be when it
-    actually fires, so the colour already means something by the time they see it.
+VERSION = "v0"
+
+# Two strands crossing. "\u259a" leans one way, "\u259e" the other, so a column of them
+# reads as a diagonal; the dashes between are the base pairs. Six rows is one
+# crossing -- enough to be unmistakably DNA, short enough to sit in a banner.
+_HELIX = [
+    "\u259a\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u259e",
+    "  \u259a\u254c\u254c\u254c\u259e  ",
+    "   \u259a\u254c\u259e   ",
+    "   \u259e\u254c\u259a   ",
+    "  \u259e\u254c\u254c\u254c\u259a  ",
+    "\u259e\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u259a",
+]
+
+_STRAND = {"\u259a": f"{BOLD}{GREEN}", "\u259e": f"{GREEN}{DIM}", "\u254c": f"{GREY}{DIM}"}
+
+
+def _helix():
+    """The helix, coloured per glyph: one strand bright, the other shaded, the
+    base pairs quiet. Two tones is what stops it reading as a flat texture."""
+    return ["".join(f"{_STRAND[c]}{c}{RESET}" if c in _STRAND else c for c in row)
+            for row in _HELIX]
+
+
+def _tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home) else path
+
+
+def _pad(cell, w):
+    """Fit a styled string to exactly w visible columns.
+
+    The truncating branch is a backstop, not a feature: every line the banner
+    builds is meant to fit, but one that didn't would push the box's right-hand
+    border out and make the whole frame look broken. Dropping the colour when
+    truncating avoids slicing through the middle of an escape sequence.
     """
+    n = _vis_len(cell)
+    if n <= w:
+        return cell + " " * (w - n)
+    return re.sub(r"\033\[[0-9;]*[A-Za-z]", "", cell)[:max(0, w - 1)] + "…"
+
+
+def _vis_len(s):
+    return len(re.sub(r"\033\[[0-9;]*[A-Za-z]", "", s))
+
+
+def _wrap(text, w, style=GREY, indent=""):
+    body = textwrap.wrap(text, max(20, w - len(indent))) or [""]
+    return [f"{indent}{style}{line}{RESET}" for line in body]
+
+
+def _identity(source, model):
+    who = source and model and f"{source} \u00b7 {model}"
+    return who or "no model configured yet"
+
+
+def _left_column(user, source, model, path):
+    lines = [""]
+    lines.append(f"{BOLD}Welcome back, {user}{RESET}")
+    lines.append("")
+    lines += [f"   {row}" for row in _helix()]
+    lines.append("")
+    lines.append(f"{BOLD}{GREEN}GenPipes{RESET} {BOLD}assistant{RESET}  "
+                 f"{GREY}{VERSION}{RESET}")
+    lines.append(f"{GREY}{_identity(source, model)}{RESET}")
+    lines.append(f"{DIM}{_tilde(path)}{RESET}")
+    return lines
+
+
+def _right_column(w):
     arrow = f"{GREY}\u2500\u2500\u25b6{RESET}"
+    lines = [""]
+    lines.append(f"{BOLD}Getting started{RESET}")
+    lines += _wrap("Type what you want in plain English, then give the run a name:", w)
+    lines.append(f"  {WHITE}run dnaseq germline_snv on my readset, all steps{RESET}")
+    lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
+    lines.append(f"{GREY}Press {RESET}{GREEN}/{RESET}{GREY} to see every command, "
+                 f"{RESET}{GREEN}Tab{RESET}{GREY} to complete one.{RESET}")
+    lines += _wrap("/help brings the full list back at any time.", w)
+    lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
+    lines.append(f"{BOLD}Once it's running{RESET}")
+    lines += _wrap("/check is the run, /jobs is each Slurm job inside it, "
+                   "/why diagnoses a failure.", w)
+    lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
+    lines.append(f"{BOLD}The one rule{RESET}")
+    lines.append(f"{GREY}ask{RESET} {arrow} {GREY}generate{RESET} {arrow} "
+                 f"{RED}{BOLD}GATE{RESET} {arrow} {GREY}submit{RESET} {arrow} "
+                 f"{GREY}watch{RESET}")
+    lines.append(f"                      {RED}\u25b2{RESET}")
+    lines.append(f"                      {RED}you{RESET}")
+    lines += _wrap("Generation and read-only checks run freely. Anything that would "
+                   "submit to Slurm stops there for your approval.", w)
+    return lines
+
+
+def banner(source=None, model=None):
+    """Print the startup banner.
+
+    source/model are what the session will actually use -- passed in rather than
+    read here, because on a first launch there is no key yet and the honest
+    answer is "not decided": the key prompt appears below this banner and picks
+    them. ready() states them again once they're settled.
+    """
+    user = os.environ.get("USER") or getpass.getuser()
+    path = os.path.dirname(os.path.abspath(__file__))
+    try:
+        cols = shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        cols = 80
+
+    total = min(cols - 2, 104)
+    left_w = 32
+    right_w = total - left_w - 7
+
+    # Two lines in the right column can't be reflowed -- the example command
+    # and the pipeline diagram -- and 51 columns is what the wider of them
+    # needs. Below that the two-column layout is being forced, so stack
+    # instead: same content, no box.
+    if right_w < 51:
+        print()
+        for line in _left_column(user, source, model, path):
+            print(f"  {line}" if line else "")
+        for line in _right_column(min(cols - 4, 60)):
+            print(f"  {line}" if line else "")
+        print()
+        return
+
+    left = _left_column(user, source, model, path)
+    right = _right_column(right_w)
+    rows = max(len(left), len(right))
+    left += [""] * (rows - len(left))
+    right += [""] * (rows - len(right))
+
+    edge = f"{GREEN}{DIM}"
+    print()
+    print(f" {edge}\u256d{'\u2500' * (left_w + 2)}\u252c{'\u2500' * (right_w + 2)}\u256e{RESET}")
+    for l, r in zip(left, right):
+        print(f" {edge}\u2502{RESET} {_pad(l, left_w)} {edge}\u2502{RESET} "
+              f"{_pad(r, right_w)} {edge}\u2502{RESET}")
+    print(f" {edge}\u2570{'\u2500' * (left_w + 2)}\u2534{'\u2500' * (right_w + 2)}\u256f{RESET}")
+    print()
+
+
+def help_text(commands):
+    """Print the command reference, grouped by where you are in a run's life.
+
+    Takes the command table rather than owning a copy of it, so the menu the
+    prompt completes against, the dispatcher, and this list cannot drift apart --
+    there is one table, in launch_agent.py.
+
+    Grouped rather than alphabetical because the list is now long enough that a
+    flat version stops being a reference and becomes a wall. The groups follow
+    the order things actually happen in, so the shape of the workflow is legible
+    from the help itself: you decide, then you watch, then you fix.
+    """
+    width = max(len(f"/{n} {a}".rstrip()) for n, a, _, _ in commands) + 3
+    order, groups = [], {}
+    for name, args, desc, group in commands:
+        if group not in groups:
+            groups[group] = []
+            order.append(group)
+        groups[group].append((name, args, desc))
 
     print()
-    print(f"  {BOLD}{CYAN}\u259a\u259a  G E N P I P E S{RESET}  {GREY}assistant{RESET}")
-    print(f"  {CYAN}\u259a\u259a{RESET}  {GREY}plain English in. gated pipelines out.{RESET}")
-    print()
-    print(f"    {GREY}ask{RESET} {arrow} {GREY}generate{RESET} {arrow} {RED}{BOLD}GATE{RESET} "
-          f"{arrow} {GREY}submit{RESET} {arrow} {GREY}watch{RESET}")
-    print(f"                          {RED}\u25b2{RESET}")
-    print(f"                          {RED}you{RESET}")
-    print()
-    print(f"  {GREY}{'\u2500' * 64}{RESET}")
-    print()
-    print(f"  {BOLD}start{RESET}      agent.run({GREEN}\"your task\"{RESET}, "
-          f"thread_id={GREEN}\"name-this-run\"{RESET})")
-    print(f"  {BOLD}approve{RESET}    agent.resume({GREEN}\"name-this-run\"{RESET}, "
-          f"approved={AMBER}True{RESET})")
-    print(f"  {BOLD}reject{RESET}     agent.resume({GREEN}\"name-this-run\"{RESET}, "
-          f"approved={AMBER}False{RESET}, feedback={GREEN}\"...\"{RESET})")
-    print(f"  {BOLD}progress{RESET}   agent.check({GREEN}\"name-this-run\"{RESET})")
-    print(f"  {BOLD}list{RESET}       agent.submissions()")
-    print(f"  {BOLD}history{RESET}    agent.history()")
-    print(f"  {BOLD}track{RESET}      agent.track({GREEN}\"name\"{RESET}, "
-          f"{GREEN}\"path/to/job_list\"{RESET})")
-    print()
-    print(f"  {GREY}Name each run. The name is how you approve it, and how you check{RESET}")
-    print(f"  {GREY}on it days later.{RESET}")
-    print()
-    print(f"  {DIM}e.g.  agent.run(\"run dnaseq germline_snv on my readset, all steps\",{RESET}")
-    print(f"  {DIM}                thread_id=\"patient-42\"){RESET}")
+    for group in order:
+        print(f"  {DIM}{group}{RESET}")
+        for name, args, desc in groups[group]:
+            left = f"/{name}" + (f" {args}" if args else "")
+            print(f"    {GREEN}/{name}{RESET}{DIM}{f' {args}' if args else ''}{RESET}"
+                  f"{' ' * (width - len(left))}{GREY}{desc}{RESET}")
+        print()
+    print(f"  {DIM}Anything that isn't a /command is a task -- you'll be offered a "
+          f"name for it.{RESET}")
+    print(f"  {DIM}The name is how you approve it, and how you check on it days "
+          f"later.{RESET}")
     print()
 
 # ---------------------------------------------------------------------------
@@ -261,13 +412,33 @@ def gate(proposal, thread_id):
         print(f"      {DIM}{label:<18}{RESET}{value}")
     if rows:
         print()
-    print(f"      {DIM}{'approve':<18}{RESET}agent.resume({WHITE}{thread_id!r}{RESET}, "
-          f"approved={BOLD}True{RESET})")
-    print(f"      {DIM}{'reject':<18}{RESET}agent.resume({WHITE}{thread_id!r}{RESET}, "
-          f"approved={BOLD}False{RESET}, feedback=\"\u2026\")")
+    print(f"      {DIM}{'approve':<18}{RESET}/approve {WHITE}{thread_id}{RESET}")
+    print(f"      {DIM}{'reject':<18}{RESET}/reject {WHITE}{thread_id}{RESET} \u2026")
     print()
     print(f"  {DIM}Nothing has reached the scheduler.{RESET}")
     print("\n")
+
+
+def ready(source=None, model=None, fake=None):
+    """Printed right before the command loop takes over. Without this, the
+    prompt that follows looks like a dead end rather than the normal, working
+    state of the app -- especially once the banner has scrolled out of view
+    behind a key prompt.
+
+    It restates the model on purpose: on a first launch the banner printed
+    before a key existed, so this is the first point at which the answer is
+    actually known.
+
+    `fake` names what is being simulated in dev mode. It is stated loudly and
+    every single launch: a tool whose whole purpose is to be trusted with a
+    cluster allocation must never leave you guessing whether what you are
+    looking at was real.
+    """
+    if fake:
+        print(f"  {AMBER}▌{RESET} {AMBER}{BOLD}dev mode{RESET}  {DIM}·{RESET}  "
+              f"{GREY}{fake} — nothing here touches a real cluster{RESET}")
+    print(f"  {GREEN}▌{RESET} {BOLD}ready{RESET}  {DIM}·{RESET}  "
+          f"{GREY}{_identity(source, model)}{RESET}")
 
 
 def post_approve(thread_id, approved):
@@ -276,7 +447,7 @@ def post_approve(thread_id, approved):
         print()
         print(f"  {DIM}\u258c {BOLD}{thread_id}{RESET}  {DIM}\u00b7{RESET}  {DIM}submitted{RESET}")
         print(f"  {DIM}\u258c{RESET}")
-        print(f"  {DIM}\u258c{RESET}   agent.check({WHITE}{thread_id!r}{RESET})")
+        print(f"  {DIM}\u258c{RESET}   /check {WHITE}{thread_id}{RESET}")
         print()
     else:
         print()
@@ -295,45 +466,31 @@ def post_approve(thread_id, approved):
 
 BAR_WIDTH = 46
 
-_BAD = {"FAILED", "TIMEOUT", "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"}
+_BAD = {"FAILED", "TIMEOUT", "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY",
+        "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
+# States meaning this job itself broke. CANCELLED is not one: a GenPipes failure
+# cancels everything downstream of it, so those jobs never ran. Kept in step with
+# runs.BROKE_STATES, and separate from _BAD because both distinctions are needed
+# -- red still marks anything wrong, but the counts must not conflate the two.
+_BROKE = _BAD - {"CANCELLED"}
 _ORDER = ["COMPLETED", "RUNNING", "PENDING", "FAILED", "TIMEOUT",
-          "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"]
+          "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED",
+          "BOOT_FAIL", "DEADLINE", "UNKNOWN"]
 
 
-def status(name, raw):
-    """Draw a run's progress from the raw text log_report prints.
+def status(name, parsed, raw=""):
+    """Draw a run's progress from log_report's already-parsed counts.
 
-    Parses rather than reformats: pulls the per-state counts and the timing lines
-    out of GenPipes' output. If no total is found the raw text is printed
-    unchanged -- better to show something unexpected than to hide it.
+    The parsing lives in runs.parse_log_report -- this only draws. If no total
+    was found the raw text is printed unchanged: better to show something
+    unexpected than to hide it behind an empty bar.
     """
-    counts, total, meta = {}, 0, []
-    for line in raw.splitlines():
-        m = re.match(r"\s*Number of jobs ([A-Z_]+):\s*(\d+)", line)
-        if m:
-            counts[m.group(1)] = int(m.group(2))
-            continue
-        m = re.match(r"\s*Number of jobs:\s*(\d+)", line)
-        if m:
-            total = int(m.group(1))
-            continue
-        # GenPipes' timing labels are long and unaligned; shorten them.
-        m = re.match(r"\s*Cumulative time spent on compute nodes:\s*(.+)", line)
-        if m:
-            meta.append(("compute time", m.group(1).strip()))
-            continue
-        m = re.match(r"\s*Cumulative core time:\s*(.+)", line)
-        if m:
-            meta.append(("core time", m.group(1).strip()))
-            continue
-        m = re.match(r"\s*Human time.*?:\s*(.+)", line)
-        if m:
-            meta.append(("elapsed", m.group(1).strip()))
-            continue
+    counts, total, meta = parsed["counts"], parsed["total"], parsed["meta"]
 
     # Nothing recognisable -- show the raw output rather than swallow it.
     if not total:
-        print(f"\n{raw.strip()}\n")
+        body = (raw or "").strip() or "log_report returned nothing."
+        print(f"\n{DIM}{body}{RESET}\n")
         return
 
     done = counts.get("COMPLETED", 0)
@@ -377,27 +534,279 @@ def status(name, raw):
             print(f"  {DIM}\u258c{RESET}   {DIM}{label:<14}{RESET}{DIM}{value}{RESET}")
     print()
 
-def submissions(runs):
-    """List recorded submissions: name, and the job list behind it."""
+# ---------------------------------------------------------------------------
+# Small messages. Every command that can fail goes through problem() or
+# nothing() rather than printing its own line, so a failure always looks the
+# same and always offers the next thing to type.
+#
+# The hint is the point. "No run named 'patient-4'" is a dead end; the same
+# message plus "/list shows what there is" is a next step. A tool that answers
+# questions should not answer one with silence.
+# ---------------------------------------------------------------------------
+
+def problem(text, hint=None):
+    """Something the user asked for could not be done."""
     print()
-    for name, path in runs.items():
-        print(f"  {DIM}\u258c{RESET} {BOLD}{name}{RESET}")
-        print(f"  {DIM}\u258c   {os.path.basename(path)}{RESET}")
+    print(f"  {RED}\u258c{RESET} {text}")
+    if hint:
+        print(f"  {RED}\u258c{RESET} {GREY}{hint}{RESET}")
+    print()
+
+
+def nothing(text, hint=None):
+    """A legitimately empty answer. Grey, not red -- an empty list is not an
+    error, and colouring it like one trains people to ignore red."""
+    print()
+    print(f"  {DIM}\u258c{RESET} {DIM}{text}{RESET}")
+    if hint:
+        print(f"  {DIM}\u258c{RESET} {GREY}{hint}{RESET}")
+    print()
+
+
+def done(text, hint=None):
+    """A completed action, confirmed."""
+    print()
+    print(f"  {GREEN}\u258c{RESET} {text}")
+    if hint:
+        print(f"  {GREEN}\u258c{RESET} {GREY}{hint}{RESET}")
+    print()
+
+
+def tracked(name, path):
+    done(f"Tracking {BOLD}{name}{RESET}", os.path.basename(path))
+
+
+def cancelled(name, n, raw=""):
+    """The result of a /cancel. Says nothing was running when nothing was, rather
+    than reporting a success that didn't happen."""
+    if not n:
+        nothing(f"Nothing left to cancel in '{name}'.",
+                "every job has already finished or been cancelled.")
+        return
+    done(f"Cancelled {BOLD}{n}{RESET} job(s) in {BOLD}{name}{RESET}")
+    body = (raw or "").strip()
+    if body:
+        for line in body.splitlines()[:4]:
+            print(f"  {GREY}{line}{RESET}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Run and job listings.
+#
+# The distinction between the two is carried visually, not just in wording: a
+# run is a titled block, a job is a row in a table. That is the difference the
+# tool most needs its user to internalise -- you approve and cancel runs, but
+# only ever diagnose jobs -- so the two never look interchangeable.
+# ---------------------------------------------------------------------------
+
+_STATUS_TAG = {
+    "held": lambda: f"{RED}{BOLD}held{RESET}",
+    "submitted": lambda: f"{GREEN}live{RESET}",
+    "gone": lambda: f"{DIM}gone{RESET}",
+}
+
+
+def _tag(record):
+    return _STATUS_TAG.get(record.get("status"), lambda: f"{DIM}?{RESET}")()
+
+
+def _snapshot(record):
+    """The cached result of the last /check, if there was one.
+
+    Explicitly labelled with when it was taken. A stale number presented as
+    current is worse than no number, and this one is deliberately not refreshed
+    on every /list -- see Registry.remember_check.
+    """
+    last = record.get("last_check")
+    if not last:
+        return None
+    at = (last.get("at") or "").replace("T", " ")[5:16]
+    return f"{last.get('verdict', '?')}  {GREY}(as of {at}){RESET}"
+
+
+def run_list(records):
+    """/list -- runs still worth acting on, held ones first.
+
+    Held runs sort to the top because they are the only entries that are waiting
+    on the person reading the list.
+    """
+    order = {"held": 0, "submitted": 1}
+    records = sorted(records, key=lambda r: (order.get(r.get("status"), 2),
+                                            r.get("submitted_at") or r.get("held_at") or ""))
+    print()
+    for r in records:
+        print(f"  {DIM}\u258c{RESET} {BOLD}{r['name']}{RESET}  {DIM}\u00b7{RESET}  {_tag(r)}")
+        if r["status"] == "held":
+            cmd = ((r.get("proposal") or {}).get("command") or "").strip()
+            if cmd:
+                print(f"  {DIM}\u258c{RESET}   {WHITE}{cmd}{RESET}")
+            print(f"  {DIM}\u258c{RESET}   {GREY}awaiting your approval{RESET}")
+        else:
+            snap = _snapshot(r)
+            if snap:
+                print(f"  {DIM}\u258c{RESET}   {snap}")
+            if r.get("job_list"):
+                print(f"  {DIM}\u258c   {os.path.basename(r['job_list'])}{RESET}")
+            else:
+                # A submission where every step was already up to date. Said
+                # plainly, because "no jobs" reads as a failure otherwise.
+                print(f"  {DIM}\u258c{RESET}   {GREY}no jobs \u2014 everything was already "
+                      f"up to date{RESET}")
     print(f"  {DIM}\u258c{RESET}")
-    print(f"  {DIM}\u258c   agent.check(\"<name>\") for progress{RESET}")
+    print(f"  {DIM}\u258c   /check <name> \u00b7 /jobs <name> \u00b7 /why <name>{RESET}")
     print()
 
 
 def history(records):
-    """List every recorded run, live and gone, newest first. Unlike
-    submissions(), a gone entry is shown too -- marked as such -- so a run can
-    still be found after its job_list file has been cleaned up from Rorqual."""
+    """/history -- every recorded run, live and gone, newest first.
+
+    A gone entry is shown, marked as such, so a run can still be found after its
+    job_list file has been cleaned up from Rorqual. Notes left by /why are shown
+    too: months later, "OOM in picard_mark_duplicates" is the only part of this
+    record anyone still wants."""
     print()
-    for r in sorted(records, key=lambda r: r.get("submitted_at", ""), reverse=True):
-        tag = f"{DIM}gone{RESET}" if r.get("gone") else f"{GREEN}live{RESET}"
-        print(f"  {DIM}\u258c{RESET} {BOLD}{r['name']}{RESET}  {DIM}\u00b7{RESET}  {tag}"
-              f"  {DIM}\u00b7{RESET}  {DIM}{r.get('source', 'agent')}{RESET}")
-        print(f"  {DIM}\u258c   {os.path.basename(r['job_list'])}{RESET}")
-        print(f"  {DIM}\u258c   {DIM}{r.get('submitted_at', '')}{RESET}")
+    for r in records:
+        when = (r.get("submitted_at") or r.get("held_at") or "").replace("T", " ")
+        print(f"  {DIM}\u258c{RESET} {BOLD}{r['name']}{RESET}  {DIM}\u00b7{RESET}  {_tag(r)}"
+              f"  {DIM}\u00b7{RESET}  {DIM}{r.get('source', 'agent')}{RESET}"
+              f"  {DIM}\u00b7{RESET}  {DIM}{when}{RESET}")
+        if r.get("job_list"):
+            print(f"  {DIM}\u258c   {os.path.basename(r['job_list'])}{RESET}")
+        for note in (r.get("notes") or [])[-2:]:
+            print(f"  {DIM}\u258c{RESET}   {GREY}\u00b7 {note.get('text', '')}{RESET}")
     print(f"  {DIM}\u258c{RESET}")
+    print()
+
+
+JOB_NAME_W = 38
+
+
+def jobs(name, job_list, only_failed=False):
+    """Every job in a run, as a table grouped by step.
+
+    Grouped because a GenPipes failure is almost never one unlucky job -- it is
+    one step failing across every sample -- and a flat list of two hundred rows
+    hides exactly that shape. The step is printed once and its jobs indented
+    under it, so "trimmomatic is fine, mark_duplicates is not" is visible without
+    reading a single job name.
+    """
+    shown = [j for j in job_list if j.failed] if only_failed else list(job_list)
+    if not shown:
+        nothing(f"No failed jobs in '{name}'.", f"/jobs {name} shows all of them.")
+        return
+
+    tally = {}
+    for j in job_list:
+        key = j.state or "UNKNOWN"
+        tally[key] = tally.get(key, 0) + 1
+    broke = sum(n for s, n in tally.items() if s in _BROKE)
+    cancelled = tally.get("CANCELLED", 0)
+
+    # Broken and cancelled are counted separately, because one failing step
+    # cancels everything downstream of it. Rolling them together reports "9
+    # failed" for a run where three things went wrong and six never started --
+    # which sends you looking for six problems that do not exist.
+    if broke and cancelled:
+        head = (f"{RED}{broke} failed{RESET}{DIM} \u00b7 {cancelled} cancelled "
+                f"downstream{RESET}")
+    elif broke:
+        head = f"{RED}{broke} failed{RESET}"
+    elif cancelled:
+        head = f"{DIM}{cancelled} cancelled{RESET}"
+    else:
+        head = f"{DIM}{len(job_list)} jobs{RESET}"
+
+    print()
+    print(f"  {DIM}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  {head}")
+    print(f"  {DIM}\u258c{RESET}")
+
+    step = None
+    for j in shown:
+        if j.step != step:
+            step = j.step
+            print(f"  {DIM}\u258c{RESET} {WHITE}{step}{RESET}")
+        state = j.state or "UNKNOWN"
+        colour = RED if state in _BAD else DIM
+        emphasis = BOLD if state in _BAD else ""
+        detail = j.elapsed or ""
+        if j.maxrss and state in _BAD:
+            detail = f"{detail}  {j.maxrss}".strip()
+        print(f"  {DIM}\u258c{RESET}   {DIM}{(j.name or '?')[:JOB_NAME_W]:<{JOB_NAME_W}}{RESET}"
+              f"{colour}{emphasis}{state.lower():<14}{RESET}"
+              f"{DIM}{detail}{RESET}")
+    print(f"  {DIM}\u258c{RESET}")
+    if broke:
+        # Offered only when something actually broke: /why on a run whose jobs
+        # were merely cancelled downstream has nothing to diagnose.
+        print(f"  {DIM}\u258c   /why {WHITE}{name}{RESET}{DIM} to diagnose{RESET}")
+    print()
+
+
+def triage(name, report):
+    """What broke, established from the scheduler before any model is asked.
+
+    Printed on its own, ahead of the model's answer, so the evidence and the
+    interpretation are visibly separate things. If the explanation that follows
+    disagrees with this block, the block is the one to trust -- it came from
+    sacct and from the log files, not from a model.
+    """
+    broke = report.get("broke_total", report["failed_total"])
+    cancelled = report.get("cancelled_total", 0)
+    tail = f", {cancelled} cancelled downstream" if cancelled else ""
+    print()
+    print(f"  {RED}\u258c {BOLD}{broke} failed{RESET}"
+          f"  {DIM}\u00b7{RESET}  {DIM}{report['steps_affected']} step(s) affected"
+          f"{tail} in {name}{RESET}")
+    print(f"  {RED}\u258c{RESET}")
+    for f in report["findings"]:
+        print(f"  {RED}\u258c{RESET} {WHITE}{f['step']}{RESET}"
+              f"  {DIM}\u00d7{f['count']}{RESET}  {RED}{(f['state'] or '?').lower()}{RESET}")
+        if f.get("maxrss"):
+            print(f"  {RED}\u258c{RESET}   {DIM}{'peak memory':<13}{f['maxrss']}{RESET}")
+        if f.get("exit_code"):
+            print(f"  {RED}\u258c{RESET}   {DIM}{'exit code':<13}{f['exit_code']}{RESET}")
+        print(f"  {RED}\u258c{RESET}   {DIM}{'log':<13}"
+              f"{os.path.basename(f['log']) if f.get('log') else 'not found'}{RESET}")
+    if report.get("truncated"):
+        print(f"  {RED}\u258c{RESET}   {GREY}+{report['truncated']} more step(s){RESET}")
+    print(f"  {RED}\u258c{RESET}")
+    print(f"  {DIM}  reading the logs, then explaining{RESET}")
+    print()
+
+
+def pending(records):
+    """Held runs, surfaced at startup.
+
+    This exists because of the tool's worst failure mode: the gate pauses a run,
+    the terminal closes, and the only record of a decision you still owe was the
+    name in your head. Everything else in the interface can wait until asked.
+    This cannot.
+    """
+    if not records:
+        return
+    n = len(records)
+    print()
+    print(f"  {RED}{REVERSE}{BOLD} {n} HELD {RESET}  "
+          f"{RED}waiting for your approval{RESET}")
+    for r in records:
+        cmd = ((r.get("proposal") or {}).get("command") or "?").strip()
+        print(f"      {BOLD}{r['name']}{RESET}   {DIM}{cmd}{RESET}")
+    print(f"      {DIM}{'approve':<10}{RESET}/approve {WHITE}<name>{RESET}")
+    print(f"      {DIM}{'see it':<10}{RESET}/list")
+    print()
+
+
+def where(paths):
+    """/where -- the directories that decide where everything lands.
+
+    Worth a command of its own because one of these silently determines whether
+    a submission gets registered at all: the job list is looked for under the
+    directory the app was launched from, and nothing else in the interface shows
+    you what that is.
+    """
+    print()
+    width = max(len(k) for k, _ in paths) + 2
+    for label, value in paths:
+        print(f"  {DIM}\u258c{RESET} {DIM}{label:<{width}}{RESET}{_tilde(str(value))}")
     print()
