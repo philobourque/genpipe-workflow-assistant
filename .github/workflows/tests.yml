@@ -1,15 +1,17 @@
 name: tests
 
-# Three suites, chosen because they are the ones that can run anywhere and still
-# say something true. They import only the standard library -- gate_rules.py,
-# runs.py and fakecluster.py were deliberately kept free of biomni for exactly
-# this reason, so CI needs no pinned agent stack, no API key, and no cluster.
+# The suites that can run anywhere and still say something true. They import
+# only the standard library -- gate_rules.py, runs.py, fakecluster.py,
+# display.py, preflight.py, slots.py and intake.py were deliberately kept free
+# of biomni for exactly this reason, so CI needs no pinned agent stack, no API
+# key, and no cluster.
 #
 # What is NOT here, and why: tests/test_lifecycle.py and tests/test_app.py drive
 # the real LangGraph gate and a real terminal, so they need biomni==0.0.8 and its
 # pinned langgraph. Installing that on every push to check a gate matcher would
 # trade a two-second signal for a several-minute one. Those two run on the
-# cluster, in the venv, before a release -- see the README.
+# cluster, in the venv, before a release -- as do the three scenarios in
+# testcases/, which walk the product rather than its parts. See the README.
 
 on:
   push:
@@ -43,7 +45,20 @@ jobs:
       - name: Every renderer
         run: python tests/test_display.py
 
+      - name: Environment preflight
+        # Grades its findings: RAP_ID blocks a submission, JOB_MAIL only warns.
+        # Getting that backwards either stops work that would have succeeded or
+        # trains the operator to ignore the warning that matters.
+        run: python tests/test_preflight.py
+
+      - name: Intake, slots, and the grammar they must agree with
+        # Also the tripwire on genpipes.md's size, and the check that the ini
+        # table in slots.py still matches the one in genpipes.md. They are the
+        # same knowledge written twice and nothing else stops them drifting.
+        run: python tests/test_intake.py
+
       - name: Everything imports without a cluster present
         # A stdlib-only module that quietly grows a heavy import would break CI
         # in a confusing way later; catching it as its own step names the cause.
-        run: python -c "import gate_rules, runs, fakecluster, display; print('ok')"
+        run: |
+          python -c "import gate_rules, runs, fakecluster, display, preflight, slots, intake; print('ok')"

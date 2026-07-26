@@ -194,13 +194,17 @@ range, a missing readset or a missing ini, and fails with a GenPipes-shaped erro
 
 ## Testing
 
-Five suites in `tests/`, all offline. The split is by what they need, not by what they cover:
+Two layers. `tests/` covers the parts; `testcases/` walks the whole product. The split within
+`tests/` is by what each suite needs, not by what it covers:
 
 ```bash
 # Run anywhere, no dependencies beyond the standard library. These are the CI set.
 python tests/test_gate_rules.py    # the gate's invariants — the one test that must never go red
 python tests/test_runs.py          # the run registry's lifecycle, and the job layer's parsing
 python tests/test_fakecluster.py   # the fake cluster itself, including that it rejects bad commands
+python tests/test_display.py       # every renderer, including the gate's refusal to offer approval
+python tests/test_preflight.py     # RAP_ID blocks a submission; JOB_MAIL only warns
+python tests/test_intake.py        # the choice panel, and slots.py vs genpipes.md staying in sync
 
 # Need the venv (biomni, langgraph, pyte). Run before a release.
 python tests/test_lifecycle.py     # the real agent + real gate + fake cluster, whole arc of a run
@@ -209,9 +213,9 @@ python tests/test_gate.py          # the original gate helpers, via GenpipeA1's 
 python tests/test_mock_pipeline.py # the original approve/reject round trip
 ```
 
-The first three run on every push via GitHub Actions (`.github/workflows/tests.yml`). That is
-possible because `gate_rules.py`, `runs.py` and `fakecluster.py` deliberately import nothing but the
-standard library — the safety-critical decision ("does this code submit to a scheduler?") is checked
+All six run on every push via GitHub Actions (`.github/workflows/tests.yml`). That is
+possible because `gate_rules.py`, `runs.py`, `fakecluster.py`, `display.py`, `preflight.py`,
+`slots.py` and `intake.py` deliberately import nothing but the standard library — the safety-critical decision ("does this code submit to a scheduler?") is checked
 in about two seconds, with no pinned agent stack, no API key and no cluster.
 
 **`test_gate_rules.py`** is two lists — code that must be gated, and code that must not — plus the
@@ -228,13 +232,49 @@ held it, which is the gate's central promise and was previously untested.
 with `pyte` — the banner, the completion menu, Tab, the pre-filled run name, the HOLD box, and that
 a pasted multi-line string does not execute its first line.
 
+**`test_intake.py`** carries the tripwire for the one-file decision: `genpipes.md` must stay under
+18,000 characters, and no step list may reappear in it. It also asserts that the feature-ini table
+in `slots.py` and the one in `genpipes.md` still agree — the same knowledge written twice, once for
+the panel to offer and once for the model to read, with nothing else stopping them drifting apart.
+
+### The three test cases
+
+`tests/` proves the parts work. `testcases/` proves the product does, by walking it the way a person
+does. See [`testcases/README.md`](testcases/README.md).
+
+```bash
+./testcases/run.sh 1              # interface, offline, ~2 min, free
+./testcases/run.sh 2              # a real run on the real cluster, CIT data, ~30 min
+./testcases/run.sh 3 --confirm    # production: real data, full steps, hours
+```
+
+Case 2 is worth knowing about. It is a **real** GenPipes run — real generation, real ini layering,
+real `sbatch`, real `sacct` — made short by appending GenPipes' own `$GENPIPES_INIS/<pipeline>/cit.ini`
+to `-c`, which repoints the genome to chr19, points annotations at
+`$MUGQIC_INSTALL_HOME/testdata/`, and caps most walltimes at ten minutes. Nothing is stubbed; only
+the data is small. Matching readsets, designs and pairs already exist under
+`$MUGQIC_INSTALL_HOME/testdata/<pipeline>/` with absolute paths, so there is nothing to stage.
+
 ## A note on `genpipes.md`
 
-The grammar document is pinned to GenPipes v6.1.1 and hardcodes Rorqual's cluster ini
-(`common_ini/rorqual.ini`). If you're on a different DRAC cluster (Narval, Béluga, Cedar) or a
-different GenPipes version, that file needs updating — it is not cluster- or version-agnostic by
-design (see its own header for why step counts are deliberately left out and read from `-h`
-instead).
+One file, deliberately, and a CI assert keeps it that way: under 18,000 characters, with no step
+lists. The rule it is built on is that **anything `genpipes <pipeline> --help` can answer is never
+written down here**. `--help` is 454 lines for rnaseq alone — every flag, every protocol, the full
+numbered step list per protocol, and a description of each step — and it is version-exact because
+it is the install talking about itself. Copying any of that would create something that goes stale
+on the next module bump with nobody noticing.
+
+What is left is only what no machine-readable source has: the environment contract, the `-c`
+layering rule, the protocol-to-feature-ini mapping (which exists nowhere on the install — not in
+`--help`, not in the shipped READMEs, not in the inis themselves), generate-versus-submit, the file
+formats, and how to read a failure.
+
+It is pinned to GenPipes v6.1.1 and to Rorqual's cluster ini (`common_ini/rorqual.ini`). On a
+different DRAC cluster or GenPipes version it needs updating; it is not cluster- or
+version-agnostic by design.
+
+When the tripwire trips, the answer is to split into `skills/` — one always-loaded core plus
+per-pipeline files loaded on demand — not to raise the number.
 
 ## Repo layout
 
@@ -246,6 +286,9 @@ instead).
 | `display.py` | Rendering (`parse()` is UI-agnostic; a future web UI can reuse it) | stdlib |
 | `ui.py` | The terminal input side: prompt box, live completion, spinner, paste | stdlib |
 | `fakecluster.py` | Stubbed GenPipes + Slurm + model, for dev mode and the tests | stdlib |
+| `preflight.py` | Environment checks: RAP_ID blocks, JOB_MAIL warns | stdlib |
+| `slots.py` | What each pipeline/protocol requires, and the feature-ini table | stdlib |
+| `intake.py` | Reads a request, finds what is missing, drives the choice panel | stdlib |
 | `genpipes.md` | The GenPipes grammar fed to the model as "software" | — |
 | `launch_agent.py` | Builds the agent, owns the command table and the loop (`_repl()`) | biomni |
 | `start_agent.sh` | Loads the cluster's Python module, activates the venv, launches the app | — |
