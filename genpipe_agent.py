@@ -27,20 +27,35 @@ Driving the gated graph (in this file):
   the proposal from _build_proposal) or "done". These replace Biomni's stock go(),
   which streams once in values mode and cannot detect or resume an interrupt.
 
-Monitoring a submitted run:
-  On approval, resume() records the run's thread_id against the job list file
-  GenPipes just wrote (runs.jsonl). check(thread_id) resolves that link and runs
-  GenPipes' log_report to report the run's progress.
+Where the rest of the logic lives:
+  Two stdlib-only modules hold everything that does not need a graph, so both
+  are testable without installing biomni (which is what lets CI check them on
+  every push):
 
-Run tracking (runs.jsonl):
-  One JSON record per submission: name, thread_id (None for a manually tracked
-  run), job_list path, submitted_at, source ("agent" or "manual"), and a "gone"
-  flag. submissions() shows only live records, checking each job_list path on
-  disk first and quietly dropping ones that no longer exist -- no message, they
-  just stop appearing. Nothing is ever deleted, though: history() shows every
-  record, live or gone, so a run can still be found after Rorqual's copy of its
-  artifacts is cleaned up. track(name, job_list_path) adds a record for a run
-  launched outside the agent, with no thread_id behind it.
+    gate_rules.py  the gate's decision logic -- is this code a submission, and
+                   what exactly is being proposed. The methods on this class are
+                   thin delegates, so the graph's routing and the tests exercise
+                   one implementation rather than two.
+    runs.py        runs and jobs. A RUN is one GenPipes invocation you named and
+                   approved; a JOB is one of the hundreds of Slurm jobs it
+                   creates. The registry (runs.jsonl) is durable and ours; job
+                   state is always read live from the scheduler.
+
+Monitoring, in three sizes:
+  check(name)      GenPipes' own log_report for the run: one aggregate progress
+                   view. Deterministic, no model, and the result is cached on the
+                   record so /list can show where things stood without re-asking.
+  jobs(name)       every individual job and its Slurm state -- the per-job view
+                   check() aggregates away.
+  why(name, ...)   the only one that costs a model call. runs.triage() first
+                   establishes deterministically WHICH jobs failed and reads
+                   their logs, then the model is asked to explain the cause. It
+                   runs on its own thread (see why()'s docstring) so it can
+                   never disturb the run it is diagnosing.
+
+A run enters runs.jsonl at the GATE, not at submission -- see runs.py's
+docstring on why "held" exists. The short version: a paused run whose name lives
+only in your memory is not a durable gate.
 """
 import os
 import re
@@ -49,7 +64,31 @@ import uuid
 import json
 import datetime
 import display
+import gate_rules
+import runs as runs_store
 import time
+import warnings
+
+# Noise from LangGraph's own checkpoint serializer, triggered just by importing
+# it -- an unset-default warning about a kwarg this codebase never passes and
+# has no reason to. Not something a user of this tool can act on.
+#
+# A plain filterwarnings("ignore", ...) doesn't hold: partway through this
+# same import chain, langchain_core re-registers a "default" (show) filter for
+# this exact warning class, which -- being added later -- outranks an ignore
+# filter set beforehand, no matter where it's placed in the import order.
+# Patching the actual display step sidesteps that registration race instead of
+# trying to win it.
+_orig_showwarning = warnings.showwarning
+
+
+def _showwarning(message, category, filename, lineno, file=None, line=None):
+    if "allowed_objects" in str(message):
+        return
+    _orig_showwarning(message, category, filename, lineno, file, line)
+
+
+warnings.showwarning = _showwarning
 
 from biomni.utils import pretty_print
 from biomni.agent import A1
@@ -156,112 +195,105 @@ class GenpipeA1(A1):
         self.app = workflow.compile(checkpointer=self.checkpointer)
     
     # --------------------------------------------------------------------- #
-    #  Run tracking store: one JSON record per submission, in runs.jsonl.   #
-    #  A record carries a "gone" flag rather than ever being deleted, so a  #
-    #  submission whose job_list file has vanished from Rorqual (scratch    #
-    #  purge, manual cleanup) can drop out of submissions() silently while  #
-    #  still being visible through history().                              #
+    #  Runs and jobs. The store itself is runs.Registry (stdlib-only, in     #
+    #  runs.py); what lives here is only the part that needs the agent --    #
+    #  the working directory a submission ran in, and the model call in      #
+    #  why(). Everything else delegates.                                    #
     # --------------------------------------------------------------------- #
-    def _runs_path(self):
-        return os.path.join(self.path, "runs.jsonl")
+    @property
+    def registry(self):
+        """The run registry, created on first use.
 
-    def _load_runs(self):
-        path = self._runs_path()
-        if not os.path.exists(path):
-            return []
-        records = []
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
-        return records
-
-    def _save_runs(self, records):
-        # Write to a temp file and rename over the original so a crash mid-write
-        # never leaves runs.jsonl half-written.
-        path = self._runs_path()
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            for r in records:
-                f.write(json.dumps(r) + "\n")
-        os.replace(tmp, path)
-
-    def _add_run(self, name, job_list, thread_id=None, source="agent"):
-        records = self._load_runs()
-        records.append({
-            "name": str(name),
-            "thread_id": thread_id,
-            "job_list": job_list,
-            "submitted_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "source": source,
-            "gone": False,
-        })
-        self._save_runs(records)
-
-    def _prune_runs(self, records):
-        """Mark records whose job_list file no longer exists as gone, in place.
-        A record already marked gone is not re-checked -- once the file is gone
-        it stays gone, so a transient filesystem hiccup can't flicker it back to
-        live. Returns True if anything changed, so the caller knows to save."""
-        changed = False
-        for r in records:
-            if not r["gone"] and not os.path.exists(r["job_list"]):
-                r["gone"] = True
-                r["gone_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-                changed = True
-        return changed
+        Lazy rather than set in configure() because configure() is called during
+        A1.__init__ and again by add_software(), and because test_gate.py builds
+        a bare instance with object.__new__ -- no __init__ at all. A property
+        means the registry exists whenever it is actually needed and never
+        requires the constructor to have run.
+        """
+        if not hasattr(self, "_registry"):
+            self._registry = runs_store.Registry(self.path)
+        return self._registry
 
     def track(self, name, job_list_path):
         """Register a run launched outside the agent -- no thread_id, no prior
-        conversation -- so check()/submissions()/history() can find it by name
-        just like an agent-launched run."""
+        conversation -- so check()/list/history can find it by name just like an
+        agent-launched run."""
         job_list_path = os.path.abspath(job_list_path)
         if not os.path.exists(job_list_path):
-            print(f"\n  '{job_list_path}' does not exist -- nothing tracked.\n")
+            display.problem(f"'{job_list_path}' does not exist -- nothing tracked.")
             return
-        self._add_run(name, job_list_path, thread_id=None, source="manual")
-        print(f"\n  Tracking '{name}' -> {job_list_path}\n")
+        self.registry.track(name, job_list_path)
+        display.tracked(name, job_list_path)
 
     def submissions(self):
-        """List every LIVE recorded submission: the run's name, and the job list
-        it points at. A record whose job_list file no longer exists is pruned
-        first, silently -- see history() to find it anyway.
+        """List every run still worth acting on: held runs awaiting a decision,
+        and submitted runs whose artifacts are still on disk.
 
-        Only approved submissions and track()'d runs appear here. A run that
-        was rejected, or that only generated a script, never produced a job
-        list and so was never recorded -- this is a record of pipelines on the
-        cluster, not of conversations with the agent. Paused conversations live
-        in the checkpoint, which is a separate store answering a different
-        question."""
-        records = self._load_runs()
-        if self._prune_runs(records):
-            self._save_runs(records)
-        seen = {}
-        for r in records:
-            if not r["gone"]:
-                seen[r["name"]] = r["job_list"]   # last live match wins per name
-        if not seen:
-            print("\n  No submissions recorded yet.\n")
+        A run whose job_list has vanished is pruned first, silently -- see
+        history() to find it anyway. Held runs are listed even though nothing of
+        theirs is on the scheduler yet, because a pending approval is the most
+        actionable thing this tool can be holding."""
+        records = self.registry.live()
+        if not records:
+            display.nothing("No runs recorded yet.",
+                            "Describe a pipeline in plain English to start one.")
             return
-        display.submissions(seen)
+        display.run_list(records)
 
     def history(self):
         """List every recorded run, live and gone, newest first. Unlike
         submissions(), nothing is hidden -- this is how you find a run again
         after its job_list file has been cleaned up from Rorqual."""
-        records = self._load_runs()
-        if self._prune_runs(records):
-            self._save_runs(records)
+        records = self.registry.all()
         if not records:
-            print("\n  No runs recorded yet.\n")
+            display.nothing("No runs recorded yet.")
             return
         display.history(records)
-# --------------------------------------------------------------------- #
+
+    def pending(self):
+        """Runs paused at the gate. Surfaced at startup, so a decision left
+        behind in a previous session is not silently lost."""
+        return self.registry.held()
+
+    def job_list_for(self, name):
+        """The job list recorded for a run, or None if there is no live record."""
+        record = self.registry.get(name)
+        if record is None or record["status"] == runs_store.GONE:
+            return None
+        return record["job_list"]
+
+    # --------------------------------------------------------------------- #
     #  Driving layer: gated replacements for A1.go that survive the pause.   #
     # --------------------------------------------------------------------- #
-    
-    def run(self, prompt, thread_id):
+
+    def _config(self, thread_id):
+        return {"recursion_limit": 500,
+                "configurable": {"thread_id": str(thread_id)}}
+
+    def _stream(self, payload, config, on_step=None):
+        """Drive the graph, rendering every message as it arrives.
+
+        Shared by run(), resume() and why() so all three render identically and
+        the transcript looks the same regardless of which one produced it.
+
+        Each message is drawn by display.render (the structured, coloured view)
+        and also stored as plain text in self.log. pretty_print with
+        printout=False still returns the formatted string, it just doesn't print
+        it, so the log keeps a clean uncoloured copy of everything.
+
+        on_step, if given, is called with each message -- used to drive the
+        spinner's label from what the agent is actually doing, so a long run
+        reports "running cmd.sh" rather than "thinking" for two minutes.
+        """
+        self.log = []
+        for s in self.app.stream(payload, stream_mode="values", config=config):
+            msg = s["messages"][-1]
+            display.render(msg)
+            self.log.append(pretty_print(msg, printout=False))
+            if on_step:
+                on_step(msg)
+
+    def run(self, prompt, thread_id, on_step=None):
         """Gated replacement for go(). Streams until the graph either finishes
         or pauses at the submission gate, and returns a status dict.
 
@@ -283,53 +315,54 @@ class GenpipeA1(A1):
         # The thread_id is the label this run is saved under in the checkpoint.
         # Every step gets stored under that label, so passing the same thread_id
         # later finds this exact run and resumes it.
-        config = {"recursion_limit": 500,
-                  "configurable": {"thread_id": str(thread_id)}}
+        config = self._config(thread_id)
         inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
 
-        # Drive the graph to completion or to the gate's pause. values mode gives
-        # no signal on a pause, so we don't inspect here; _gate_status reads the
-        # checkpoint afterward to tell which happened.
-        #
-        # Each message is drawn by display.render (the structured, coloured view)
-        # and also stored as plain text in self.log. pretty_print with
-        # printout=False still returns the formatted string, it just doesn't print
-        # it, so the log keeps a clean uncoloured copy of everything.
-        self.log = []
-        for s in self.app.stream(inputs, stream_mode="values", config=config):
-            msg = s["messages"][-1]
-            display.render(msg)
-            self.log.append(pretty_print(msg, printout=False))
+        # values mode gives no signal on a pause, so we don't inspect here;
+        # _gate_status reads the checkpoint afterward to tell which happened.
+        self._stream(inputs, config, on_step)
+        return self._settle(thread_id, config, task=prompt)
 
-        # If the run stopped at the gate, draw the approval box before returning,
-        # so the decision and the commands to answer it are the last thing on
-        # screen rather than something the caller has to go print themselves.
-        status = self._gate_status(config)
-        if status["status"] == "paused":
-            display.gate(status["proposal"], status["thread_id"])
-        return status
-
-    def resume(self, thread_id, approved, feedback=None):
+    def resume(self, thread_id, approved, feedback=None, on_step=None):
         """Continue a run paused at the submission gate. approved=True lets the
         command execute; approved=False sends feedback back to generate. Safe to
         call when nothing is paused: it just reports current status.
 
         On approval, the submission actually runs and GenPipes writes a job list
         file. That is the only moment the run's job list exists, so this is where
-        the run's thread_id is linked to that file for later progress lookups.
+        the run's name is linked to that file for later progress lookups.
         """
         started = time.time()
-        config = {"recursion_limit": 500,
-                  "configurable": {"thread_id": str(thread_id)}}
+        config = self._config(thread_id)
         snap = self.app.get_state(config)
         if not (snap.next and snap.tasks and snap.tasks[0].interrupts):
             return self._gate_status(config)
         command = Command(resume={"approved": bool(approved), "feedback": feedback})
-        for _ in self.app.stream(command, stream_mode="values", config=config):
-            pass
+        self._stream(command, config, on_step)
         if approved:
-            self._record_submission(thread_id,started)
-        return self._gate_status(config)
+            self._record_submission(thread_id, started)
+        return self._settle(thread_id, config)
+
+    def _settle(self, thread_id, config, task=None):
+        """Classify where the run ended up, record it, and show the consequence.
+
+        Both run() and resume() end here so that reaching the gate always has the
+        same three effects, in the same order, regardless of which call got
+        there: the pause is persisted to the registry, the approval box is drawn,
+        and the status dict is returned.
+
+        Persisting BEFORE drawing is the point. Everything on screen is lost the
+        moment the terminal closes; the record is what makes the pending decision
+        findable again tomorrow.
+        """
+        status = self._gate_status(config)
+        if status["status"] == "paused":
+            proposal = status["proposal"]
+            self.registry.hold(thread_id, thread_id, proposal, os.getcwd())
+            if task:
+                self.registry.update(thread_id, task=task)
+            display.gate(proposal, status["thread_id"])
+        return status
 
     def _gate_status(self, config):
         """Read the checkpoint after a stream ends and classify the run: either
@@ -363,277 +396,275 @@ class GenpipeA1(A1):
                 "final": msgs[-1].content if msgs else None,
                 "thread_id": thread_id}
     # --------------------------------------------------------------------- #
-    #  Helpers. Pure logic, callable in isolation — this is the surface your #
-    #  gate-invariant tests should hammer directly.                         #
+    #  Gate helpers. Thin delegates to gate_rules, which holds the actual     #
+    #  logic as pure functions over plain data.                               #
+    #                                                                        #
+    #  The split is not tidiness: gate_rules imports nothing but the standard #
+    #  library, so the one property that must never regress -- "does this     #
+    #  code submit to a scheduler?" -- is checked on every push in seconds,   #
+    #  without installing biomni. These methods stay because the graph's      #
+    #  routing_function and test_gate.py both call them, and delegating means #
+    #  there is one implementation rather than two that can drift.            #
     # --------------------------------------------------------------------- #
     def _extract_pending_code(self, state):
-        """The code the model just proposed, pulled from the last message."""
-        msgs = state.get("messages")
-        if not msgs:
-            return None
-        last = msgs[-1].content
-        if "<execute>" in last and "</execute>" not in last:
-            last += "</execute>"
-        m = re.search(r"<execute>(.*?)</execute>", last, re.DOTALL)
-        return m.group(1) if m else None
+        return gate_rules.extract_pending_code(state.get("messages"))
 
     def _is_submission(self, code):
-        """True only for code that actually submits: bash cmd.sh, or the DRAC
-        chunk_genpipes.sh / submit_genpipes path. Generation and reads return False.
+        return gate_rules.is_submission(code)
 
-        KNOWN LIMITATION (observed 2026-07-13): these patterns are searched across
-        the whole block as plain text, so they cannot tell a command that runs from
-        a command that is merely printed. Both of these match:
-
-            bash dnaseq_cmd.sh            <- actually submits
-            echo "  bash dnaseq_cmd.sh"   <- prints the words, runs nothing
-
-        This produced a live false positive: after an approved submission, the model
-        wrote a summary of what it had done, that summary echoed the submission
-        command, and the gate caught the summary as though it were a second
-        submission. Rejecting it only made the model summarize again, so the run
-        could not leave the gate.
-
-        The fix is to match only text that actually executes. Matchees against
-        _executable_lines(code) rather than the raw block, so a block that only prints
-        a submission command, such as the model summarizing work it already finished does 
-        NOT fire the gate.
-
-        """
-        if not code:
-            return False
-        code = self._executable_lines(code)
-        patterns = [
-            r"\b(?:bash|sh)\s+\S+\.sh\b",   # bash <script>.sh — any generated submission script
-            r"\bsubmit_genpipes\b",            # DRAC submit
-            r"\bchunk_genpipes\.sh\b",         # DRAC chunk (precedes submit)
-        ]
-        return any(re.search(p, code) for p in patterns)
+    def _executable_lines(self, code):
+        return gate_rules.executable_lines(code)
 
     def _flag_value(self, cmd, flag):
-        m = re.search(rf"{re.escape(flag)}\s+(\S+)", cmd)
-        return m.group(1) if m else None
+        return gate_rules.flag_value(cmd, flag)
 
     def _submission_line(self, code):
-        """Pull the real submission command out of a noisy code block, even if
-        the model buried it in a Python script or a string literal."""
-        if not code:
-            return ""
-        for p in (r"(?:bash|sh)\s+\S+\.sh\b",
-                  r"chunk_genpipes\.sh\b[^\"'\n]*",
-                  r"submit_genpipes\b[^\"'\n]*"):
-            m = re.search(p, code)
-            if m:
-                return m.group(0).strip()
-        return code.strip()
+        return gate_rules.submission_line(code)
 
     def _generation_command(self, state):
-        """Find the genpipes generation command anywhere in the history, since
-        the model often generates in one block and submits in a later one."""
-        for m in state.get("messages", []):
-            content = getattr(m, "content", "")
-            for block in re.findall(r"<execute>(.*?)</execute>", content, re.DOTALL):
-                if "genpipes" in block and "-g" in block:
-                    return block
-        return ""
+        return gate_rules.generation_command(state.get("messages"))
 
     def _build_proposal(self, state, code):
-        """The payload shown to the human. The submission line is extracted from
-        the caught block; the descriptive slots are parsed from the earlier
-        generation command so the box stays populated even when the model splits
-        generation and submission across separate blocks. Every fact is parsed
-        from command text, never from the model's prose, so the explanation
-        cannot disagree with the box the user approves."""
-        cmd = self._submission_line(code or "")
-        gen = self._generation_command(state)
-        src = gen or (code or "")
-        protocol = self._flag_value(src, "-t")
-        steps = self._flag_value(src, "-s")
-        inis = re.findall(r"\S+/([^/\s]+\.ini)", src) or re.findall(r"\S+\.ini", src)
-        design = self._flag_value(src, "-d")
-        pairs = self._flag_value(src, "-p")
-        lines = ["About to submit this GenPipes run:", f"  command: {cmd}"]
-        if protocol:
-            lines.append(f"  protocol: {protocol}")
-        if steps:
-            lines.append(f"  steps: {steps}")
-        if inis:
-            lines.append(f"  config layering: {' , '.join(inis)}")
-        if design:
-            lines.append(f"  design file: {design}")
-        if pairs:
-            lines.append(f"  pairs file: {pairs}")
-        lines.append("Approve to submit, or request an adjustment (protocol, steps, config).")
-        return {
-            "command": cmd,
-            "explanation": "\n".join(lines),
-            "slots": {"protocol": protocol, "steps": steps, "inis": inis,
-                      "design": design, "pairs": pairs},
-        }
+        return gate_rules.build_proposal(state.get("messages"), code)
 
-    def _record_submission(self, thread_id, since):
+    # --------------------------------------------------------------------- #
+    #  Monitoring, in three sizes. check() is one aggregate number, jobs() is #
+    #  every job, why() is the only one that costs a model call.             #
+    # --------------------------------------------------------------------- #
+    def _record_submission(self, name, since):
         """Called from resume() right after an approved submission runs. Records
-        the job list GenPipes just wrote, linking this run's thread_id to it so the
-        run can be found again by name.
+        the job list GenPipes just wrote, promoting the run from held to
+        submitted and pinning the directory it ran in.
 
         `since` is the time the submission started. Only a job list written after
         that moment belongs to this run. Without this guard, a submission that
-        creates zero jobs (everything already up to date) writes no list at all, and
-        the glob would silently grab the newest list from a PREVIOUS run — linking
-        this name to another run's jobs. The mtime filter prevents that: if nothing
-        new was written, nothing is recorded."""
-        import glob
+        creates zero jobs (everything already up to date) writes no list at all,
+        and the glob would silently grab the newest list from a PREVIOUS run --
+        linking this name to another run's jobs.
 
-        job_output = os.path.join(os.getcwd(), "job_output")
-        lists = glob.glob(os.path.join(job_output, "*job_list*"))
+        The working directory is recorded rather than inferred. A job's log path
+        in the job list is relative to wherever the submission ran, so without
+        this a later /why can only find logs if you happen to still be sitting in
+        the same directory. Pinning it here is what makes analysis work from
+        anywhere, in any later session.
+        """
+        import glob as _glob
+
+        workdir = os.getcwd()
+        lists = _glob.glob(os.path.join(workdir, "job_output", "*job_list*"))
 
         # Keep only job lists written by THIS submission, not a stale one.
         lists = [f for f in lists if os.path.getmtime(f) >= since]
-        if not lists:
-            return          # zero jobs created -> no list written -> record nothing
+        newest = max(lists, key=os.path.getmtime) if lists else None
 
-        newest = max(lists, key=os.path.getmtime)
-        self._add_run(thread_id, newest, thread_id=str(thread_id), source="agent")
+        # Promote even when there is no list: "every step already up to date"
+        # produces no jobs, and that is a successful outcome, not a run still
+        # awaiting approval.
+        held = self.registry.get(name)
+        proposal = (held or {}).get("proposal")
+        self.registry.mark_submitted(name, newest, workdir=workdir,
+                                     proposal=proposal, thread_id=name)
 
-    def job_list_for(self, thread_id):
-        """Look up the job list file recorded for a name (a thread_id, or a name
-        given to track()). Returns the path, or None if there's no live record --
-        a gone record is never returned, since there is nothing left to check."""
-        records = self._load_runs()
-        if self._prune_runs(records):
-            self._save_runs(records)
-        found = None
-        for r in records:
-            if r["name"] == str(thread_id) and not r["gone"]:
-                found = r["job_list"]        # last live match wins
-        return found
+    def _need_run(self, name, needs_jobs=True):
+        """Resolve a name to a record, explaining the failure if it can't.
 
-    def check(self, thread_id):
-        """Show a submitted run's progress by its thread_id. Resolves the run's
-        job list file, runs GenPipes' log_report on it, and draws the result.
-
-        Prints rather than returns, because the point of it is to be looked at.
-        The raw log_report text is still returned, so it can be captured."""
-        import subprocess
-        path = self.job_list_for(thread_id)
-        if not path:
-            print(f"\nNo recorded submission for '{thread_id}'.\n")
-            return None
-        cmd = ("module load mugqic/genpipes/6.1.1 && "
-               f"genpipes tools log_report --loglevel ERROR {path}")
-        out = subprocess.run(cmd, shell=True, capture_output=True,
-                             text=True, executable="/bin/bash")
-        raw = out.stdout + (("\n" + out.stderr) if out.stderr else "")
-        display.status(thread_id, raw)
-        return None
-
-    def _executable_lines(self, code):
-        """Return only the parts of a code block that actually run.
-
-        A block can *mention* a submission without performing one. The model does
-        this constantly when it summarizes or explains its own work, and it does
-        it in two languages:
-
-            bash dnaseq_cmd.sh                 <- runs: submits the pipeline
-            echo "  bash dnaseq_cmd.sh"        <- shell: prints the words only
-            print("  bash dnaseq_cmd.sh")      <- python: prints the words only
-
-        All three contain the same text, so searching the raw block cannot tell
-        them apart. Both false positives happened for real:
-
-          2026-07-13, shell: after an approved submission, the model echoed a
-          summary of what it had done. The gate caught the summary as a second
-          submission, and rejecting it only produced another summary. Stuck.
-
-          2026-07-14, python: on a generation-only task, the model ended with
-          print("  bash launch_cmd.sh") inside a "here is how you would submit
-          this" note -- while explicitly saying it was NOT submitting. The gate
-          fired before the code ran, so the script was never even generated.
-
-        So before asking "is this a submission?", strip the places text is written
-        but never executed:
-
-            - comments              (# anything)
-            - echo arguments        (shell prints its words, it does not run them)
-            - heredoc bodies        (cat << 'EOF' ... EOF is a block of plain text)
-            - print() arguments     (python prints its words, it does not run them)
-
-        What remains is only code that would truly execute, and _is_submission
-        searches that instead of the raw block.
-
-        WHY ONLY print(), AND NOT ALL PYTHON STRINGS. In python a quoted string is
-        sometimes inert and sometimes the command itself:
-
-            print("bash cmd.sh")                       <- inert
-            subprocess.run("bash cmd.sh", shell=True)  <- a real submission
-
-        Stripping every string would blind the matcher to the second, which is a
-        false negative: a real submission slipping through ungated. That is the
-        dangerous direction. A false positive only costs a rejection; a false
-        negative costs an unapproved pipeline on the cluster. So this strips only
-        what is handed to print(), the one construct we are confident is inert,
-        and leaves every other string intact so subprocess and os.system calls are
-        still caught.
-
-        A rule of thumb, not a parser. A submission hidden in a variable that is
-        never spelled out, an eval, or a $(...) would still slip through. That is
-        accepted: the job is to stop misreading a cooperative model's own summary,
-        not to defeat someone deliberately hiding a command.
+        Every monitoring command starts with the same three questions -- does
+        this run exist, is it still on disk, does it have jobs to look at -- and
+        the answers are far more useful than "None". A held run in particular is
+        not a missing run; it is a run waiting for you, and saying so turns a
+        dead end into the next thing to type.
         """
-        # Nothing to look at.
-        if not code:
-            return ""
+        record = self.registry.get(name)
+        if record is None:
+            display.problem(f"No run named '{name}'.", "/list shows what there is.")
+            return None
+        if record["status"] == runs_store.HELD:
+            display.problem(f"'{name}' hasn't been submitted yet -- it's waiting "
+                            f"for approval.", f"/approve {name}")
+            return None
+        if record["status"] == runs_store.GONE:
+            display.problem(f"'{name}' ran, but its job list is no longer on disk.",
+                            "/history still has the record.")
+            return None
+        if needs_jobs and not record["job_list"]:
+            display.problem(f"'{name}' created no jobs -- every step was already "
+                            f"up to date.")
+            return None
+        return record
 
-        kept = []            # the lines we decide are real code
-        in_heredoc = False   # are we currently inside a block of heredoc text?
-        end_word = None      # the word that will close that heredoc (often "EOF")
+    def check(self, name):
+        """Show a run's progress: GenPipes' own log_report, drawn as a bar.
 
-        # .splitlines() turns the one big block of code into a list of single lines,
-        # so we can judge each line on its own.
-        for line in code.splitlines():
+        This is the cheap, deterministic answer to "how is it going" -- no model,
+        no cost, and the number GenPipes itself would give you. The result is
+        cached on the record so /list can show where each run stood without
+        re-running a module load per row.
+        """
+        record = self._need_run(name)
+        if record is None:
+            return None
+        raw = runs_store.log_report(record["job_list"])
+        parsed = runs_store.parse_log_report(raw)
+        if parsed["total"]:
+            self.registry.remember_check(name, parsed["counts"], parsed["total"],
+                                         runs_store.verdict(parsed["counts"]))
+        display.status(name, parsed, raw)
+        return raw
 
-            # .strip() removes spaces from both ends, so an indented "   EOF"
-            # still matches the plain word "EOF".
-            bare = line.strip()
+    def jobs(self, name, only_failed=False):
+        """List the individual Slurm jobs inside a run, with their live states.
 
-            # --- Case 1: we are inside a heredoc -------------------------------
-            # Everything here is text handed to a command, not code. Skip it. The
-            # only thing we watch for is the closing word, which ends the block.
-            if in_heredoc:
-                if bare == end_word:
-                    in_heredoc = False
-                continue     # "continue" = skip to the next line, keep nothing
+        check() answers "how is the run doing"; this answers "which jobs".
+        States come from sacct rather than from any cached record, because the
+        scheduler is the only authority on whether a job is still alive.
+        """
+        record = self._need_run(name)
+        if record is None:
+            return []
+        jobs = runs_store.jobs_for(record)
+        if not jobs:
+            display.problem(f"'{name}' has a job list, but no jobs could be read "
+                            f"from it.", os.path.basename(record["job_list"] or ""))
+            return []
+        # The tally is always over ALL the jobs, even when only failures are
+        # shown: the cached verdict describes the run, and computing it from a
+        # filtered view would record "everything failed" for a healthy run.
+        tally = runs_store.counts(jobs)
+        self.registry.remember_check(name, tally, len(jobs),
+                                     runs_store.verdict(tally))
+        display.jobs(name, jobs, only_failed=only_failed)
+        return [j for j in jobs if j.failed] if only_failed else jobs
 
-            # --- Case 2: does this line START a heredoc? -----------------------
-            # A heredoc opens like:   cat << EOF    or    cat << 'EOF'
-            # We grab the closing word so we know when the text block ends.
-            opener = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", line)
-            if opener:
-                in_heredoc = True
-                end_word = opener.group(1)   # group(1) = the captured word, e.g. EOF
-                continue                     # the opener line is not a command
+    def cancel(self, name):
+        """scancel every job in a run that is still pending or running.
 
-            # --- Case 3: a comment ---------------------------------------------
-            # Anything starting with # never runs. Covers both shell and python.
-            if bare.startswith("#"):
-                continue
+        The counterpart to the gate. A tool careful enough to stop before
+        submitting should also be able to stop after -- otherwise the moment you
+        realise a run is wrong is the moment the tool stops being useful.
+        Returns the number of jobs targeted.
+        """
+        record = self._need_run(name)
+        if record is None:
+            return 0
+        jobs = runs_store.jobs_for(record)
+        n, raw = runs_store.cancel(jobs)
+        display.cancelled(name, n, raw)
+        if n:
+            self.registry.add_note(name, f"cancelled {n} job(s)")
+        return n
 
-            # --- Case 4: strip shell echo's arguments --------------------------
-            # echo only prints its words. Delete "echo" and everything after it,
-            # but stop at ; | or & so a real command chained on the same line
-            # survives:   echo hi && bash cmd.sh   ->   " && bash cmd.sh"
-            line = re.sub(r"\becho\b[^;|&\n]*", "", line)
+    def why(self, name, question=None, on_step=None):
+        """Ask the model why a run failed, having first established what failed.
 
-            # --- Case 5: strip python print's arguments ------------------------
-            # print(...) only writes to the screen. Replace the whole call with an
-            # empty print(), so anything quoted inside it -- including a submission
-            # command the model is merely describing -- is gone. Strings passed to
-            # subprocess, os.system, eval and friends are deliberately NOT touched:
-            # those really do execute, and must still trip the gate.
-            line = re.sub(r"\bprint\s*\([^)]*\)", "print()", line)
+        Two deliberate decisions here.
 
-            # Whatever is left on this line is treated as real code.
-            kept.append(line)
+        1. THE FACTS ARE GATHERED BEFORE THE MODEL IS INVOLVED. runs.triage()
+           asks Slurm which jobs failed and reads their logs from disk. A
+           GenPipes run has hundreds of .o files; a model told to "go look" burns
+           an enormous amount of context rediscovering what one sacct call
+           already knows, and then answers vaguely. So the model is handed the
+           failed steps and the relevant log text, and spends its reasoning on
+           the cause instead of the search.
 
-        # Join the surviving lines back into one block for the matcher to search.
-        return "\n".join(kept)
+        2. IT RUNS ON ITS OWN THREAD, never the run's. Biomni's AgentState
+           declares `messages` with no reducer, which makes it a last-value-wins
+           channel: passing new inputs to an existing thread REPLACES its message
+           list instead of appending. Re-using the run's thread would therefore
+           erase the conversation that built the pipeline -- and, if the run were
+           parked at the gate, the pending interrupt with it. A sibling thread
+           gets the analysis without ever touching the state that /approve
+           depends on.
+
+        The investigation is read-only in intent, but it is not trusted to be:
+        it goes through the same gated graph, so if the model decides to
+        resubmit something, it stops at the gate like anything else.
+        """
+        record = self._need_run(name)
+        if record is None:
+            return None
+
+        report = runs_store.triage(record)
+        if not report["failed_total"]:
+            display.problem(f"Nothing in '{name}' has failed.",
+                            f"/check {name} for where it's up to.")
+            return None
+
+        display.triage(name, report)
+
+        thread = f"{name}::why-{datetime.datetime.now():%m%d%H%M%S}"
+        prompt = self._why_prompt(name, record, report, question)
+        self.critic_count = 0
+        self.user_task = prompt
+        self._stream({"messages": [HumanMessage(content=prompt)], "next_step": None},
+                     self._config(thread), on_step)
+        status = self._gate_status(self._config(thread))
+
+        # Record the conclusion on the RUN, not the investigation thread, so it
+        # shows up next to the run in /history months later.
+        if status.get("final"):
+            self.registry.add_note(name, _one_line(status["final"]))
+        return status
+
+    def _why_prompt(self, name, record, report, question):
+        """Build the diagnosis prompt out of facts, not prose.
+
+        Every value here was parsed from a command or read from the scheduler, so
+        the model is arguing from the same evidence the user can see on screen
+        above it. The instruction to answer in a <solution> block matters: without
+        it the agent's default is to start running code, and the first thing worth
+        having is a hypothesis, not more shell.
+        """
+        slots = (record.get("proposal") or {}).get("slots") or {}
+        lines = [
+            f"A GenPipes run named '{name}' has failed jobs. Diagnose the cause.",
+            "",
+            "What is known, gathered from the scheduler and the run's own files:",
+            f"  working directory: {record.get('workdir') or 'unknown'}",
+        ]
+        for label, key in (("pipeline", "pipeline"), ("protocol", "protocol"),
+                           ("steps", "steps"), ("readset", "readset")):
+            if slots.get(key):
+                lines.append(f"  {label}: {slots[key]}")
+        if slots.get("inis"):
+            lines.append(f"  config layering: {' , '.join(slots['inis'])}")
+        if record.get("job_list"):
+            lines.append(f"  job list: {record['job_list']}")
+        lines += [
+            f"  failed jobs: {report['failed_total']} "
+            f"across {report['steps_affected']} step(s)",
+            "",
+        ]
+        for f in report["findings"]:
+            lines.append(f"--- step {f['step']}: {f['count']} job(s) {f['state']} ---")
+            if f["maxrss"]:
+                lines.append(f"    peak memory: {f['maxrss']}")
+            if f["exit_code"]:
+                lines.append(f"    exit code: {f['exit_code']}")
+            lines.append(f"    log: {f['log'] or 'not found on disk'}")
+            if f["log_tail"]:
+                lines.append("    tail of that log:")
+                lines += [f"      {l}" for l in f["log_tail"].splitlines()]
+            lines.append("")
+        if question:
+            lines += [f"The user specifically asks: {question}", ""]
+        lines += [
+            "Explain, in a <solution> block: the single most likely cause, the "
+            "evidence in the logs above that supports it, and the concrete fix "
+            "(which ini key, which resource, which file). If a resubmission is "
+            "needed, say exactly which steps to rerun -- do not resubmit now.",
+            "Only use <execute> if you genuinely need to read a file that is not "
+            "quoted above.",
+        ]
+        return "\n".join(lines)
+
+
+def _one_line(text, limit=140):
+    """Squash a model's answer to one line for the run's note field.
+
+    The <solution> wrapper is stripped: the tag is an artifact of how the agent
+    talks to itself, and leaving it in means /history six weeks later reads as
+    markup rather than as a finding.
+    """
+    flat = re.sub(r"</?solution>", " ", text or "")
+    flat = " ".join(flat.split())
+    return flat[:limit - 1] + "…" if len(flat) > limit else flat

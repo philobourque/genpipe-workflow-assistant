@@ -10,8 +10,8 @@ WARNING: agent.go() is Biomni's own ungated loop, NOT GenpipeA1's gated
 run()/resume(). This UI does not stop for approval before a submission
 reaches the cluster. It is a convenience face for generation, exploration, and
 demos -- do not point it at a real submission task. Use the CLI
-(start_agent.sh -> agent.run(...)/agent.resume(...)) for anything that
-actually submits to the scheduler, until this UI grows its own gate.
+(start_agent.sh, then type a task and /approve it) for anything that actually
+submits to the scheduler, until this UI grows its own gate.
 
 The ONLY integration point is build_agent() below, imported from
 launch_agent.py. Building the agent here runs your normal setup once (the big

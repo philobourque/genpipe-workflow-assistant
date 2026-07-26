@@ -115,7 +115,12 @@ for c in ["bash rnaseq_steps_1-5.sh", "bash ./rnaseq_stringtie.sh"]:
     got = gate._is_submission(c)
     print(f"    {'gates' if got else 'MISSES'}: {c!r}")
 
-print("\n=== G. run tracking store (track / submissions / history / prune) ===")
+print("\n=== G. run tracking store (track / job_list_for / prune) ===")
+# The store itself now lives in runs.py and is tested directly and far more
+# thoroughly by tests/test_runs.py, which runs in CI. What is left here is only
+# what belongs at the AGENT level: that agent.track() refuses a path that isn't
+# there, that a manually tracked run and an agent-recorded one coexist, and that
+# job_list_for stops resolving a run whose artifacts have been purged.
 import tempfile
 import shutil
 
@@ -124,47 +129,48 @@ tracker.path = tempfile.mkdtemp(prefix="genpipe_runs_test_")
 try:
     # track() on a path that doesn't exist must record nothing.
     tracker.track("ghost", os.path.join(tracker.path, "does_not_exist.job_list"))
-    expect("track() refuses a missing path", tracker._load_runs(), [])
+    expect("track() refuses a missing path", tracker.registry.load(), [])
 
     # track() on a real file records a live, source="manual" entry.
     job_list = os.path.join(tracker.path, "Pipeline.protocol.job_list.T1")
     open(job_list, "w").close()
     tracker.track("manual-1", job_list)
-    records = tracker._load_runs()
+    records = tracker.registry.load()
     expect("track() records one entry", len(records), 1)
     expect("tracked entry has no thread_id", records[0]["thread_id"], None)
-    expect("tracked entry is live", records[0]["gone"], False)
+    expect("tracked entry is live", records[0]["status"], "submitted")
     expect("tracked entry source is manual", records[0]["source"], "manual")
 
-    # An agent-side submission (_add_run with a thread_id) coexists fine.
+    # An agent-side submission coexists fine.
     job_list2 = os.path.join(tracker.path, "Pipeline.protocol.job_list.T2")
     open(job_list2, "w").close()
-    tracker._add_run("patient-42", job_list2, thread_id="patient-42", source="agent")
+    tracker.registry.mark_submitted("patient-42", job_list2, thread_id="patient-42")
     expect("job_list_for finds the agent-recorded run",
            tracker.job_list_for("patient-42"), job_list2)
     expect("job_list_for finds the manually tracked run",
            tracker.job_list_for("manual-1"), job_list)
 
-    # Delete one job_list file on disk, then prune via job_list_for (submissions()
-    # and history() call the same _prune_runs path). The gone run must disappear
-    # from lookup but the record itself must survive, marked gone -- not deleted.
+    # Delete one job_list file on disk, then prune via job_list_for. The gone run
+    # must disappear from lookup but the record itself must survive, marked gone
+    # -- not deleted.
     os.remove(job_list2)
+    tracker.registry.live()          # triggers the prune
     expect("job_list_for no longer returns a gone run",
            tracker.job_list_for("patient-42"), None)
-    records = tracker._load_runs()
-    by_name = {r["name"]: r for r in records}
+    by_name = {r["name"]: r for r in tracker.registry.load()}
     expect("gone run's record still exists", "patient-42" in by_name, True)
     expect("gone run's record is marked gone", by_name["patient-42"]["gone"], True)
     expect("untouched run is still live", by_name["manual-1"]["gone"], False)
 
-    # Once marked gone, pruning again must not flip it back or touch gone_at,
-    # even if a file were to reappear at that path -- gone is a one-way door.
+    # Once marked gone, pruning again must not flip it back -- gone is a one-way
+    # door, so a transient filesystem hiccup can't resurrect a run.
     open(job_list2, "w").close()   # simulate the path becoming valid again
-    tracker.job_list_for("patient-42")
+    tracker.registry.live()
     expect("a gone run stays gone even if its path reappears",
-           tracker._load_runs()[0]["gone"] if tracker._load_runs()[0]["name"] == "patient-42"
-           else tracker._load_runs()[1]["gone"], True)
+           {r["name"]: r for r in tracker.registry.load()}["patient-42"]["gone"], True)
 finally:
+    shutil.rmtree(tracker.path, ignore_errors=True)
+
     shutil.rmtree(tracker.path, ignore_errors=True)
 
 print("\n" + "=" * 52)
