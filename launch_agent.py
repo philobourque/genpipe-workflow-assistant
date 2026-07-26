@@ -10,7 +10,10 @@ import io, contextlib
 from pathlib import Path
 
 import display
+import intake
+import preflight
 import runs
+import slots
 import ui
 from biomni.llm import get_llm
 from genpipe_agent import GenpipeA1
@@ -583,6 +586,25 @@ def _name_run(agent, task):
     return unique
 
 
+def _panel(gap):
+    """Render one gap as a question. The seam intake.resolve() asks through.
+
+    A panel with nothing to offer is worse than a plain question: it costs a
+    keystroke to reach the free-text row and implies there were alternatives
+    worth reading. So when nothing on disk matches, this degrades to a one-line
+    prompt with the note as its hint.
+    """
+    if not gap.options:
+        if gap.note:
+            print(f"  {display.DIM}{gap.note}{display.RESET}")
+        try:
+            return ui.ask(gap.question).strip() or None
+        except (EOFError, KeyboardInterrupt):
+            return None
+    return ui.choose(gap.question, gap.options,
+                     note=gap.note, free_text=gap.free_text)
+
+
 def _repl(agent):
     """The application's actual interface. Bare text is a task -- named, then
     run, since every run needs a name to /approve, /reject, or /check it later,
@@ -621,6 +643,19 @@ def _repl(agent):
                 print(f"  {display.RED}{type(e).__name__}: {e}{display.RESET}\n")
             continue
 
+        # Fill in what the request left out before the model sees it, so the
+        # panel's options come from the ini table rather than from a model's
+        # idea of what protocols exist.
+        try:
+            stated, cancelled = intake.resolve(line, asker=_panel)
+        except Exception as e:
+            display.problem(f"{type(e).__name__}: {e}")
+            continue
+        if cancelled:
+            display.nothing("Cancelled.")
+            continue
+        task = intake.restate(line, stated)
+
         try:
             name = _name_run(agent, line)
         except Exception as e:
@@ -631,7 +666,7 @@ def _repl(agent):
         print()
         try:
             with ui.Activity("thinking") as act:
-                agent.run(line, thread_id=name, on_step=_narrate(act))
+                agent.run(task, thread_id=name, on_step=_narrate(act))
         except KeyboardInterrupt:
             display.problem("Stopped.", "Nothing has reached the scheduler.")
         except Exception as e:
@@ -692,10 +727,30 @@ def main(argv=None):
     # must not wait to be asked about: its name lived only in that session's
     # scrollback, and without this the decision is simply lost.
     display.pending(agent.pending())
+    # Environment problems that only surface at submit time, surfaced now. The
+    # blocking one is re-checked at the gate; this is the early warning.
+    if not fake_cluster:
+        display.environment(preflight.check())
     try:
         _repl(agent)
     except KeyboardInterrupt:
         print()
+    display.farewell(agent.pending())
+
+    # Leave deliberately rather than falling off the end of main().
+    #
+    # On the raw-terminal path the interpreter does not shut down: it spins at
+    # 100% CPU and never exits, so /exit and Ctrl+D both appear to hang and the
+    # only way out is to close the terminal. Headless it exits in two seconds,
+    # which is why the pty test never caught it -- its close() shuts the master
+    # and the app dies of SIGHUP looking healthy.
+    #
+    # The app keeps its own history in ui.Prompt and asks nothing of readline
+    # (imported only so any stray input() call is editable), so there is no
+    # atexit work here worth waiting for. Flush what we printed, then go.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

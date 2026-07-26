@@ -65,6 +65,7 @@ import json
 import datetime
 import display
 import gate_rules
+import preflight
 import runs as runs_store
 import time
 import warnings
@@ -337,6 +338,18 @@ class GenpipeA1(A1):
         snap = self.app.get_state(config)
         if not (snap.next and snap.tasks and snap.tasks[0].interrupts):
             return self._gate_status(config)
+        if approved:
+            # Re-checked here, not just when the box was drawn. The box may have
+            # been on screen for a day, and /approve is the irreversible act.
+            blockers = self._blockers()
+            if blockers:
+                display.environment(blockers)
+                display.problem(
+                    "Not approved -- the environment would reject every job.",
+                    "Nothing has reached the scheduler.")
+                status = self._gate_status(config)
+                status["blockers"] = blockers
+                return status
         command = Command(resume={"approved": bool(approved), "feedback": feedback})
         self._stream(command, config, on_step)
         if approved:
@@ -361,8 +374,22 @@ class GenpipeA1(A1):
             self.registry.hold(thread_id, thread_id, proposal, os.getcwd())
             if task:
                 self.registry.update(thread_id, task=task)
-            display.gate(proposal, status["thread_id"])
+            blockers = self._blockers()
+            status["blockers"] = blockers
+            display.gate(proposal, status["thread_id"], blockers=blockers)
         return status
+
+    def _blockers(self):
+        """Environment problems that would make this submission fail regardless
+        of the command.
+
+        Checked here rather than only at startup because the gate is the last
+        moment before anything is spent, and because a session can outlive the
+        environment it started in.
+        """
+        if os.environ.get("GENPIPE_FAKE"):
+            return []          # the fake cluster has no allocation to bill
+        return preflight.blockers()
 
     def _gate_status(self, config):
         """Read the checkpoint after a stream ends and classify the run: either

@@ -163,6 +163,13 @@ class App:
 def main():
     r = Report("the whole app, through a terminal")
     workdir = tempfile.mkdtemp(prefix="genpipe_app_")
+    # The intake step asks about anything a request leaves out, so these exist
+    # to be named in the request below. This suite is about the app as a whole;
+    # the panel's own behaviour is covered by tests/test_intake.py and walked
+    # end to end by testcases/case1_interface.py.
+    for _seed in ("readset.rnaseq.txt", "design.rnaseq.txt"):
+        with open(os.path.join(workdir, _seed), "w") as _fh:
+            _fh.write("Sample\tReadset\n")
     app = None
     try:
         app = App(workdir, state="failed-oom")
@@ -217,6 +224,17 @@ def main():
         # ================================================================== #
         r.section("a task offers a name, then stops at the gate")
         app.line("run rnaseq stringtie steps 1-5")
+        # Two panels stand between the request and the name prompt now: the
+        # readset and the design, neither of which this request names. Answering
+        # them with the seeded files keeps the run name -- and therefore every
+        # assertion below -- the same as before intake existed.
+        # send(), not line(): with nine or fewer rows a digit selects
+        # immediately, so a trailing Enter would leak into whatever prompt comes
+        # next -- which is the name prompt, whose suggestion is pre-filled.
+        app.wait_for("Which readset file", timeout=30)
+        app.send("1")
+        app.wait_for("needs a design file", timeout=30)
+        app.send("1")
         r.check("asks for a name", app.wait_for("name this run", timeout=30))
         screen = app.visible()
         r.contains("with one already suggested", screen, "rnaseq-stringtie")
@@ -334,6 +352,17 @@ def main():
         # ================================================================== #
         r.section("a reused name is redirected, not allowed to clobber")
         app.line("run rnaseq stringtie steps 1-5")
+        # Two panels stand between the request and the name prompt now: the
+        # readset and the design, neither of which this request names. Answering
+        # them with the seeded files keeps the run name -- and therefore every
+        # assertion below -- the same as before intake existed.
+        # send(), not line(): with nine or fewer rows a digit selects
+        # immediately, so a trailing Enter would leak into whatever prompt comes
+        # next -- which is the name prompt, whose suggestion is pre-filled.
+        app.wait_for("Which readset file", timeout=30)
+        app.send("1")
+        app.wait_for("needs a design file", timeout=30)
+        app.send("1")
         r.check("asks for a name again", app.wait_for("name this run", timeout=30))
         # The suggestion is pre-filled with the cursor at the end, so typing
         # appends to it -- which is what makes it editable rather than a default.

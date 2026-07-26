@@ -268,6 +268,37 @@ def main():
     r.check("drawing all of it raises nothing",
             drawn(display.render, Msg("<solution>ok</solution>")) is not None)
 
+    # ---------------------------------------------------------------- #
+    r.section("environment findings, and the gate's refusal to offer approval")
+
+    import preflight
+
+    r.equal("a sound environment prints nothing",
+            drawn(display.environment, []).strip(), "")
+
+    warn = preflight.check_job_mail("x@gmail.coma")
+    text = drawn(display.environment, [warn])
+    r.check("a warning names the variable", "JOB_MAIL" in text)
+    r.check("and offers the fix line", "export JOB_MAIL=" in text)
+    r.check("and does not claim to block", "BLOCKS SUBMISSION" not in text)
+
+    block = preflight.check_rap_id("")
+    text = drawn(display.environment, [block])
+    r.check("a blocker says so plainly", "BLOCKS SUBMISSION" in text)
+
+    proposal = {"command": "bash cmd.sh", "slots": {"protocol": "germline_snv"}}
+    clean = drawn(display.gate, proposal, "run-1")
+    r.check("a normal gate offers approve", "/approve run-1" in clean)
+
+    # The point of the blocked gate: the command that cannot work must not be
+    # on screen next to the explanation of why it cannot work.
+    stopped = drawn(display.gate, proposal, "run-1", blockers=[block])
+    r.check("a blocked gate withholds approve", "/approve" not in stopped)
+    r.check("but still allows reject", "/reject run-1" in stopped)
+    r.check("and says what to fix", "RAP_ID" in stopped)
+    r.check("and confirms nothing was spent",
+            "Nothing has reached the scheduler" in stopped)
+
     return r.finish()
 
 

@@ -377,11 +377,53 @@ def render(message):
 # selected and pasted without dragging a border character along with them.
 # ---------------------------------------------------------------------------
 
-def gate(proposal, thread_id):
+def farewell(pending=()):
+    """Printed on the way out.
+
+    A held run is the one thing that must not leave quietly: its approval is
+    still outstanding, it survives in the checkpoint, and the name needed to
+    resume it was only ever on screen.
+    """
+    print()
+    if pending:
+        names = ", ".join(getattr(p, "name", str(p)) for p in pending)
+        print(f"  {AMBER}▌{RESET} {len(pending)} run(s) still held at the gate: "
+              f"{WHITE}{names}{RESET}")
+        print(f"  {DIM}  They keep their place. Reopen and /approve or /reject "
+              f"when you have decided.{RESET}")
+    print(f"  {DIM}bye{RESET}\n")
+
+
+def environment(findings):
+    """Environment problems, at startup. Silent when there are none.
+
+    Warnings and blockers are drawn the same way apart from colour, because the
+    distinction that matters is stated in words -- "jobs will not run" versus
+    "mail will bounce" -- and a person who has to decode a colour to learn which
+    is which has been told nothing.
+    """
+    if not findings:
+        return
+    print()
+    for finding in findings:
+        colour = RED if finding.blocking else AMBER
+        tag = "BLOCKS SUBMISSION" if finding.blocking else "heads up"
+        print(f"  {colour}{BOLD}{finding.variable}{RESET} "
+              f"{colour}{tag}{RESET}  {DIM}{finding.problem}{RESET}")
+        print(f"      {DIM}fix:{RESET} {WHITE}{finding.fix}{RESET}")
+    print()
+
+
+def gate(proposal, thread_id, blockers=()):
     """Print the submission gate: what is about to run, and how to answer it.
 
     The approve/reject commands are printed here on purpose. The moment you are
     asked to make a decision is the worst moment to be recalling an API.
+
+    `blockers` are environment findings that would make this submission fail no
+    matter how good the command is. When there are any, the approve line is
+    replaced rather than merely annotated: offering an action that cannot work,
+    next to an explanation of why it cannot work, invites trying it anyway.
     """
     slots = proposal.get("slots") or {}
 
@@ -412,6 +454,19 @@ def gate(proposal, thread_id):
         print(f"      {DIM}{label:<18}{RESET}{value}")
     if rows:
         print()
+    if blockers:
+        for finding in blockers:
+            print(f"      {RED}{'cannot submit':<18}{RESET}"
+                  f"{finding.variable} {finding.problem}")
+            print(f"      {DIM}{'fix':<18}{RESET}{WHITE}{finding.fix}{RESET}")
+        print()
+        print(f"      {DIM}{'reject':<18}{RESET}/reject {WHITE}{thread_id}{RESET} \u2026")
+        print()
+        print(f"  {DIM}Nothing has reached the scheduler. Fix the above and "
+              f"restart to approve.{RESET}")
+        print("\n")
+        return
+
     print(f"      {DIM}{'approve':<18}{RESET}/approve {WHITE}{thread_id}{RESET}")
     print(f"      {DIM}{'reject':<18}{RESET}/reject {WHITE}{thread_id}{RESET} \u2026")
     print()
