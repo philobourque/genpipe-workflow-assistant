@@ -168,25 +168,26 @@ def _left_column(user, source, model, path):
 def _right_column(w):
     lines = [""]
     lines.append(f"{BOLD}Getting started{RESET}")
-    lines += _wrap("Talk to it in plain English -- ask it something, or ask "
-                   "for a run:", w)
+    lines += _wrap("Ask a question or describe the GenPipes run you want:", w)
     lines.append(f"  {WHITE}run dnaseq germline_snv on my readset, all steps{RESET}")
     lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
-    lines.append(f"{GREY}Press {RESET}{GREEN}/{RESET}{GREY} to see every command, "
-                 f"{RESET}{GREEN}Tab{RESET}{GREY} to complete one.{RESET}")
+    # Two rows, not one sentence: both are hand-styled, so neither can go
+    # through _wrap() -- textwrap would count the escape sequences -- and a
+    # single 60-column row clips at the widths where the box gives the right
+    # column 49 to 59, taking the green / and Tab with it.
+    lines.append(f"{GREY}Type {RESET}{GREEN}/{RESET}{GREY} to see available "
+                 f"commands.{RESET}")
+    lines.append(f"{GREY}Press {RESET}{GREEN}Tab{RESET}{GREY} to "
+                 f"autocomplete.{RESET}")
     lines += _wrap("/help brings the full list back at any time.", w)
     lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
     lines.append(f"{BOLD}Once it's running{RESET}")
-    lines += _wrap("You can monitor it, stop it, or work out what went wrong:", w)
+    lines += _wrap("You can monitor it, cancel it, or diagnose a failure:", w)
     lines.append(f"  {GREEN}/check{RESET}  {GREEN}/jobs{RESET}  "
                  f"{GREEN}/cancel{RESET}  {GREEN}/why{RESET}")
-    lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
-    # The one thing a person needs to believe before typing anything here. It
-    # used to be a five-line ASCII diagram of the pipeline; the sentence says
-    # the same thing, and a first screen is not the place to spend five lines
-    # drawing an arrow.
-    lines += _wrap("Nothing reaches Slurm without your approval. Anything that "
-                   "would submit stops and asks you first.", w, style=WHITE)
+    # The approval promise used to close this screen. It says more where it is
+    # demonstrated -- at the gate, holding a real submission -- than as a claim
+    # made to someone who has not yet typed anything.
     return lines
 
 
