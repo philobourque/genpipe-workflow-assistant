@@ -113,6 +113,60 @@ def main():
                 "already-done" in [x["name"] for x in reg.live()])
 
         # ---------------------------------------------------------------- #
+        # 2026-07-27: a 46-job dnaseq run reported "created no jobs". It had
+        # been generated with -o, so GenPipes wrote its list one directory
+        # below the cwd, and the search only looked in the cwd. Every case
+        # below is that incident or the guard that must survive fixing it.
+        r.section("finding the job list a submission just wrote")
+        root = os.path.join(workdir, "submission")
+        os.makedirs(root, exist_ok=True)
+        # Fixed timestamps rather than time.time(): a filesystem that stores
+        # mtimes to the second would otherwise make this race its own setup.
+        since, older = 2_000_000_000, 1_999_999_000
+
+        buried = os.path.join(root, "cit_run", "job_output",
+                              "DnaSeq.somatic_fastpass.job_list.2026")
+        make_job_list(buried, [("41000010", "picard.s1", "picard/s1.o", "PENDING")])
+        os.utime(buried, (since + 10, since + 10))
+
+        r.equal("a list written under -o is found, not missed",
+                runs.find_job_list(root, since, output_dir="cit_run"), buried)
+        r.equal("...and found even when nobody recorded the -o",
+                runs.find_job_list(root, since), buried)
+
+        script = os.path.join(root, "cmd.sh")
+        elsewhere = os.path.join(workdir, "declared", "job_output",
+                                 "RnaSeq.default.job_list.2026")
+        make_job_list(elsewhere, [("41000020", "trim.s1", "trim/s1.o", "PENDING")])
+        os.utime(elsewhere, (since + 5, since + 5))
+        with open(script, "w") as f:
+            f.write("#!/bin/bash\n"
+                    f"OUTPUT_DIR={os.path.join(workdir, 'declared')}\n"
+                    "JOB_OUTPUT_DIR=$OUTPUT_DIR/job_output\n")
+        r.equal("the script's own OUTPUT_DIR is read",
+                runs.output_dir_of(script), os.path.join(workdir, "declared"))
+        r.truthy("and a list outside the cwd entirely is still found",
+                 runs.find_job_list(root, since, script=script) in
+                 (elsewhere, buried))
+
+        # The guard that makes widening the search safe. Without it a run that
+        # created nothing adopts the previous run's jobs and reports them as
+        # its own -- which is worse than saying nothing at all.
+        stale = os.path.join(root, "old_run", "job_output",
+                             "DnaSeq.germline_snv.job_list.2025")
+        make_job_list(stale, [("40000001", "trim.old", "trim/old.o", "COMPLETED")])
+        os.utime(stale, (older, older))
+        r.equal("a list from a previous run is never adopted",
+                runs.find_job_list(os.path.join(root, "old_run"), since), None)
+
+        empty = os.path.join(workdir, "quiet")
+        os.makedirs(empty, exist_ok=True)
+        r.equal("a submission that really wrote nothing stays None",
+                runs.find_job_list(empty, since), None)
+        r.equal("a missing script is not an error", runs.output_dir_of(
+                os.path.join(empty, "nope.sh")), None)
+
+        # ---------------------------------------------------------------- #
         r.section("reusing a name shadows, it does not destroy")
         r.equal("a free name is returned unchanged",
                 reg.unique_name("brand-new"), "brand-new")

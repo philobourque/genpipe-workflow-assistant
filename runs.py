@@ -408,6 +408,84 @@ class Job:
         return f"<Job {self.job_id} {self.name} {self.state}>"
 
 
+def output_dir_of(script):
+    """The OUTPUT_DIR a generated GenPipes script declares, or None.
+
+    Every script GenPipes writes opens with the three lines that decide where
+    everything lands:
+
+        OUTPUT_DIR=/scratch/me/project
+        JOB_OUTPUT_DIR=$OUTPUT_DIR/job_output
+        JOB_LIST=$JOB_OUTPUT_DIR/DnaSeq.somatic_fastpass.job_list.$TIMESTAMP
+
+    So the script is the authority on where its own job list goes -- more than
+    the agent's cwd, which is only where the submission happened to be typed.
+    """
+    if not script or not os.path.exists(script):
+        return None
+    try:
+        with open(script) as f:
+            for line in f:
+                m = re.match(r"\s*OUTPUT_DIR=(\S+)", line)
+                if m:
+                    return m.group(1).strip("\"'")
+                # It is declared in the header. Give up at the first job rather
+                # than read 60,000 lines looking for a line that is not coming.
+                if line.startswith("#SBATCH"):
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def find_job_list(workdir, since, output_dir=None, script=None):
+    """The job list a submission just wrote, or None if it wrote none.
+
+    Where GenPipes puts it depends on the run's OUTPUT_DIR, which is frequently
+    NOT the directory the submission was launched from -- `-o some_dir` is
+    ordinary usage, and it puts the list in some_dir/job_output/. Looking only in
+    the cwd is what made a 46-job run report as "created no jobs" on 2026-07-27:
+    the list existed, one directory down, and nothing looked there.
+
+    Four places, most authoritative first:
+
+        1. OUTPUT_DIR declared by the script that was submitted
+        2. the -o directory from the generation command
+        3. the directory the submission ran in
+        4. one level below it, for an -o nobody recorded
+
+    `since` is what keeps this honest. A wider search is a wider chance of
+    adopting a PREVIOUS run's list and reporting another run's jobs under this
+    name, so only a file written after the submission started can match. A
+    submission that genuinely created no jobs writes no file, and correctly
+    stays None rather than picking up the newest thing lying around.
+
+    Stdlib only, and here rather than in genpipe_agent.py, so the case that
+    broke is covered by a test that runs on every push.
+    """
+    roots = []
+    for d in (output_dir_of(script), output_dir):
+        if d:
+            roots.append(d if os.path.isabs(d) else os.path.join(workdir, d))
+    roots.append(workdir)
+
+    patterns = [os.path.join(r, "job_output", "*job_list*") for r in roots]
+    # One level down, not `**`: workdir also holds raw_reads/, alignment/ and
+    # everything else a pipeline drops, and walking all of that to find a file
+    # we already have three better guesses for costs seconds on Lustre.
+    patterns.append(os.path.join(workdir, "*", "job_output", "*job_list*"))
+
+    found = []
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                if os.path.getmtime(path) >= since:
+                    found.append(path)
+            except OSError:
+                continue
+    return max(found, key=os.path.getmtime) if found else None
+
+
 def parse_job_list(path):
     """Read a GenPipes job_list file into Job objects.
 

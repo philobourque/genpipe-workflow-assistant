@@ -1009,20 +1009,22 @@ class GenpipeA1(A1):
         the same directory. Pinning it here is what makes analysis work from
         anywhere, in any later session.
         """
-        import glob as _glob
-
         workdir = os.getcwd()
-        lists = _glob.glob(os.path.join(workdir, "job_output", "*job_list*"))
 
-        # Keep only job lists written by THIS submission, not a stale one.
-        lists = [f for f in lists if os.path.getmtime(f) >= since]
-        newest = max(lists, key=os.path.getmtime) if lists else None
+        # The proposal is read BEFORE the search, not after: it carries the -o
+        # directory and the name of the script that was approved, and those are
+        # what say where GenPipes put the list. The cwd is only where the person
+        # was standing.
+        held = self.registry.get(name)
+        proposal = (held or {}).get("proposal")
+        slots = (proposal or {}).get("slots") or {}
+        newest = runs_store.find_job_list(workdir, since,
+                                          output_dir=slots.get("output_dir"),
+                                          script=(proposal or {}).get("script"))
 
         # Promote even when there is no list: "every step already up to date"
         # produces no jobs, and that is a successful outcome, not a run still
         # awaiting approval.
-        held = self.registry.get(name)
-        proposal = (held or {}).get("proposal")
         self.registry.mark_submitted(name, newest, workdir=workdir,
                                      proposal=proposal, thread_id=name)
 
@@ -1048,8 +1050,15 @@ class GenpipeA1(A1):
                             "/history still has the record.")
             return None
         if needs_jobs and not record["job_list"]:
-            display.problem(f"'{name}' created no jobs -- every step was already "
-                            f"up to date.")
+            # Two different things, and saying the wrong one costs a real
+            # investigation: GenPipes may genuinely have created no jobs, or it
+            # may have written a list somewhere the search did not reach. The
+            # record cannot tell them apart after the fact, so say both and hand
+            # over the escape hatch rather than assert the happier one.
+            display.problem(f"No job list was recorded for '{name}' -- either "
+                            f"every step was already up to date, or GenPipes "
+                            f"wrote its list outside the directories searched.",
+                            f"/track {name} <path/to/job_list>")
             return None
         return record
 
