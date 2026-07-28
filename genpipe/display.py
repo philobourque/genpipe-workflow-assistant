@@ -200,7 +200,9 @@ def banner(source=None, model=None):
     them. ready() states them again once they're settled.
     """
     user = who()
-    path = os.path.dirname(os.path.abspath(__file__))
+    # The checkout, not the package directory: what someone reads off the
+    # banner is the thing they would cd into or git pull.
+    path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
         cols = shutil.get_terminal_size((80, 24)).columns
     except Exception:
@@ -243,7 +245,7 @@ def help_text(commands):
 
     Takes the command table rather than owning a copy of it, so the menu the
     prompt completes against, the dispatcher, and this list cannot drift apart --
-    there is one table, in launch_agent.py.
+    there is one table, in genpipe/cli.py.
 
     Grouped rather than alphabetical because the list is now long enough that a
     flat version stops being a reference and becomes a wall. The groups follow
@@ -281,12 +283,12 @@ def help_text(commands):
 _ASK_ONLY = re.compile(r"^ask\s*\(.*\)$", re.DOTALL)
 
 # Fingerprints of the user-role messages nobody typed. Three are written by this
-# codebase (the observation wrapper, the gate's rejection note, genpipe_agent's
+# codebase (the observation wrapper, the gate's rejection note, agent.py's
 # NUDGE) and one by biomni's generate node, which corrects a model that replied
 # without a tag. Matched by content because that is all a message carries -- the
 # API has no notion of "the graph said this", and a role is the only field there
 # is. Kept here rather than imported so this module stays stdlib-only.
-_NUDGE = "[continue]"                                   # genpipe_agent.NUDGE
+_NUDGE = "[continue]"                                   # agent.NUDGE
 _CONTEXT_MARK = "--- context for you, not typed by the user ---"  # intake.CONTEXT_MARK
 
 _CORRECTION = re.compile(r"Each response must include thinking process")
@@ -447,7 +449,7 @@ def parse(message):
     # the panel would show the plumbing instead of the question.
     #
     # This is a rendering rule, not a second copy of ask()'s grammar: it drops a
-    # block that is nothing but a call, and gate_rules.ask_request remains the
+    # block that is nothing but a call, and gate.ask_request remains the
     # only thing that decides what such a call means. A block that mixes an ask
     # with real code fails this test and is shown in full, which is the right
     # way round -- the router will not treat it as an ask either.

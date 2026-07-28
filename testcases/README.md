@@ -5,8 +5,9 @@ Looking for something to try by hand while changing how the agent behaves? See
 shortest path to a distinct piece of machinery, with the expected observation for
 every line you type.
 
-Three scenarios, in ascending order of what they cost and what they prove. They
-are not unit tests — the suites in `tests/` cover the parts. These walk the
+Three numbered cases, in ascending order of what they cost and what they prove.
+(The five in SCENARIOS.md are the hand-driven ones; these three are scripted.)
+They are not unit tests — the suites in `tests/` cover the parts. These walk the
 whole product the way a person walks it, and they exist so that "does it still
 work?" has an answer that does not depend on anyone's memory of what it used to
 do.

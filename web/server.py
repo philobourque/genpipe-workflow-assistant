@@ -2,7 +2,7 @@
 Thin web wrapper around your existing GenPipes agent.
 
 It does not change the agent. It builds the one you already configure in
-launch_agent.py, runs agent.go(task) in a background thread, captures
+genpipe/cli.py, runs agent.go(task) in a background thread, captures
 everything the agent prints, and streams it to the browser line by line. One
 agent, one run at a time, single user.
 
@@ -14,7 +14,7 @@ demos -- do not point it at a real submission task. Use the CLI
 submits to the scheduler, until this UI grows its own gate.
 
 The ONLY integration point is build_agent() below, imported from
-launch_agent.py. Building the agent here runs your normal setup once (the big
+genpipe/cli.py. Building the agent here runs your normal setup once (the big
 software dump prints to this console at startup, not into a run).
 """
 
@@ -23,6 +23,7 @@ import contextlib
 import io
 import json
 import queue
+import sys
 import threading
 from pathlib import Path
 
@@ -30,8 +31,12 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+# So `uvicorn web.server:app` finds the package whatever directory it was
+# started from, rather than only from the checkout root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # --- the one integration point -------------------------------------------
-from launch_agent import build_agent, _require_api_key
+from genpipe.cli import build_agent, _require_api_key  # noqa: E402
 _require_api_key()
 agent = build_agent()
 # -------------------------------------------------------------------------

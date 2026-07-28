@@ -31,7 +31,7 @@ import threading
 import time
 import tty
 
-import display
+from . import display
 
 # Braille dots: ten frames, all the same visual weight, so the spinner reads as
 # motion rather than as a character that keeps changing shape.

@@ -29,14 +29,14 @@ import tempfile
 
 from harness import Report
 
-import fakecluster
-import runs
+from genpipe import fakecluster
+from genpipe import runs
 
 GENPIPES = "module load mugqic/genpipes/6.1.1 && genpipes"
 
 
 def sh(cmd, cwd):
-    """Run a command the way genpipe_agent does: through bash, both streams
+    """Run a command the way agent.py does: through bash, both streams
     captured, inheriting the environment the fake cluster has activated."""
     p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                        executable="/bin/bash", cwd=cwd)

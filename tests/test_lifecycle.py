@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """The whole arc of a run, offline: generate, hold, reject, approve, watch, fix.
 
-This is the suite that covers the half the others cannot. test_gate_rules checks
+This is the suite that covers the half the others cannot. test_gate checks
 the matcher as pure logic; test_fakecluster checks the stubs; this drives the
-REAL agent -- the actual GenpipeA1 that launch_agent.build_agent() builds, the
+REAL agent -- the actual GenpipeA1 that cli.build_agent() builds, the
 actual LangGraph gate, the actual SqliteSaver checkpoint -- against the fake
 cluster, with a scripted model in place of Claude.
 
@@ -32,14 +32,14 @@ import tempfile
 
 from harness import Report, ScriptedLLM, execute_block, solution
 
-import fakecluster
-import runs as runs_store
+from genpipe import fakecluster
+from genpipe import runs as runs_store
 
-# Never let this test's fixtures near the real .env: launch_agent writes to
+# Never let this test's fixtures near the real .env: cli.py writes to
 # ENV_PATH when a key or model is set, and a stray write would clobber a live
-# key. Redirected before launch_agent is used for anything.
-import launch_agent
-from launch_agent import build_agent
+# key. Redirected before cli.py is used for anything.
+from genpipe import cli
+from genpipe.cli import build_agent
 
 GEN = ("module load mugqic/genpipes/6.1.1 && genpipes rnaseq -t stringtie "
        "-s 1-5 -c rnaseq.base.ini common_ini/rorqual.ini -r readset.tsv "
@@ -86,7 +86,7 @@ def main():
     # directory handed to build_agent. Worth knowing, and worth /where printing.
     store = os.path.join(work, "biomni_data")
     envdir = tempfile.mkdtemp(prefix="genpipe_env_")
-    launch_agent.ENV_PATH = __import__("pathlib").Path(envdir) / ".env"
+    cli.ENV_PATH = __import__("pathlib").Path(envdir) / ".env"
     prev = os.getcwd()
     try:
         with fakecluster.session("failed-oom"):

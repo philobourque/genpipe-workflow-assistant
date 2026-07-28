@@ -17,7 +17,7 @@ submission, so the gate refuses to offer approval and says why. JOB_MAIL does
 not, so it warns once at startup and gets out of the way. Blocking on a
 notification address would train the operator to ignore the check that matters.
 
-Standard library only, like gate_rules and runs, so CI can verify it in a second
+Standard library only, like gate.py and runs, so CI can verify it in a second
 without a cluster or an agent stack.
 """
 

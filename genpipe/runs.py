@@ -38,8 +38,8 @@ and the cluster is not obliged to remember.
 
 Stdlib only, no biomni
 ----------------------
-Like gate_rules.py, this module imports nothing heavy, so the registry and the
-job parsing are testable in CI in a couple of seconds. genpipe_agent.py holds
+Like gate.py, this module imports nothing heavy, so the registry and the
+job parsing are testable in CI in a couple of seconds. genpipe/agent.py holds
 the graph; this holds the bookkeeping; neither needs the other to be tested.
 """
 import datetime
@@ -460,7 +460,7 @@ def find_job_list(workdir, since, output_dir=None, script=None):
     submission that genuinely created no jobs writes no file, and correctly
     stays None rather than picking up the newest thing lying around.
 
-    Stdlib only, and here rather than in genpipe_agent.py, so the case that
+    Stdlib only, and here rather than in genpipe/agent.py, so the case that
     broke is covered by a test that runs on every push.
     """
     roots = []

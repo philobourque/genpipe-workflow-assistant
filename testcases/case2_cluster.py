@@ -24,8 +24,8 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
-import preflight                                # noqa: E402
-import runs as runs_store                       # noqa: E402
+from genpipe import preflight                                # noqa: E402
+from genpipe import runs as runs_store                       # noqa: E402
 from harness import Report                      # noqa: E402
 
 MODULE = "mugqic/genpipes/6.1.1"

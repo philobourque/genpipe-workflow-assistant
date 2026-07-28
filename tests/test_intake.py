@@ -18,12 +18,12 @@ import shutil
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import intake
-import slots
+from genpipe import intake
+from genpipe import slots
 from harness import Report
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GRAMMAR = os.path.join(HERE, "..", "genpipes.md")
+GRAMMAR = os.path.join(HERE, "..", "genpipe", "genpipes.md")
 
 r = Report("intake and slots")
 
@@ -260,7 +260,7 @@ r.contains("and --help is named as the authority", doc, "--help")
 r.section("The choice panel, headless")
 
 import builtins
-import ui
+from genpipe import ui
 
 
 def answers(*script):

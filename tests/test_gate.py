@@ -1,179 +1,215 @@
 #!/usr/bin/env python
-"""
-test_gate.py  --  model-free logic test for the GenpipeA1 submission gate.
+"""The gate's invariants. This is the one test that must never go red.
 
-Runs on Rorqual in the biomni venv, no model call, no API, no cluster.
-It builds a bare GenpipeA1 with object.__new__ (skipping the heavy __init__)
-and hammers the pure helpers the gate's correctness reduces to:
+Everything else in this repo is about convenience. This is about whether an
+unapproved pipeline can reach a scheduler, so it is written as two lists and one
+rule about which direction a mistake is allowed to fall in:
 
-    _extract_pending_code   pulls code out of the model's last message
-    _is_submission          decides whether that code is a real submission
-    _build_proposal         parses the command into the approval box
+    MUST_GATE      code that submits. A miss here puts unapproved work on a real
+                   cluster and spends someone's allocation. Unacceptable.
+    MUST_NOT_GATE  code that only generates, reads, or TALKS ABOUT submitting.
+                   A false positive here costs a rejection and an annoyed user.
+
+Both failure modes have happened in production, and both are represented below
+by the case that caused them (see gate.executable_lines for the incidents).
+
+Runs in CI on every push: gate imports nothing but the standard library,
+so there is no biomni, no langgraph, no API key and no cluster involved.
 
 Run:  python tests/test_gate.py
-Exit code is 0 if every invariant holds, 1 otherwise.
 """
-
-import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from genpipe_agent import GenpipeA1
+from harness import Report
 
-# Bare instance: no __init__, so no LLM, no data lake, no API key needed.
-gate = object.__new__(GenpipeA1)
+from genpipe import gate as g
 
 
 class Msg:
     """Minimal stand-in for a langchain message: only .content is read."""
+
     def __init__(self, content):
         self.content = content
 
 
-def state_with(code_line):
-    """A state whose last message carries an <execute> block."""
-    return {"messages": [Msg("some reasoning\n<execute>" + code_line + "</execute>")]}
-
-
-passed = 0
-failed = 0
-
-
-def expect(label, got, want):
-    global passed, failed
-    ok = got == want
-    passed += ok
-    failed += (not ok)
-    print(f"  [{'PASS' if ok else 'FAIL'}] {label}: got={got!r} want={want!r}")
-
-
-def route(state):
-    """Mirror routing_function's decision for a next_step=='execute' turn:
-    a real submission is diverted to the gate, everything else runs."""
-    code = gate._extract_pending_code(state)
-    if code and gate._is_submission(code):
-        return "gate"
-    return "execute"
-
-
-print("=== A. _is_submission: commands that MUST be gated ===")
-for c in [
+# Code that really does submit. Every one of these must stop at the gate.
+MUST_GATE = [
     "bash cmd.sh",
-    "sh cmd.sh",
-    "bash ./cmd.sh",
-    "bash /home/pbourque/scratch/rnaseq_run/cmd.sh",
-    "chunk_genpipes.sh cmd.sh job_output -n 15",
-    "submit_genpipes",
-    "chunk_genpipes.sh script.sh && submit_genpipes",
-]:
-    expect(c, gate._is_submission(c), True)
+    "bash dnaseq_cmd.sh",
+    "sh rnaseq_cmd.sh",
+    "bash /scratch/me/project/cmd.sh",
+    "cd /scratch/me && bash cmd.sh",
+    "bash chunk_genpipes.sh chunks/ 20",
+    "submit_genpipes chunks/",
+    # Buried in Python -- a real submission, and the reason executable_lines
+    # strips only print() and not every quoted string.
+    'subprocess.run("bash cmd.sh", shell=True)',
+    'os.system("bash cmd.sh")',
+    # Generated and submitted in one block: the generation is fine, the last
+    # line is not, and the block as a whole has to be held.
+    "genpipes rnaseq -t stringtie -s 1-5 -g cmd.sh\nbash cmd.sh",
+]
 
-print("\n=== B. _is_submission: commands that MUST pass through ===")
-for c in [
-    "module load mugqic/genpipes/6.1.1 && genpipes rnaseq -t stringtie "
-    "-c $GENPIPES_INIS/rnaseq/rnaseq.base.ini -r readset.rnaseq.txt -s 1-5 -g cmd.sh",
-    "squeue -u pbourque",
-    "ls /home/pbourque/scratch/rnaseq_tutorial",
-    "cat cmd.sh",
-    "module load mugqic/genpipes/6.1.1 && genpipes rnaseq -h",
-]:
-    expect(c, gate._is_submission(c), False)
+# Code that must flow through untouched. Anything that stops here makes the tool
+# unusable for the 90% of work that is generation and inspection.
+MUST_NOT_GATE = [
+    # Generation only -- the whole point of being able to work without approval.
+    "genpipes rnaseq -t stringtie -s 1-5 -g cmd.sh",
+    "module load mugqic/genpipes/6.1.1 && genpipes dnaseq -t germline_snv -g cmd.sh",
+    # Reads.
+    "squeue -u $USER",
+    "sacct -j 41000001 --format=JobID,State",
+    "genpipes dnaseq -h",
+    "genpipes tools log_report --loglevel ERROR job_output/x.job_list.2026",
+    "cat readset.tsv",
+    "ls job_output/",
+    # 2026-07-13, shell: the model summarised finished work by echoing the
+    # command. The gate caught the summary, rejecting it produced another
+    # summary, and the run could not leave the gate.
+    'echo "  bash dnaseq_cmd.sh"',
+    'echo "Next step: bash cmd.sh"',
+    # 2026-07-14, python: a generation-only task ended with a "here is how you
+    # would submit this" note, while explicitly not submitting. The gate fired
+    # before the code ran, so the script was never even generated.
+    'print("  bash launch_cmd.sh")',
+    'print("To submit: bash cmd.sh")',
+    # A comment is not a command.
+    "# bash cmd.sh",
+    "genpipes rnaseq -g cmd.sh   # then: bash cmd.sh",
+    # A heredoc body is text being written to a file, not code being run. This
+    # is how cmd.sh gets created in the first place.
+    "cat > cmd.sh << 'EOF'\n#!/bin/bash\nbash inner.sh\nEOF\nchmod +x cmd.sh",
+    # Nothing at all.
+    "",
+]
 
-print("\n=== C. routing decision (extract + is_submission composed) ===")
-expect("generation -> execute",
-       route(state_with("genpipes rnaseq -t stringtie -s 1-5 -g cmd.sh")), "execute")
-expect("bash cmd.sh -> gate", route(state_with("bash cmd.sh")), "gate")
-expect("submit_genpipes -> gate", route(state_with("submit_genpipes")), "gate")
 
-print("\n=== D. _build_proposal slot parsing ===")
-cmd = ("module load mugqic/genpipes/6.1.1 && genpipes rnaseq -t stringtie "
-       "-c $GENPIPES_INIS/rnaseq/rnaseq.base.ini $GENPIPES_INIS/common_ini/rorqual.ini "
-       "-r readset.rnaseq.txt -d design.rnaseq.txt -s 1-5 -g cmd.sh")
-prop = gate._build_proposal({"messages": []}, cmd)
-slots = prop["slots"]
-expect("protocol", slots["protocol"], "stringtie")
-expect("steps", slots["steps"], "1-5")
-expect("design", slots["design"], "design.rnaseq.txt")
-expect("pairs (none)", slots["pairs"], None)
-expect("inis count", len(slots["inis"]), 2)
-expect("command echoed verbatim", prop["command"], cmd.strip())
+def main():
+    r = Report("gate invariants")
 
-print("\n=== E. _extract_pending_code edge cases ===")
-expect("normal block", gate._extract_pending_code(state_with("bash cmd.sh")), "bash cmd.sh")
-expect("unclosed tag",
-       gate._extract_pending_code({"messages": [Msg("<execute>bash cmd.sh")]}), "bash cmd.sh")
-expect("no execute block",
-       gate._extract_pending_code({"messages": [Msg("<solution>done</solution>")]}), None)
-expect("empty messages", gate._extract_pending_code({"messages": []}), None)
+    r.section("code that MUST be gated (a miss here submits unapproved work)")
+    for code in MUST_GATE:
+        r.check(f"gated: {code[:64]}", g.is_submission(code) is True)
 
-# --- Advisory: NOT a pass/fail invariant, a design decision to make ---
-print("\n=== F. ADVISORY: submissions whose script is not named cmd.sh ===")
-print("  The matcher only recognizes 'cmd.sh'. If the model names the generated")
-print("  script anything else, the bash-form submission slips through the gate.")
-print("  Decide: enforce -g cmd.sh upstream, or broaden the matcher.")
-for c in ["bash rnaseq_steps_1-5.sh", "bash ./rnaseq_stringtie.sh"]:
-    got = gate._is_submission(c)
-    print(f"    {'gates' if got else 'MISSES'}: {c!r}")
+    r.section("code that MUST NOT be gated (a hit here blocks ordinary work)")
+    for code in MUST_NOT_GATE:
+        r.check(f"free: {code[:64]!r}", g.is_submission(code) is False)
 
-print("\n=== G. run tracking store (track / job_list_for / prune) ===")
-# The store itself now lives in runs.py and is tested directly and far more
-# thoroughly by tests/test_runs.py, which runs in CI. What is left here is only
-# what belongs at the AGENT level: that agent.track() refuses a path that isn't
-# there, that a manually tracked run and an agent-recorded one coexist, and that
-# job_list_for stops resolving a run whose artifacts have been purged.
-import tempfile
-import shutil
+    r.section("extracting the proposal from a message")
+    msgs = [Msg("Generating.\n" + "<execute>\n"
+                "genpipes rnaseq -t stringtie -s 1-5 "
+                "-c $MUGQIC/rnaseq.base.ini common_ini/rorqual.ini "
+                "-r readset.tsv -g cmd.sh\n</execute>"),
+            Msg("Now submitting.\n<execute>\nbash cmd.sh\n</execute>")]
+    code = g.extract_pending_code(msgs)
+    r.equal("pulls the last block's code", code.strip(), "bash cmd.sh")
 
-tracker = object.__new__(GenpipeA1)
-tracker.path = tempfile.mkdtemp(prefix="genpipe_runs_test_")
-try:
-    # track() on a path that doesn't exist must record nothing.
-    tracker.track("ghost", os.path.join(tracker.path, "does_not_exist.job_list"))
-    expect("track() refuses a missing path", tracker.registry.load(), [])
+    p = g.build_proposal(msgs, code)
+    r.equal("command shown for approval", p["command"], "bash cmd.sh")
+    r.equal("pipeline parsed from the earlier generation", p["slots"]["pipeline"], "rnaseq")
+    r.equal("protocol parsed", p["slots"]["protocol"], "stringtie")
+    r.equal("steps parsed", p["slots"]["steps"], "1-5")
+    r.equal("readset parsed", p["slots"]["readset"], "readset.tsv")
+    r.equal("script recorded", p["script"], "cmd.sh")
+    r.check("both inis found", set(p["slots"]["inis"]) ==
+            {"rnaseq.base.ini", "rorqual.ini"},
+            f"got={p['slots']['inis']}")
 
-    # track() on a real file records a live, source="manual" entry.
-    job_list = os.path.join(tracker.path, "Pipeline.protocol.job_list.T1")
-    open(job_list, "w").close()
-    tracker.track("manual-1", job_list)
-    records = tracker.registry.load()
-    expect("track() records one entry", len(records), 1)
-    expect("tracked entry has no thread_id", records[0]["thread_id"], None)
-    expect("tracked entry is live", records[0]["status"], "submitted")
-    expect("tracked entry source is manual", records[0]["source"], "manual")
+    r.section("an unclosed tag is tolerated, not dropped")
+    truncated = [Msg("<execute>\nbash cmd.sh")]
+    r.truthy("still finds the code", g.extract_pending_code(truncated))
+    r.check("and still gates it",
+            g.is_submission(g.extract_pending_code(truncated)) is True)
 
-    # An agent-side submission coexists fine.
-    job_list2 = os.path.join(tracker.path, "Pipeline.protocol.job_list.T2")
-    open(job_list2, "w").close()
-    tracker.registry.mark_submitted("patient-42", job_list2, thread_id="patient-42")
-    expect("job_list_for finds the agent-recorded run",
-           tracker.job_list_for("patient-42"), job_list2)
-    expect("job_list_for finds the manually tracked run",
-           tracker.job_list_for("manual-1"), job_list)
+    r.section("no generation command in history: the box still populates")
+    only = [Msg("<execute>\nbash cmd.sh\n</execute>")]
+    p = g.build_proposal(only, "bash cmd.sh")
+    r.equal("command survives", p["command"], "bash cmd.sh")
+    r.equal("unknown protocol is None, not a guess", p["slots"]["protocol"], None)
 
-    # Delete one job_list file on disk, then prune via job_list_for. The gone run
-    # must disappear from lookup but the record itself must survive, marked gone
-    # -- not deleted.
-    os.remove(job_list2)
-    tracker.registry.live()          # triggers the prune
-    expect("job_list_for no longer returns a gone run",
-           tracker.job_list_for("patient-42"), None)
-    by_name = {r["name"]: r for r in tracker.registry.load()}
-    expect("gone run's record still exists", "patient-42" in by_name, True)
-    expect("gone run's record is marked gone", by_name["patient-42"]["gone"], True)
-    expect("untouched run is still live", by_name["manual-1"]["gone"], False)
+    r.section("after a rejection, the box shows the REVISED command")
+    # Found by tests/test_lifecycle.py, 2026-07-25. The history now holds two
+    # generations, and taking the first showed the stale one -- so rejecting
+    # "steps 1-5", asking for 6-12, and being shown 1-5 again would look like
+    # nothing had changed. Approving what you were not shown is the exact
+    # failure the gate exists to prevent, so this is a permanent regression test.
+    after_reject = [
+        Msg("<execute>\ngenpipes rnaseq -t stringtie -s 1-5 -g cmd.sh\n</execute>"),
+        Msg("<execute>\nbash cmd.sh\n</execute>"),
+        Msg("The proposed submission was not approved. use steps 6-12 instead."),
+        Msg("<execute>\ngenpipes rnaseq -t stringtie -s 6-12 -g cmd.sh\n</execute>"),
+        Msg("<execute>\nbash cmd.sh\n</execute>"),
+    ]
+    p = g.build_proposal(after_reject, "bash cmd.sh")
+    r.equal("the revised steps are shown", p["slots"]["steps"], "6-12")
+    r.check("not the stale ones", p["slots"]["steps"] != "1-5")
 
-    # Once marked gone, pruning again must not flip it back -- gone is a one-way
-    # door, so a transient filesystem hiccup can't resurrect a run.
-    open(job_list2, "w").close()   # simulate the path becoming valid again
-    tracker.registry.live()
-    expect("a gone run stays gone even if its path reappears",
-           {r["name"]: r for r in tracker.registry.load()}["patient-42"]["gone"], True)
-finally:
-    shutil.rmtree(tracker.path, ignore_errors=True)
+    # ---------------------------------------------------------------------
+    r.section("ask(): the agent putting a question to the user")
 
-    shutil.rmtree(tracker.path, ignore_errors=True)
+    got = g.ask_request('ask(slot="protocol", pipeline="dnaseq")')
+    r.equal("the slot is read", (got or {}).get("slot"), "protocol")
+    r.equal("and the pipeline it is about", (got or {}).get("pipeline"), "dnaseq")
 
-print("\n" + "=" * 52)
-print(f"RESULT: {passed} passed, {failed} failed")
-print("=" * 52)
-sys.exit(1 if failed else 0)
+    r.equal("single quotes work too",
+            (g.ask_request("ask(slot='readset')") or {}).get("slot"), "readset")
+    r.equal("whitespace inside the call is fine",
+            (g.ask_request('ask( slot = "pairs" )') or {}).get("slot"), "pairs")
+    r.equal("a call split over lines still parses",
+            (g.ask_request('ask(\n  slot="design",\n  pipeline="rnaseq",\n)')
+             or {}).get("slot"), "design")
+
+    free = g.ask_request('ask(question="Which steps should this run?")')
+    r.equal("a free-form question has no slot", (free or {}).get("slot"), None)
+    r.equal("but keeps its wording",
+            (free or {}).get("question"), "Which steps should this run?")
+
+    # An invented slot is not silently dropped. The panel has no table for
+    # "genome", but the question is still worth putting to a human, so it
+    # degrades to free text rather than to nothing happening.
+    made_up = g.ask_request('ask(slot="genome")')
+    r.equal("an unknown slot gets no menu", (made_up or {}).get("slot"), None)
+    r.equal("and becomes a plain question",
+            (made_up or {}).get("question"), "Which genome?")
+
+    r.equal("no ask, no request", g.ask_request("genpipes rnaseq -g cmd.sh"), None)
+    r.equal("nothing at all", g.ask_request(""), None)
+    # Once the call is there, this ALWAYS returns a request. Returning None for an
+    # argument list it could not read is what used to send `ask(...)` to the Python
+    # interpreter, where it came back as "NameError: name 'ask' is not defined".
+    bare = g.ask_request("ask()")
+    r.truthy("a bare ask() is still recognised as a question", bare is not None)
+    r.equal("with nothing to ask about", (bare or {}).get("question"), None)
+
+    positional = g.ask_request('ask("Which steps should this run?")')
+    r.equal("a positional question is read as the question",
+            (positional or {}).get("question"), "Which steps should this run?")
+    r.equal("a positional slot name is read as the slot",
+            (g.ask_request('ask("protocol")') or {}).get("slot"), "protocol")
+    r.equal("an f-string value is not a parse failure",
+            (g.ask_request('ask(question=f"Which steps of {p}?")') or {}
+             ).get("question"), "Which steps of {p}?")
+
+    # The same inertness rules the gate lives by. The model narrates its own
+    # work constantly, and a described ask must not open a real panel.
+    r.equal("an ask inside print() is not an ask",
+            g.ask_request('print("ask(slot=\'protocol\')")'), None)
+    r.equal("an ask inside echo is not an ask",
+            g.ask_request("echo ask(slot='protocol')"), None)
+    r.equal("an ask in a comment is not an ask",
+            g.ask_request('# ask(slot="protocol") would be the next move'), None)
+
+    # The asymmetry that matters. A block doing both is a submission, and the
+    # router tests is_submission first for exactly this reason -- an ask() must
+    # never be a way to route work past the gate.
+    both = 'ask(slot="protocol")\nbash cmd.sh'
+    r.truthy("a block that also submits is still a submission",
+             g.is_submission(both))
+    r.truthy("even though an ask can be parsed out of it",
+             g.ask_request(both) is not None)
+
+    return r.finish()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

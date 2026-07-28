@@ -1,5 +1,3 @@
-# /home/pbourque/genpipe_agent.py
-
 """GenpipeA1 — subclass of Biomni's A1 agent that inserts a human-approval gate before any
 GenPipes submission, without reimplementing Biomni's agent loop.
 
@@ -24,7 +22,7 @@ Design:
     interrupts, and comes back with the person's answer as an <observation>.
     Riding inside <execute> is what makes it free -- Biomni's generate node
     routes it to "execute" like anything else, and our router picks it off
-    there, so generate is never touched. See gate_rules.ask_request.
+    there, so generate is never touched. See gate.ask_request.
 
 A conversation is a thread; a run is a name
 -------------------------------------------
@@ -55,7 +53,7 @@ Where the rest of the logic lives:
   are testable without installing biomni (which is what lets CI check them on
   every push):
 
-    gate_rules.py  the gate's decision logic -- is this code a submission, and
+    gate.py  the gate's decision logic -- is this code a submission, and
                    what exactly is being proposed. The methods on this class are
                    thin delegates, so the graph's routing and the tests exercise
                    one implementation rather than two.
@@ -88,12 +86,12 @@ import sqlite3
 import uuid
 import json
 import datetime
-import display
-import gate_rules
-import intake
-import preflight
-import runs as runs_store
-import slots as slot_table
+from . import display
+from . import gate
+from . import intake
+from . import preflight
+from . import runs as runs_store
+from . import slots as slot_table
 import time
 import warnings
 
@@ -314,14 +312,14 @@ def _shell_not_python(node):
     like a failure of the cluster.
 
     So the marker is added here, from what the code actually is (see
-    gate_rules.mark_shell). It runs after the transcript has been drawn, so the
+    gate.mark_shell). It runs after the transcript has been drawn, so the
     person sees what the model wrote, and biomni sees what will work.
     """
     def run_as_written(state):
         messages = state.get("messages") or []
         if messages:
             last = messages[-1]
-            fixed = gate_rules.mark_shell(str(last.content or ""))
+            fixed = gate.mark_shell(str(last.content or ""))
             if fixed != last.content:
                 messages[-1] = type(last)(content=fixed)
         return _call(node, state)
@@ -346,7 +344,7 @@ def _observation_from_the_machine(node):
     what every other agent framework does with it.
 
     Only the trailing observation is touched, and only its role -- the text is
-    byte-identical, so gate_rules still reads the same history and the transcript
+    byte-identical, so gate.py still reads the same history and the transcript
     still shows the same OUT block.
     """
     def run_and_relabel(state):
@@ -442,7 +440,7 @@ class GenpipeA1(A1):
                 code = self._extract_pending_code(state)
                 if code and self._is_submission(code):
                     return "gate"
-                if code and gate_rules.ask_request(code):
+                if code and gate.ask_request(code):
                     return "ask"
                 return "execute"
             if next_step in ("generate", "end"):
@@ -463,7 +461,7 @@ class GenpipeA1(A1):
         #     whereas a model asked only *when* to raise the question cannot
         #     invent anything.
         def ask_user(state):
-            request = gate_rules.ask_request(self._extract_pending_code(state))
+            request = gate.ask_request(self._extract_pending_code(state))
             gap = self._gap_for(request or {})
             if gap is None:
                 # Nothing askable came out of the call -- a malformed ask(), or
@@ -607,7 +605,7 @@ class GenpipeA1(A1):
         """The run registry, created on first use.
 
         Lazy rather than set in configure() because configure() is called during
-        A1.__init__ and again by add_software(), and because test_gate.py builds
+        A1.__init__ and again by add_software(), and because test_agent_gate.py builds
         a bare instance with object.__new__ -- no __init__ at all. A property
         means the registry exists whenever it is actually needed and never
         requires the constructor to have run.
@@ -957,36 +955,36 @@ class GenpipeA1(A1):
                 "final": msgs[-1].content if msgs else None,
                 "thread_id": thread_id}
     # --------------------------------------------------------------------- #
-    #  Gate helpers. Thin delegates to gate_rules, which holds the actual     #
+    #  Gate helpers. Thin delegates to gate.py, which holds the actual     #
     #  logic as pure functions over plain data.                               #
     #                                                                        #
-    #  The split is not tidiness: gate_rules imports nothing but the standard #
+    #  The split is not tidiness: gate.py imports nothing but the standard #
     #  library, so the one property that must never regress -- "does this     #
     #  code submit to a scheduler?" -- is checked on every push in seconds,   #
     #  without installing biomni. These methods stay because the graph's      #
-    #  routing_function and test_gate.py both call them, and delegating means #
+    #  routing_function and test_agent_gate.py both call them, and delegating means #
     #  there is one implementation rather than two that can drift.            #
     # --------------------------------------------------------------------- #
     def _extract_pending_code(self, state):
-        return gate_rules.extract_pending_code(state.get("messages"))
+        return gate.extract_pending_code(state.get("messages"))
 
     def _is_submission(self, code):
-        return gate_rules.is_submission(code)
+        return gate.is_submission(code)
 
     def _executable_lines(self, code):
-        return gate_rules.executable_lines(code)
+        return gate.executable_lines(code)
 
     def _flag_value(self, cmd, flag):
-        return gate_rules.flag_value(cmd, flag)
+        return gate.flag_value(cmd, flag)
 
     def _submission_line(self, code):
-        return gate_rules.submission_line(code)
+        return gate.submission_line(code)
 
     def _generation_command(self, state):
-        return gate_rules.generation_command(state.get("messages"))
+        return gate.generation_command(state.get("messages"))
 
     def _build_proposal(self, state, code):
-        return gate_rules.build_proposal(state.get("messages"), code)
+        return gate.build_proposal(state.get("messages"), code)
 
     # --------------------------------------------------------------------- #
     #  Monitoring, in three sizes. check() is one aggregate number, jobs() is #

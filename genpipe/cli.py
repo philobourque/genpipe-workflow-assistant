@@ -10,17 +10,24 @@ import tty
 import io, contextlib
 from pathlib import Path
 
-import display
-import intake
-import preflight
-import runs as runs_store
-import ui
 from biomni.llm import get_llm
-from genpipe_agent import GenpipeA1
 
+from . import display
+from . import intake
+from . import preflight
+from . import runs as runs_store
+from . import ui
+from .agent import GenpipeA1
+
+# HERE is the package; ROOT is the checkout it sits in. The distinction is
+# load-bearing: genpipes.md ships beside the code that reads it, while .env
+# belongs to the checkout -- start_agent.sh sources it from there before this
+# process exists, so writing it anywhere else would silently stop persisting
+# the API key while still looking like it worked.
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 GRAMMAR_PATH = HERE / "genpipes.md"
-ENV_PATH = HERE / ".env"
+ENV_PATH = ROOT / ".env"
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_SOURCE = "Anthropic"
 
@@ -345,7 +352,7 @@ def build_agent(path=None, llm=None, source=None):
     """Construct a fully configured GenpipeA1 agent: the gated graph, with the
     GenPipes grammar registered as software.
 
-    Shared by launch_agent.py (real use, real LLM) and the mock pipeline test
+    Shared by this module (real use, real LLM) and the mock pipeline test
     (fake LLM swapped in after construction) so both exercise the exact same
     construction path -- no separate, drifting "test version" of the setup.
 
@@ -624,7 +631,7 @@ def _cmd_where(agent, args):
         ("agent workdir", agent.path),
         ("run registry", agent.registry.path),
         ("checkpoints", os.path.join(agent.path, "genpipe_checkpoints.sqlite")),
-        ("this copy", HERE),
+        ("this copy", ROOT),
     ])
 
 
@@ -897,7 +904,7 @@ def main(argv=None):
         # -- can be exercised on any machine with no allocation, no cluster and no
         # API spend. Imported here rather than at module scope so a production
         # launch never even loads it.
-        import fakecluster
+        from . import fakecluster
     if fake_cluster:
         notes.append(fakecluster.activate(
             os.environ.get("GENPIPE_FAKE_STATE", "failed-oom")))

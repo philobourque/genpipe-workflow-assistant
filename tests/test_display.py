@@ -23,8 +23,8 @@ from contextlib import redirect_stdout
 
 from harness import Report
 
-import display
-import runs
+from genpipe import display
+from genpipe import runs
 
 
 def drawn(fn, *args, **kwargs):
@@ -385,7 +385,7 @@ def main():
 
     # intake.brief appends what it could establish about the request. It is for
     # the model; showing it back reads as if they had typed an inventory.
-    import intake
+    from genpipe import intake
     briefed = drawn(display.render, HumanMessage(
         intake.brief("run rnaseq stringtie with readset.tsv", ".")))
     r.contains("their own words are shown", briefed, "run rnaseq stringtie")
@@ -402,7 +402,7 @@ def main():
     # ---------------------------------------------------------------- #
     r.section("environment findings, and the gate's refusal to offer approval")
 
-    import preflight
+    from genpipe import preflight
 
     r.equal("a sound environment prints nothing",
             drawn(display.environment, []).strip(), "")

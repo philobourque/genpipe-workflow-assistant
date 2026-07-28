@@ -16,8 +16,8 @@ the `chunk_genpipes.sh` / `submit_genpipes` pair — the graph pauses and shows 
 about to run. You approve, reject, or send it back with feedback.
 
 It's a thin subclass of [Biomni](https://github.com/snap-stanford/Biomni)'s `A1` agent
-(`genpipe_agent.py`), reusing Biomni's own generate/execute nodes and splicing in one extra node —
-the gate — rather than reimplementing the agent loop. `genpipes.md` is the grammar document that
+(`genpipe/agent.py`), reusing Biomni's own generate/execute nodes and splicing in one extra node —
+the gate — rather than reimplementing the agent loop. `genpipe/genpipes.md` is the grammar document that
 teaches the model GenPipes' invocation shape, config layering, and file formats.
 
 ## Prerequisites
@@ -149,11 +149,11 @@ cluster.
 
 ### Optional: web UI
 
-`server.py` + `index.html` are a minimal browser front end, useful for demos or one-off exploratory
-questions:
+`web/server.py` + `web/index.html` are a minimal browser front end, useful for demos or one-off
+exploratory questions:
 
 ```bash
-uvicorn server:app --reload
+uvicorn web.server:app --reload    # from the repo root
 ```
 
 **This bypasses the approval gate.** It drives Biomni's own `agent.go()`, not `GenpipeA1`'s gated
@@ -168,7 +168,7 @@ not this UI, until it grows its own gate.
 ./start_agent.sh --fake --fake-llm   # nothing real at all: no allocation, no API key, no cost
 ```
 
-`fakecluster.py` writes a directory of small stubs — `module`, `genpipes`, `sbatch`, `sacct`,
+`genpipe/fakecluster.py` writes a directory of small stubs — `module`, `genpipes`, `sbatch`, `sacct`,
 `scancel`, `squeue` — and puts it at the front of `PATH`. Everything downstream then runs for real:
 GenPipes "generates" a `cmd.sh`, running it writes a `job_output/` tree with per-job `.o` logs and a
 `*.job_list.*`, and `sacct` answers about those job ids. The registry, the job parser, the triage and
@@ -199,7 +199,7 @@ Two layers. `tests/` covers the parts; `testcases/` walks the whole product. The
 
 ```bash
 # Run anywhere, no dependencies beyond the standard library. These are the CI set.
-python tests/test_gate_rules.py    # the gate's invariants — the one test that must never go red
+python tests/test_gate.py          # the gate's invariants — the one test that must never go red
 python tests/test_runs.py          # the run registry's lifecycle, and the job layer's parsing
 python tests/test_fakecluster.py   # the fake cluster itself, including that it rejects bad commands
 python tests/test_display.py       # every renderer, including the gate's refusal to offer approval
@@ -209,16 +209,16 @@ python tests/test_intake.py        # the choice panel, and slots.py vs genpipes.
 # Need the venv (biomni, langgraph, pyte). Run before a release.
 python tests/test_lifecycle.py     # the real agent + real gate + fake cluster, whole arc of a run
 python tests/test_app.py           # the real app in a pty, asserting on the rendered screen
-python tests/test_gate.py          # the original gate helpers, via GenpipeA1's own methods
-python tests/test_mock_pipeline.py # the original approve/reject round trip
+python tests/test_agent_gate.py    # the same gate helpers, reached through GenpipeA1's methods
+python tests/test_mock_pipeline.py # the approve/reject round trip against a scripted model
 ```
 
-All six run on every push via GitHub Actions (`.github/workflows/tests.yml`). That is
-possible because `gate_rules.py`, `runs.py`, `fakecluster.py`, `display.py`, `preflight.py`,
-`slots.py` and `intake.py` deliberately import nothing but the standard library — the safety-critical decision ("does this code submit to a scheduler?") is checked
-in about two seconds, with no pinned agent stack, no API key and no cluster.
+All six run on every push via GitHub Actions (`.github/workflows/tests.yml`). That is possible
+because every module in `genpipe/` except `agent.py` and `cli.py` deliberately imports nothing but
+the standard library — so the safety-critical decision ("does this code submit to a scheduler?") is
+checked in about two seconds, with no pinned agent stack, no API key and no cluster.
 
-**`test_gate_rules.py`** is two lists — code that must be gated, and code that must not — plus the
+**`test_gate.py`** is two lists — code that must be gated, and code that must not — plus the
 rule about which direction a mistake may fall in. A false negative puts unapproved work on a real
 cluster; a false positive costs a rejection. Both have happened in production and both are in the
 list as the case that caused them.
@@ -278,25 +278,36 @@ per-pipeline files loaded on demand — not to raise the number.
 
 ## Repo layout
 
-| File | Purpose | Needs |
+```
+genpipe/          the application, one importable package
+tests/            suites over the parts        (see Testing)
+testcases/        walkthroughs of the product  (see Testing)
+web/              optional, ungated browser front end
+start_agent.sh    module load, venv, python -m genpipe
+```
+
+Inside the package, in dependency order — each module depends only on the ones above it:
+
+| Module | Purpose | Needs |
 |---|---|---|
-| `genpipe_agent.py` | `GenpipeA1`: the gated graph, and run/resume/check/jobs/why/cancel | biomni |
-| `gate_rules.py` | The gate's decision logic, as pure functions | stdlib |
+| `slots.py` | What each pipeline/protocol requires, and the feature-ini table | stdlib |
+| `preflight.py` | Environment checks: RAP_ID blocks, JOB_MAIL warns | stdlib |
 | `runs.py` | Runs and jobs: the registry, the job parser, triage, naming | stdlib |
+| `gate.py` | The gate's decision logic, as pure functions over command text | stdlib |
+| `intake.py` | Reads a request, finds what is missing, drives the choice panel | stdlib |
 | `display.py` | Rendering (`parse()` is UI-agnostic; a future web UI can reuse it) | stdlib |
 | `ui.py` | The terminal input side: prompt box, live completion, spinner, paste | stdlib |
 | `fakecluster.py` | Stubbed GenPipes + Slurm + model, for dev mode and the tests | stdlib |
-| `preflight.py` | Environment checks: RAP_ID blocks, JOB_MAIL warns | stdlib |
-| `slots.py` | What each pipeline/protocol requires, and the feature-ini table | stdlib |
-| `intake.py` | Reads a request, finds what is missing, drives the choice panel | stdlib |
+| `agent.py` | `GenpipeA1`: the gated graph, and run/resume/check/jobs/why/cancel | biomni |
+| `cli.py` | Builds the agent, owns the command table and the loop (`_repl()`) | biomni |
 | `genpipes.md` | The GenPipes grammar fed to the model as "software" | — |
-| `launch_agent.py` | Builds the agent, owns the command table and the loop (`_repl()`) | biomni |
-| `start_agent.sh` | Loads the cluster's Python module, activates the venv, launches the app | — |
-| `server.py` / `index.html` | Optional, ungated web UI | fastapi |
-| `tests/` | Five offline suites — see above | mixed |
 
-The "Needs" column is load-bearing, not incidental. Keeping `gate_rules.py`, `runs.py` and
-`fakecluster.py` free of `biomni` is what lets the gate's invariants, the registry's lifecycle and
+The "Needs" column is load-bearing, not incidental. Only the last two touch `biomni`; keeping
+everything above them free of it is what lets the gate's invariants, the registry's lifecycle and
 the fake cluster all be verified on every push in seconds. If one of them grows a heavy import, CI
-stops covering the thing that matters most — so `tests.yml` has a step that imports all three and
-fails if it can't.
+stops covering the thing that matters most — so `tests.yml` has a step that imports all of them,
+and a second that asserts `import genpipe` alone pulls in no `biomni`.
+
+`genpipes.md` lives inside the package rather than at the root because `cli.GRAMMAR_PATH` resolves
+it relative to the code that reads it. `.env` stays at the root: `start_agent.sh` sources it before
+this process exists.

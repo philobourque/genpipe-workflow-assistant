@@ -25,7 +25,7 @@ sys.path.insert(0, ROOT)
 from harness import Report                      # noqa: E402
 from test_app import App                        # noqa: E402
 
-import display                                  # noqa: E402 -- for _GOODBYES
+from genpipe import display                                  # noqa: E402 -- for _GOODBYES
 
 
 def run():

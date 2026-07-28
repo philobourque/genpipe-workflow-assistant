@@ -1,17 +1,17 @@
 name: tests
 
 # The suites that can run anywhere and still say something true. They import
-# only the standard library -- gate_rules.py, runs.py, fakecluster.py,
-# display.py, preflight.py, slots.py and intake.py were deliberately kept free
-# of biomni for exactly this reason, so CI needs no pinned agent stack, no API
-# key, and no cluster.
+# only the standard library -- every module in the genpipe package except
+# agent.py and cli.py was deliberately kept free of biomni for exactly this
+# reason, so CI needs no pinned agent stack, no API key, and no cluster.
 #
-# What is NOT here, and why: tests/test_lifecycle.py and tests/test_app.py drive
-# the real LangGraph gate and a real terminal, so they need biomni==0.0.8 and its
-# pinned langgraph. Installing that on every push to check a gate matcher would
-# trade a two-second signal for a several-minute one. Those two run on the
-# cluster, in the venv, before a release -- as do the three scenarios in
-# testcases/, which walk the product rather than its parts. See the README.
+# What is NOT here, and why: test_lifecycle.py, test_app.py, test_agent_gate.py
+# and test_mock_pipeline.py drive the real LangGraph gate and a real terminal,
+# so they need biomni==0.0.8 and its pinned langgraph. Installing that on every
+# push to check a gate matcher would trade a two-second signal for a
+# several-minute one. Those four run on the cluster, in the venv, before a
+# release -- as do the scenarios in testcases/, which walk the product rather
+# than its parts. See the README.
 
 on:
   push:
@@ -34,7 +34,7 @@ jobs:
       - name: The gate's invariants
         # First, and on its own step, because it is the only test here whose
         # failure means something unsafe rather than something broken.
-        run: python tests/test_gate_rules.py
+        run: python tests/test_gate.py
 
       - name: Runs and jobs
         run: python tests/test_runs.py
@@ -61,4 +61,5 @@ jobs:
         # A stdlib-only module that quietly grows a heavy import would break CI
         # in a confusing way later; catching it as its own step names the cause.
         run: |
-          python -c "import gate_rules, runs, fakecluster, display, preflight, slots, intake; print('ok')"
+          python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui; print('ok')"
+          python -c "import genpipe, sys; assert 'biomni' not in sys.modules; print('no biomni')"

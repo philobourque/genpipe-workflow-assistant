@@ -22,7 +22,7 @@ import tempfile
 
 from harness import Report
 
-import runs
+from genpipe import runs
 
 
 def make_job_list(path, rows):

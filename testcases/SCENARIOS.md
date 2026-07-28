@@ -16,6 +16,9 @@ absolute CVMFS paths already written into the readsets, nothing to stage. A CIT
 run is a real run — real generation, real ini layering, real `sbatch`, real job
 IDs. Only the data and the walltimes are small.
 
+Where each scenario names the machinery it exercises, the module is in
+`genpipe/` — `gate.is_submission` is `genpipe/gate.py`, and so on.
+
 ---
 
 ## Before any of them
@@ -71,8 +74,8 @@ words the model used.
 talking stays talk, a request becomes a generation, a submission stops at the
 gate, approval reaches Slurm, and monitoring reports what the scheduler says.
 
-**Machinery under test.** `genpipe_agent.TALK_PROTOCOL` (mode choice),
-`intake.brief` (directory context), `gate_rules.is_submission` → the gate,
+**Machinery under test.** `agent.TALK_PROTOCOL` (mode choice),
+`intake.brief` (directory context), `gate.is_submission` → the gate,
 `runs.Registry` (hold → submitted), `runs.jobs_for` / `log_report`.
 
 **Why this pipeline.** The cheapest real one on the install: no `-t` protocol, no
@@ -107,7 +110,7 @@ the command it ran.
 **If it fails.** A generation that stops before proposing the submission is the
 failure this scenario exists to catch — see the `HOW A RUN IS APPROVED` section
 of `TALK_PROTOCOL`. A `NameError: name 'bash' is not defined` means
-`gate_rules.mark_shell` stopped recognising the block as shell.
+`gate.mark_shell` stopped recognising the block as shell.
 
 **Cost.** ~15 core-minutes, ~20 minutes wall.
 
@@ -121,7 +124,7 @@ to list dnaseq protocols will eventually invent an eighth one and sound certain;
 the panel cannot.
 
 **Machinery under test.** `ask()` inside `<execute>` →
-`gate_rules.ask_request` → the `ask_user` node → `slots.gap_for` → `ui.choose`.
+`gate.ask_request` → the `ask_user` node → `slots.gap_for` → `ui.choose`.
 Also `slots.as_data` / `from_data`: the pause is written into the SQLite
 checkpoint as JSON, and a `Gap` object there used to kill the turn with
 `TypeError: Object of type Gap is not serializable`.
@@ -167,7 +170,7 @@ and produce a *different* command with the *same* name.
 
 **Machinery under test.** the `submission_gate` node's rejection branch,
 `GenpipeA1.resume(approved=False)`, `runs.Registry.held_for_thread` (one pending
-decision keeps one name), `gate_rules.generation_command` searching **backwards**
+decision keeps one name), `gate.generation_command` searching **backwards**
 so the box shows the revision and not the original.
 
 **Setup**
@@ -248,7 +251,7 @@ one — without that turning into a submission. Second, that a conversation is n
 a run: one thread can produce several, each named and monitored on its own.
 
 **Machinery under test.** the ungated `execute` path (Python by default, shell
-with `#!BASH`, variables persisting between blocks), `gate_rules.mark_shell`,
+with `#!BASH`, variables persisting between blocks), `gate.mark_shell`,
 `intake.brief`'s "named but NOT on disk" section, and the identity split — a
 `thread_id` names the conversation, a `name` names the run
 (`GenpipeA1._run_name`).
@@ -293,7 +296,7 @@ scratch:
 
 - **The proposal box can mis-report a flag.** One `rnaseq_light` run with `-o
   <dir>` showed `pairs  rnaseq_light_out` in the HOLD box. Cosmetic, in
-  `gate_rules.build_proposal`, but the box is meant to be the trustworthy summary.
+  `gate.build_proposal`, but the box is meant to be the trustworthy summary.
 - **The model sometimes stops after generating** and asks in prose whether to
   submit. Prose cannot be approved — there is no box and no run name. The prompt
   now forbids this explicitly; if it recurs, the fix is there, not in the graph.

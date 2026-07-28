@@ -2,7 +2,7 @@
 """The whole app, driven through a real terminal.
 
 test_lifecycle drives the agent's API. This drives the PRODUCT: it launches
-launch_agent.main() inside a pty, types keystrokes at it, and asserts on the
+cli.py.main() inside a pty, types keystrokes at it, and asserts on the
 screen a person would actually be looking at -- reconstructed with pyte, so what
 is checked is the rendered result of every escape sequence, not the bytes.
 
@@ -55,7 +55,11 @@ class App:
         env["COLUMNS"], env["LINES"] = str(COLS), str(ROWS)
         env["GENPIPE_AGENT_WORKDIR"] = workdir
         env["GENPIPE_FAKE_STATE"] = state
-        env.pop("PYTHONPATH", None)
+        # The checkout, and only the checkout. A module-loaded shell exports a
+        # PYTHONPATH pointing at GenPipes' own 3.13 site-packages, which makes
+        # any import here die of "SRE module mismatch"; replacing it rather than
+        # dropping it is what lets `-m genpipe` resolve from cwd=workdir below.
+        env["PYTHONPATH"] = ROOT
         # A scripted model needs no key, and leaving the real ones visible would
         # let a bug spend money. Removing them also proves --fake-llm does not
         # quietly fall back to asking for one.
@@ -70,8 +74,7 @@ class App:
         env["GENPIPE_USER"] = "tester"
 
         self.proc = subprocess.Popen(
-            [sys.executable, os.path.join(ROOT, "launch_agent.py"),
-             "--fake", "--fake-llm"],
+            [sys.executable, "-m", "genpipe", "--fake", "--fake-llm"],
             stdin=slave, stdout=slave, stderr=slave,
             # Launched from the work directory, so job_output/ and cmd.sh land
             # there -- and, incidentally, so biomni's import-time load_dotenv()

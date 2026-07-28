@@ -53,7 +53,7 @@ BASH_FUNC_module%% environment entry is removed, because DRAC also sets
     BASH_ENV=/cvmfs/soft.computecanada.ca/custom/software/lmod/lmod/init/bash
 
 and non-interactive bash sources $BASH_ENV on startup -- which is precisely the
-kind of shell genpipe_agent runs its commands in. The real `module load
+kind of shell agent.py runs its commands in. The real `module load
 mugqic/genpipes/6.1.1` then succeeds and PREPENDS the real GenPipes to PATH,
 ahead of the fake, so the tests quietly exercise the real toolchain and the fake
 cluster looks broken for reasons that have nothing to do with it.
@@ -104,7 +104,7 @@ def _write(path, body, executable=True):
 
 # ---------------------------------------------------------------------------
 # The stubs. Written as shell/python scripts rather than monkeypatched into the
-# process because the code under test really does shell out: genpipe_agent runs
+# process because the code under test really does shell out: agent.py runs
 # `module load ... && genpipes ...` through bash, and a patched subprocess.run
 # would prove nothing about whether that command line is correct.
 # ---------------------------------------------------------------------------
@@ -627,7 +627,7 @@ def _typed(message):
     mentions "possible readset: readset.tsv" would make "hi" read as a request to
     run something. It marks where its own text starts (intake.CONTEXT_MARK).
     """
-    import intake as _intake
+    from . import intake as _intake
     return message.split(_intake.CONTEXT_MARK, 1)[0]
 
 
@@ -649,7 +649,7 @@ def _wants_a_run(said, latest):
     """Has the person asked for work to be done, or are they talking?
 
     Dev mode needs this because the real model now has it in its system prompt
-    (see genpipe_agent.TALK_PROTOCOL): talk is the default, and building a
+    (see agent.TALK_PROTOCOL): talk is the default, and building a
     pipeline is what you do when you were asked to. A stand-in that generated a
     submission in reply to "hi" would be evidence about nothing except itself.
 
@@ -665,7 +665,7 @@ def _wants_a_run(said, latest):
     stripped = (latest or "").strip()
     if _QUESTION.match(stripped) or stripped.endswith("?"):
         return False
-    import intake as _intake
+    from . import intake as _intake
     return bool(_intake.find_pipeline(said))
 
 
@@ -727,8 +727,8 @@ def _next_question(said, limit=2):
     already answered is not asked twice -- the same accumulation a real model
     does by reading its own history.
     """
-    import intake as _intake
-    import slots as _slots
+    from . import intake as _intake
+    from . import slots as _slots
 
     stated = _intake.read(" ".join(said))
     gaps = _slots.gaps(**stated)
@@ -794,7 +794,7 @@ def _gen_block(task, feedback=(), answers=()):
 
 def _intake_files(text):
     """intake.find_files, imported lazily to keep this module's import cheap."""
-    import intake as _intake
+    from . import intake as _intake
     return _intake.find_files(text)
 
 

@@ -15,7 +15,7 @@ what a code block is.
 It lives in its own module, importing nothing but the standard library, for two
 reasons.
 
-  1. It can be tested anywhere. genpipe_agent.py imports biomni, which drags in
+  1. It can be tested anywhere. genpipe/agent.py imports biomni, which drags in
      langchain, langgraph and a pinned checkpoint stack -- fine on the cluster,
      too heavy to install in CI just to ask "is `bash cmd.sh` a submission?".
      Because this module is stdlib-only, the gate's invariants run on every push

@@ -108,7 +108,7 @@ flushes and calls `os._exit(0)` after the farewell.
   function in every non-interactive bash and bypasses a `PATH` stub.
   `fakecluster.env_for()` unsets every `BASH_FUNC_*` to prevent exactly this.
 - **Action 9 never reaches the gate** — the scripted model's reply did not match
-  the submission patterns. Check `gate_rules._SUBMIT_PATTERNS`.
+  the submission patterns. Check `gate._SUBMIT_PATTERNS`.
 - **Assertion found the string in scrollback but not on screen** — expected; the
   runner checks scrollback for "did this ever appear" and the viewport only for
   layout.

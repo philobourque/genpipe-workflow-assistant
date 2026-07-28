@@ -27,7 +27,7 @@ silence: silence gets asked about, a confident wrong guess does not.
 import os
 import re
 
-import slots
+from . import slots
 
 # Longest first, so rnaseq_denovo_assembly is not matched as rnaseq. Underscores
 # and hyphens are both accepted because people type both.

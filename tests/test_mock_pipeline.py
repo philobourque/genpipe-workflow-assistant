@@ -3,7 +3,7 @@
 test_mock_pipeline.py -- fast, offline, end-to-end test of the gated graph.
 
 test_gate.py checks the gate's pure helper functions in isolation. This test
-drives the real thing: the actual GenpipeA1 built by launch_agent.build_agent()
+drives the real thing: the actual GenpipeA1 built by cli.build_agent()
 (same construction path production uses), through the real LangGraph plumbing
 -- generate -> route -> gate -> interrupt -> resume -> execute -> generate ->
 end -- with a scripted FakeLLM standing in for Claude.
@@ -11,7 +11,7 @@ end -- with a scripted FakeLLM standing in for Claude.
 No Anthropic API call, no ANTHROPIC_API_KEY required, no real GenPipes command,
 no SLURM job, no cost, no wait. A full round trip (both an approve and a
 reject) takes a couple of seconds. This is the loop to run after touching
-genpipe_agent.py or display.py, before burning API credits or a cluster
+genpipe/agent.py or display.py, before burning API credits or a cluster
 allocation on a real conversation.
 
 What this does NOT test: whether Claude actually writes correct GenPipes
@@ -37,7 +37,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.messages import AIMessage
-from launch_agent import build_agent
+from genpipe.cli import build_agent
 
 
 class FakeLLM:
