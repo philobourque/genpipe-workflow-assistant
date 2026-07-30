@@ -36,8 +36,10 @@ reproducible rather than whatever the cluster happened to be doing:
     running               a mix of RUNNING and PENDING
     failed-oom            one step OUT_OF_MEMORY, with a real-looking log
     failed-missing-input  a different failure signature, so diagnosis can't cheat
+    dying                 one step FAILED, everything after it still PENDING --
+                          the run sacct calls healthy and squeue calls doomed
 
-The two failure states matter most: a /why that only ever sees one kind of
+The two failure states matter most: a /diagnose that only ever sees one kind of
 breakage is not being tested, it is being demonstrated.
 
 The one non-obvious gotcha
@@ -70,7 +72,8 @@ import shutil
 import stat
 import tempfile
 
-STATES = ("happy", "running", "failed-oom", "failed-missing-input")
+STATES = ("happy", "running", "failed-oom", "failed-missing-input",
+          "dying")
 
 # The pipelines and protocols the stub will accept. Kept deliberately short: the
 # point is that SOMETHING is rejected, so a model inventing a protocol name gets
@@ -163,12 +166,23 @@ if args[0] == "tools":
     if not os.path.exists(job_list):
         die(f"no such job list: {job_list}")
 
+    # The manifest is the real GenPipes four-column shape and carries no state,
+    # so the states come from the fake sacct store -- the same place the real
+    # log_report would have had to infer them from .o files on disk.
+    known = {}
+    store = os.path.join(os.environ["GENPIPE_FAKE_STORE"], "sacct.db")
+    if os.path.exists(store):
+        with open(store) as f:
+            for line in f:
+                parts = line.strip().split("|")
+                if len(parts) == 3:
+                    known[parts[0]] = parts[2]
     states = {}
     with open(job_list) as f:
         for line in f:
             parts = line.strip().split("\t")
-            if len(parts) >= 4:
-                states[parts[0]] = parts[3]
+            if parts and parts[0]:
+                states[parts[0]] = known.get(parts[0], "PENDING")
     total = len(states)
     tally = {}
     for s in states.values():
@@ -314,6 +328,13 @@ def plan():
         for j in jobs:
             if j[0].startswith("trimmomatic") and j[0].endswith("sampleB"):
                 j[1] = "FAILED"
+    elif STATE == "dying":
+        # The shape the filesystem cannot record: one job died, and everything
+        # behind it is queued on a dependency that will never be satisfied.
+        # sacct reports 1 FAILED and the rest PENDING for as long as you ask.
+        for j in jobs[1:]:
+            j[1] = "PENDING"
+        jobs[0][1] = "FAILED"
     return jobs
 
 
@@ -343,10 +364,15 @@ for i, (name, state) in enumerate(plan()):
     print(f"Submitted batch job {jid}   # {name}")
 
 with open(listing, "w") as f:
-    for jid, name, log, state in rows:
-        # id \t name \t log \t state -- the fourth column is ours, so sacct and
-        # log_report can agree on the same canned reality without a database.
-        f.write(f"{jid}\t{name}\t{log}\t{state}\n")
+    for i, (jid, name, log, state) in enumerate(rows):
+        # GenPipes' real manifest shape, positionally exact:
+        #   id \t name \t dependencies(colon-joined) \t log
+        # The dependency column is populated for everything after the first job
+        # precisely so that runs.parse_job_list is tested against the field that
+        # used to defeat it -- a fan-in job whose dependency string is longer
+        # than its own name.
+        deps = ":".join(r[0] for r in rows[:i]) if i else ""
+        f.write(f"{jid}\t{name}\t{deps}\t{log}\n")
 
 # A registry of every job this fake cluster knows about, so sacct can answer
 # about a run's jobs long after the submitting process is gone.
@@ -431,18 +457,64 @@ sys.stderr.write(f"scancel: cancelled {len(targets)} job(s)\n")
 '''
 
 _SQUEUE = r'''#!/usr/bin/env python3
-"""Fake `squeue`: the pending and running jobs from the fake sacct store."""
+"""Fake `squeue`: the pending and running jobs from the fake sacct store.
+
+Understands the two shapes this app asks for -- a bare listing for a human, and
+`-o '%i|%T|%r' --jobs=...` for runs.query_reasons. The reason column is the
+whole point of the second one: sacct records `None` for every reason on this
+cluster, so a pending job's reason exists in exactly one place and stops
+existing the moment the job leaves the queue.
+
+A pending job downstream of something that already broke reports
+DependencyNeverSatisfied, which is the case that matters: sacct still calls
+that job PENDING, and reading PENDING as "queued and healthy" is how a dead run
+reports itself as alive.
+"""
 import os
+import sys
 
 STORE = os.environ["GENPIPE_FAKE_STORE"]
 db = os.path.join(STORE, "sacct.db")
-print("JOBID    NAME                 STATE")
+
+args = sys.argv[1:]
+fmt = None
+wanted = None
+for i, a in enumerate(args):
+    if a in ("-o", "--format") and i + 1 < len(args):
+        fmt = args[i + 1]
+    elif a.startswith("--jobs="):
+        wanted = {x for x in a[len("--jobs="):].split(",") if x}
+    elif a in ("-j", "--jobs") and i + 1 < len(args):
+        wanted = {x for x in args[i + 1].split(",") if x}
+
+rows = []
 if os.path.exists(db):
     with open(db) as f:
         for line in f:
             parts = line.strip().split("|")
-            if len(parts) == 3 and parts[2] in ("PENDING", "RUNNING"):
-                print(f"{parts[0]:<9}{parts[1]:<21}{parts[2]}")
+            if len(parts) == 3:
+                rows.append(parts)
+
+doomed = any(p[2] in ("FAILED", "OUT_OF_MEMORY", "TIMEOUT", "NODE_FAIL")
+             for p in rows)
+
+def reason(state):
+    if state == "RUNNING":
+        return "None"
+    return "DependencyNeverSatisfied" if doomed else "Dependency"
+
+live = [p for p in rows if p[2] in ("PENDING", "RUNNING")
+        and (wanted is None or p[0] in wanted)]
+
+if fmt:
+    for jid, name, state in live:
+        out = (fmt.replace("%i", jid).replace("%T", state)
+                  .replace("%j", name).replace("%r", reason(state)))
+        print(out)
+else:
+    print("JOBID    NAME                 STATE")
+    for jid, name, state in live:
+        print(f"{jid:<9}{name:<21}{state}")
 '''
 
 _SBATCH = """#!/bin/bash
@@ -570,10 +642,13 @@ class DevLLM:
         feedback = [t for t in theirs[1:] if "was not approved" in t]
         answers = [t for t in theirs[1:] if "The user answered" in t]
 
-        # A /why investigation. Its prompt carries the facts already, so the
+        # A /diagnose investigation. Its prompt carries the facts already, so the
         # answer is written from those rather than invented.
-        if "Diagnose the cause" in task:
-            return AIMessage(content=f"<solution>{_diagnosis(task)}</solution>")
+        # Matched on the prompt's real opening line. It used to look for
+        # "Diagnose the cause", which _why_prompt never wrote, so this branch
+        # was dead and dev mode answered a diagnosis with a generic reply.
+        if "needs diagnosing" in task:
+            return AIMessage(content=f"<solution>\n{_diagnosis(task)}\n</solution>")
 
         # What the person has actually typed, as opposed to what the graph fed
         # back to itself. One conversation now spans many turns, so the request
@@ -615,7 +690,7 @@ class DevLLM:
 
         return AIMessage(content=(
             "<solution>The pipeline was submitted. Use /check to follow its "
-            "progress, /jobs to see the individual Slurm jobs, and /why if "
+            "progress, /jobs to see the individual Slurm jobs, and /diagnose if "
             "anything fails.</solution>"))
 
 
@@ -693,25 +768,68 @@ def _chat(latest):
 
 
 def _diagnosis(prompt):
-    """An explanation written from the facts triage put in the prompt."""
+    """An explanation written from the facts triage put in the prompt.
+
+    Answered in diagnosis.SHAPE, the same contract a real model is given, so
+    dev mode exercises the parser and the structured renderer rather than only
+    their prose fallback. A stand-in that answered in a shape the real one is
+    forbidden from using would be evidence about nothing.
+    """
     step = "the failing step"
     for line in prompt.splitlines():
         if line.startswith("--- step "):
             step = line.split()[2].rstrip(":")
             break
+    # The original -s range, quoted back. The relaunch rule is that the FULL
+    # range is resubmitted, never a narrowed one -- see diagnosis.RELAUNCH_RULE.
+    steps = "the full original range"
+    for line in prompt.splitlines():
+        if line.strip().startswith("steps:"):
+            steps = line.split(":", 1)[1].strip()
+            break
+
     if "OutOfMemory" in prompt or "oom_kill" in prompt:
-        return (f"{step} ran out of memory. The log ends in a Java heap "
-                f"OutOfMemoryError and Slurm recorded an oom_kill, and sacct "
-                f"reports the peak RSS at the cgroup limit. Raise "
-                f"java_other_options -Xmx for that step in your ini (and "
-                f"cluster_mem with it), then rerun just that step.")
+        return _shaped(
+            manner=f"OUT_OF_MEMORY — {step} was killed by the cgroup limit.",
+            cause=(f"{step} ran out of memory. The log ends in a Java heap "
+                   f"OutOfMemoryError and Slurm recorded an oom_kill, with peak "
+                   f"RSS at the cgroup limit."),
+            evidence=["the .o log ends in java.lang.OutOfMemoryError",
+                      "sacct reports MaxRSS at the ReqMem ceiling",
+                      "no other step reports a resource problem"],
+            fix=f"raise cluster_mem, and ram with it, for the [{step}] section",
+            override=f"[{step}]\ncluster_mem = 96G\nram = %(cluster_mem)s",
+            steps=steps, confidence="likely")
     if "No such file or directory" in prompt:
-        return (f"{step} could not read an input it expected. The log names a "
-                f"FASTQ that is not on disk, so a path in the readset file does "
-                f"not resolve from the run directory. Fix the readset entry and "
-                f"rerun that step.")
-    return (f"{step} failed. The log does not name a cause on its own -- check "
-            f"the step's resources and its inputs.")
+        return _shaped(
+            manner=f"FAILED — {step} exited without producing its output.",
+            cause=(f"{step} could not read an input it expected. The log names "
+                   f"a FASTQ that is not on disk, so a path in the readset file "
+                   f"does not resolve from the run directory."),
+            evidence=["the .o log ends in No such file or directory",
+                      "the path it names is not under the run directory"],
+            fix="correct the path in the readset file; this is not a resource "
+                "problem and no ini change will help",
+            override="", steps=steps, confidence="certain")
+    return _shaped(
+        manner=f"{step} did not complete.",
+        cause="The log does not name a cause on its own.",
+        evidence=["the .o log ends without an error message"],
+        fix="check the step's resources and its inputs; the logs do not "
+            "support a specific value",
+        override="", steps=steps, confidence="unclear")
+
+
+def _shaped(manner, cause, evidence, fix, override, steps, confidence):
+    """The seven headings diagnosis.parse() reads back."""
+    lines = [f"MANNER: {manner}", f"CAUSE: {cause}", "EVIDENCE:"]
+    lines += [f"- {e}" for e in evidence]
+    lines.append(f"FIX: {fix}")
+    if override:
+        lines.append("OVERRIDE:")
+        lines += override.splitlines()
+    lines += [f"RELAUNCH: {steps}", f"CONFIDENCE: {confidence}"]
+    return "\n".join(lines)
 
 
 def _next_question(said, limit=2):

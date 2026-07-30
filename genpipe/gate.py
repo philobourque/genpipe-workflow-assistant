@@ -386,10 +386,43 @@ def mark_shell(content):
     return content[:m.start(1)] + "\n#!BASH\n" + code.strip() + "\n" + content[m.end(1):]
 
 
+# The long form of every flag the proposal box reads. GenPipes accepts both, and
+# a model writing the readable one is writing a correct command -- but the box
+# used to parse only the short form, so `--output-dir /scratch/out` rendered as
+# "output: cwd (no -o flag)" in red on a command that really did set it. Being
+# wrong in the approval box is worse than being silent: it is the one screen
+# whose whole job is to say what is about to happen.
+#
+# Public because mirror.py needs the same equivalence when it tokenises the
+# command for display. Two tables that disagree about whether `--steps` is `-s`
+# would put a flag in the mirror that the gate does not think is set.
+LONG_FORM = {
+    "-t": "--type",
+    "-s": "--steps",
+    "-r": "--readsets",
+    "-d": "--design",
+    "-p": "--pairs",
+    "-o": "--output-dir",
+    "-c": "--config",
+    "-j": "--job-scheduler",
+    "-g": "--genpipes-file",
+}
+
+
 def flag_value(cmd, flag):
-    """The argument given to a flag, e.g. flag_value(cmd, '-t') -> 'stringtie'."""
-    m = re.search(rf"{re.escape(flag)}\s+(\S+)", cmd)
-    return m.group(1) if m else None
+    """The argument given to a flag, e.g. flag_value(cmd, '-t') -> 'stringtie'.
+
+    Accepts the long form too, and `--flag=value` as well as `--flag value`.
+    The long form is tried FIRST: `-o` is a prefix of nothing, but a short-form
+    search would happily match the `-o` inside `--output-dir` and return
+    `/scratch/out`'s neighbour instead of the value.
+    """
+    long = LONG_FORM.get(flag)
+    for name in ([long] if long else []) + [flag]:
+        m = re.search(rf"(?<![\w-]){re.escape(name)}(?:\s+|=)(\S+)", cmd)
+        if m:
+            return m.group(1)
+    return None
 
 
 def submission_line(code):
@@ -480,6 +513,14 @@ def build_proposal(messages, code):
     lines.append("Approve to submit, or request an adjustment (protocol, steps, config).")
     return {
         "command": cmd,
+        # The generation command itself, kept so the gate can show what the
+        # script being approved was BUILT from. `bash cmd.sh` is what runs, and
+        # on its own it says nothing: two runs a week apart submit the same
+        # three words. It matters more now that the transcript folds the agent's
+        # working away by default -- without this, the generation would scroll
+        # past unseen and the approval box would be the first and only place the
+        # command appeared, reading `bash cmd.sh`.
+        "generated": " ".join((gen or "").split()) or None,
         "explanation": "\n".join(lines),
         "script": script_name(code or ""),
         "slots": {"pipeline": pipeline, "protocol": protocol, "steps": steps,

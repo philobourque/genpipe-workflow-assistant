@@ -12,7 +12,7 @@ That distinction is the point. Everything here is invisible to an API-level test
   * the completion menu appearing as you type, and Tab finishing a command
   * the suggested run name being pre-filled and editable
   * the gate's HOLD box, and /approve from the prompt
-  * /list, /jobs, /why and /where actually being wired to their handlers
+  * /list, /jobs, /diagnose and /where actually being wired to their handlers
   * a pasted multi-line string NOT executing its first line as a command
 
 Runs against the fake cluster and the scripted model, so no allocation, no API
@@ -87,7 +87,7 @@ class App:
         # Two views, and the difference matters. `screen` is the 44-row viewport
         # -- what a person is looking at right now -- and is what layout
         # assertions must use. `scrollback` is everything ever emitted, which is
-        # what "did this appear at all?" needs: a long /why scrolls its own
+        # what "did this appear at all?" needs: a long /diagnose scrolls its own
         # evidence off the top before the next assertion runs, and checking the
         # viewport for it would fail for a reason that has nothing to do with the
         # product.
@@ -190,8 +190,13 @@ def main():
         r.contains("shows the version", screen, "v0")
         r.contains("greets the user", screen, "Welcome back")
         r.contains("shows the model", screen, "claude-sonnet-5")
-        r.contains("shows where it lives", screen, "genpipe-workflow-assistant")
-        r.contains("promises the gate in words", screen, "without your approval")
+        r.contains("shows where it lives", screen, "assistant")
+        # The banner used to close with the approval promise. It says more where
+        # it is demonstrated -- at the gate, holding a real submission -- than as
+        # a claim made to someone who has not typed anything yet, so what is
+        # asserted here is that the screen orients rather than promises.
+        r.contains("says what to type first", screen, "Getting started")
+        r.contains("and what is available afterwards", screen, "/check")
         r.contains("dev mode is announced, not hidden", screen, "dev mode")
         r.contains("...naming what is simulated", screen, "fake cluster")
         r.check("and it never asked for an API key",
@@ -201,11 +206,22 @@ def main():
         r.section("the completion menu appears as you type")
         app.send("/")
         screen = app.visible()
-        r.contains("shows /approve", screen, "/approve")
-        r.contains("shows /jobs", screen, "/jobs")
-        r.contains("shows /why", screen, "/why")
-        r.contains("shows /cancel", screen, "/cancel")
-        r.contains("with descriptions", screen, "diagnose a failed run")
+        # The menu is capped to what fits above the prompt, and the command
+        # list has grown past a screenful, so assert that it opened and is
+        # showing real rows with their descriptions -- not that every command
+        # in the table is visible at once, which stopped being true and is not
+        # the property this section is about.
+        r.check("the menu opened", "/" in screen)
+        rows = [c for c in ("/approve", "/modify", "/reject", "/list",
+                            "/check", "/jobs", "/diagnose", "/cancel")
+                if c in screen]
+        r.check("showing several commands", len(rows) >= 3, f"saw={rows}")
+        r.check("with descriptions beside them",
+                any(d in screen for d in
+                    ("let a held submission through", "diagnose a failed run",
+                     "rewrites the command", "abandons a held run",
+                     "how a whole run is doing")),
+                screen[-400:])
 
         r.section("typing narrows it, Tab completes it")
         app.send("j")
@@ -229,7 +245,7 @@ def main():
         app.send("\x15")
 
         # ================================================================== #
-        r.section("a task offers a name, then stops at the gate")
+        r.section("a task is named at the gate, without being asked")
         app.line("run rnaseq stringtie steps 1-5")
         # Two panels stand between the request and the name prompt now: the
         # readset and the design, neither of which this request names. Answering
@@ -242,13 +258,16 @@ def main():
         app.send("1")
         app.wait_for("needs a design file", timeout=30)
         app.send("1")
-        r.check("asks for a name", app.wait_for("name this run", timeout=30))
-        screen = app.visible()
-        r.contains("with one already suggested", screen, "rnaseq-stringtie")
-
-        app.send("\r")                      # accept the suggestion
         r.check("reaches the gate", app.wait_for("HOLD", timeout=120),
                 app.text()[-800:])
+        # Named here and only here, from what the run turned out to BE. Nobody
+        # is asked: a name is invented before anyone has seen what they are
+        # naming, and the command is the better source anyway -- it says
+        # `rnaseq -t stringtie` where the request said "the usual thing".
+        r.contains("with a name derived from the command",
+                   app.visible(), "rnaseq-stringtie")
+        r.check("and it was never asked for",
+                "name this run" not in app.emitted())
         screen = app.visible()
         r.contains("says approval is required", screen, "requires approval")
         r.contains("shows the command to be approved", screen, "bash cmd.sh")
@@ -258,9 +277,10 @@ def main():
                    "Nothing has reached the scheduler")
 
         r.section("/list shows the held run before it is approved")
+        mark = len(app.emitted())
         app.line("/list")
-        app.pump(0.6)
-        screen = app.visible()
+        app.pump(0.8)
+        screen = app.emitted()[mark:]
         r.contains("the run is listed", screen, "rnaseq-stringtie")
         r.contains("marked as held", screen, "held")
         r.contains("with what it is waiting for", screen, "awaiting your approval")
@@ -281,9 +301,16 @@ def main():
         app.pump(1.5)
         screen = app.visible()
         r.contains("names the run", screen, name)
-        r.contains("reports the failures loudly", screen, "need attention")
-        r.contains("counts the completed jobs", screen, "completed")
-        r.contains("and the out-of-memory ones", screen, "out_of_memory")
+        # The wording changed with the source. /check used to report GenPipes'
+        # log_report, which reads files on disk and therefore cannot see a job
+        # that never started or one that was killed; it now reports sacct.
+        r.contains("reports the failures loudly", screen.lower(), "failed")
+        r.contains("counts the completed jobs", screen, "COMPLETED")
+        r.contains("and the out-of-memory ones", screen, "OUT_OF_MEMORY")
+        r.contains("names the step that actually broke", screen, "root cause")
+        r.contains("and says where the answer came from", screen, "sacct")
+        r.contains("with how much of the manifest it covered",
+                   screen, "jobs resolved")
 
         r.section("/jobs shows the individual jobs, grouped by step")
         app.line(f"/jobs {name}")
@@ -291,7 +318,7 @@ def main():
         screen = app.visible()
         r.contains("groups by step", screen, "picard_mark_duplicates")
         r.contains("shows a per-job state", screen, "out_of_memory")
-        r.contains("and offers the diagnosis", screen, "/why")
+        r.contains("and offers the diagnosis", screen, "/diagnose")
 
         r.section("/jobs <name> failed narrows to the failures")
         app.line(f"/jobs {name} failed")
@@ -303,12 +330,29 @@ def main():
                 screen[-500:])
 
         # ================================================================== #
-        r.section("/why establishes the facts before explaining")
+        r.section("/diagnose establishes the facts before explaining")
         before = len(app.scrollback)
-        app.line(f"/why {name}")
+        app.line(f"/diagnose {name}")
         r.check("reports what failed first",
                 app.wait_for("step(s) affected", timeout=60), app.text()[-800:])
-        r.check("then explains it", app.wait_for("SOLUTION", timeout=120),
+        # The evidence block's last line, printed by display.triage before the
+        # model is asked anything. It is the seam: everything after it is the
+        # explanation. Anchoring on it rather than on a speaker label is
+        # deliberate -- the transcript no longer labels the agent's turns, and a
+        # test that depended on a label would have been testing the furniture.
+        SEAM = "reading the logs, then explaining"
+        r.check("the evidence block closes", app.wait_for(SEAM, timeout=60),
+                app.text()[-800:])
+        # Then wait for the model to finish. There is no marker to wait on any
+        # more -- the reply is plain prose with no label, which is the point --
+        # so wait for the output to go quiet instead.
+        settled = ""
+        for _ in range(40):
+            app.pump(3.0)
+            if app.scrollback == settled:
+                break
+            settled = app.scrollback
+        r.check("then explains it", len(app.scrollback) > before,
                 app.text()[-800:])
         # Only what this command produced, so an earlier /jobs can't satisfy it.
         out = re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", app.scrollback[before:])
@@ -317,7 +361,7 @@ def main():
         r.contains("and the evidence it read", out, "peak memory")
         r.contains("naming the log it read", out, ".o")
         r.check("the evidence came before the explanation",
-                out.index("peak memory") < out.index("SOLUTION"),
+                out.index("peak memory") < out.index(SEAM),
                 "the model's answer preceded the facts it was given")
         r.contains("with an actionable cause", out, "memory")
 
@@ -326,7 +370,7 @@ def main():
         app.pump(0.8)
         screen = app.visible()
         r.contains("the run is there", screen, name)
-        r.contains("with the note from /why", screen.lower(), "memory")
+        r.contains("with the note from /diagnose", screen.lower(), "memory")
 
         # ================================================================== #
         r.section("/where shows the directories that decide where things land")
@@ -364,24 +408,32 @@ def main():
         # them with the seeded files keeps the run name -- and therefore every
         # assertion below -- the same as before intake existed.
         # send(), not line(): with nine or fewer rows a digit selects
-        # immediately, so a trailing Enter would leak into whatever prompt comes
-        # next -- which is the name prompt, whose suggestion is pre-filled.
+        # immediately, so a trailing Enter would leak into the next prompt.
         app.wait_for("Which readset file", timeout=30)
         app.send("1")
         app.wait_for("needs a design file", timeout=30)
         app.send("1")
-        r.check("asks for a name again", app.wait_for("name this run", timeout=30))
-        # The suggestion is pre-filled with the cursor at the end, so typing
-        # appends to it -- which is what makes it editable rather than a default.
-        # Clear it first, the way a person replacing it would.
-        app.send("\x15")
-        app.send(name)                       # deliberately reuse the taken name
-        r.contains("the name really was replaced, not appended",
-                   app.visible(), f"name this run ❯ {name}")
-        app.send("\r")
-        r.check("says the name was taken",
-                app.wait_for("is taken", timeout=60), app.text()[-600:])
-        r.contains("and shows the one it used instead", app.emitted(), f"{name}-2")
+        mark = len(app.emitted())
+        reached = False
+        for _ in range(60):
+            app.pump(2.0)
+            if "HOLD" in app.emitted()[mark:]:
+                reached = True
+                break
+        r.check("the second run also reaches the gate", reached,
+                app.text()[-800:])
+        # A name has to identify exactly one run, because it is what /approve,
+        # /check and /diagnose are given. The name is derived from the command, so a
+        # repeat of the same request collides -- and the collision must be
+        # advanced rather than allowed to shadow the first run's record.
+        # Read the name off the second box rather than predicting the suffix:
+        # what is being asserted is that the two differ, not what the second is
+        # called, and the model's exact command is not this suite's business.
+        found = re.findall(r"/approve (\S+)", app.emitted()[mark:])
+        second = found[-1] if found else None
+        r.truthy("the second gate names a run", second)
+        r.check("and it is not the first run's name", second != name,
+                f"both runs are called {second!r}")
 
         r.section("Ctrl+D leaves cleanly")
         app.close()
@@ -395,10 +447,15 @@ def main():
         again = App(workdir, state="failed-oom")
         try:
             r.check("relaunches", again.wait_for("ready", timeout=120))
-            screen = again.visible()
-            r.contains("announces the pending approval", screen, "HELD")
-            r.contains("names the run waiting", screen, f"{name}-2")
-            r.contains("and how to answer it", screen, "/approve")
+            screen = again.emitted()
+            # One line, however many are held. display.pending deliberately
+            # does NOT reprint every held command: a fortnight of experiments
+            # made the largest thing on a fresh screen the list of things you
+            # had not decided, and pushed the prompt to the bottom of the
+            # scrollback.
+            r.contains("announces the pending approval", screen, "held")
+            r.contains("names the run waiting", screen, second or f"{name}-2")
+            r.contains("and where to see the commands", screen, "/list")
         finally:
             again.close()
 

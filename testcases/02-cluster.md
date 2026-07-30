@@ -69,7 +69,7 @@ if any is missing.
 | 10 | `/runs` | the run reads `submitted` with a job count |
 | 11 | `/jobs <name>` | states come from `sacct` and change between polls |
 | 12 | wait for completion | every job reaches `COMPLETED` |
-| 13 | `/check <name>` | `log_report` agrees with what `/jobs` said |
+| 13 | `/check <name>` | the state table sums to the manifest, and the footer reads `N/N jobs resolved` naming `sacct` — never `log_report` |
 | 14 | — | `report/` and the MultiQC html exist |
 | 15 | re-run the same request under a new name | the second run generates, and GenPipes skips already-complete work |
 
@@ -83,7 +83,7 @@ matters most. After 15, do this:
 | 16 | generate again with an override ini setting one step's `cluster_walltime` to `0:00:30` | generation succeeds |
 | 17 | approve | that step is submitted and killed at its limit |
 | 18 | `/jobs <name>` | one job `TIMEOUT`; the jobs downstream counted as **cancelled, not failed** |
-| 19 | `/why <name>` | names the failing step, quotes the `.sh` and the config section, and does **not** claim a cause the logs do not show |
+| 19 | `/diagnose <name>` | names the failing step, quotes the `.sh` and the config section, and does **not** claim a cause the logs do not show |
 
 Action 19 is the real assertion. The diagnosis is allowed to say "the logs do
 not show why". It is not allowed to invent a plausible reason, and it is not

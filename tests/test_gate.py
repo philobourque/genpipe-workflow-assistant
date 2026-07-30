@@ -115,6 +115,33 @@ def main():
             {"rnaseq.base.ini", "rorqual.ini"},
             f"got={p['slots']['inis']}")
 
+    r.section("the box reads long-form flags too")
+    # GenPipes accepts both, and a model writing the readable one is writing a
+    # correct command. The box used to parse only the short form, so
+    # `--output-dir /scratch/out` rendered as "output: cwd (no -o flag)" in red
+    # on a command that really did set it -- wrong on the one screen whose whole
+    # job is to say what is about to happen.
+    long_form = [Msg("<execute>\ngenpipes chipseq --type chipseq "
+                     "--output-dir /scratch/out --steps 1-4 "
+                     "--readsets rs.tsv -g cmd.sh\n</execute>"),
+                 Msg("<execute>\nbash cmd.sh\n</execute>")]
+    p = g.build_proposal(long_form, "bash cmd.sh")
+    r.equal("--type", p["slots"]["protocol"], "chipseq")
+    r.equal("--steps", p["slots"]["steps"], "1-4")
+    r.equal("--readsets", p["slots"]["readset"], "rs.tsv")
+    r.equal("--output-dir", p["slots"]["output_dir"], "/scratch/out")
+    # And the reason the long form has to be tried first: a short-form search
+    # matches the `-o` inside `--output-dir` and returns the wrong token.
+    r.equal("no phantom pairs file", p["slots"]["pairs"], None)
+
+    equals = [Msg("<execute>\ngenpipes rnaseq --type=stringtie "
+                  "--output-dir=/scratch/o -g cmd.sh\n</execute>"),
+              Msg("<execute>\nbash cmd.sh\n</execute>")]
+    p = g.build_proposal(equals, "bash cmd.sh")
+    r.equal("--flag=value works too", p["slots"]["protocol"], "stringtie")
+    r.equal("for the output directory as well",
+            p["slots"]["output_dir"], "/scratch/o")
+
     r.section("an unclosed tag is tolerated, not dropped")
     truncated = [Msg("<execute>\nbash cmd.sh")]
     r.truthy("still finds the code", g.extract_pending_code(truncated))

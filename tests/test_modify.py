@@ -1,0 +1,259 @@
+#!/usr/bin/env python
+"""The three gate verbs, and what each one costs.
+
+The gate used to offer two: approve, and a reject that secretly meant rework --
+it regenerated and came back. So there was no way to abandon a run at all, and a
+run you had mentally dropped went on appearing in /list and in the startup
+pending line forever.
+
+    /approve   submits. Irreversible, and the only one that spends anything.
+    /modify    rewrites the command and asks again. What reject used to do.
+    /reject    abandons the run. Terminal, nothing submitted, reason kept.
+
+Two properties here are safety properties rather than behaviour, and they are
+the reason this file is stdlib-only and runs on every push:
+
+  * prose never approves. "looks good, go ahead" typed at the gate must be
+    REFUSED with the command that would work -- not read as consent. Approval is
+    typed, always.
+  * a rename leaves no ghost. The registry is append-only and get() takes the
+    last match, so a rename that rewrote only the current record would leave the
+    run reachable under a name /list no longer shows.
+
+Run:  python tests/test_modify.py
+"""
+import os
+import sys
+import tempfile
+
+from harness import Report
+
+from genpipe import modify
+from genpipe import runs
+
+
+PROPOSAL = {
+    "command": "bash cmd.sh",
+    "slots": {"pipeline": "chipseq", "protocol": "chipseq", "steps": "1-5",
+              "design": "design.tsv", "inis": [], "pairs": None,
+              "readset": "readset.tsv", "output_dir": None},
+}
+
+
+def main():
+    r = Report("modify")
+
+    # ------------------------------------------------------------------ #
+    r.section("prose at the gate never approves")
+
+    for line in ("lgtm", "looks good", "looks good, go ahead", "go ahead",
+                 "yes", "ship it!", "ok do it", "approve", "sounds good",
+                 "perfect, submit it"):
+        r.check(f"refused as approval: {line!r}", modify.is_approval_shaped(line))
+
+    # The other half, and the more important one: a line that merely STARTS
+    # agreeably is a change request and must reach the modify path. A prefix
+    # match here would have swallowed the change and printed an approve line.
+    for line in ("yes, but use steps 1-8", "looks good except the protocol",
+                 "use steps 1 through 8", "change -t to atacseq",
+                 "ok so what does step 4 do"):
+        r.check(f"not an approval: {line!r}", not modify.is_approval_shaped(line))
+
+    # ------------------------------------------------------------------ #
+    r.section("tier 1: a wrong protocol is answered with the right ones")
+
+    verdict = modify.check("protocol", "germline_snv", PROPOSAL)
+    r.check("rejected", not verdict.ok)
+    r.contains("and named as another pipeline's", verdict.message, "dnaseq")
+    r.equal("with this pipeline's real protocols offered",
+            sorted(o.value for o in verdict.options), ["atacseq", "chipseq"])
+    r.check("which never reached a model", True)
+
+    ok = modify.check("protocol", "atacseq", PROPOSAL)
+    r.check("a legal one is accepted", ok.ok)
+    r.contains("with its consequence stated in the same breath",
+               ok.note, "atac")
+
+    # A protocol switch that newly REQUIRES a file has to say so immediately,
+    # not two steps later when generation fails on a missing -d.
+    rna = {"slots": {"pipeline": "rnaseq", "protocol": "variants",
+                     "steps": "1-5"}}
+    switch = modify.check("protocol", "stringtie", rna)
+    r.check("accepted", switch.ok)
+    r.contains("and the new requirement is named", switch.note, "design")
+
+    # ------------------------------------------------------------------ #
+    r.section("tier 1: a file that is not on disk is caught before a model call")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = modify.check("design", "nope.tsv", PROPOSAL, directory=tmp)
+        r.check("rejected", not missing.ok)
+        r.contains("and says what would have happened", missing.message,
+                   "genpipes would fail")
+        real = os.path.join(tmp, "design.tsv")
+        open(real, "w").close()
+        r.check("a file that is there is accepted",
+                modify.check("design", "design.tsv", PROPOSAL, directory=tmp).ok)
+
+    # ------------------------------------------------------------------ #
+    r.section("tier 2: form, not meaning")
+
+    for good in ("1-5", "3,6-8", "4", "1-20"):
+        r.check(f"well formed: {good}", modify.valid_steps(good))
+    for bad in ("one-five", "5-1", "0-3", "1..5", ""):
+        r.check(f"malformed: {bad!r}", not modify.valid_steps(bad))
+
+    # ------------------------------------------------------------------ #
+    r.section("tier 3: steps are reasoned about against --help, never a table")
+
+    # There is no step table in this repo and there must not be one:
+    # genpipes.md says so outright, because the numbered list is version-exact
+    # and a copy here would be wrong on the next GenPipes release while looking
+    # authoritative. So the help text is an ARGUMENT.
+    help_text = "\n".join(
+        f"{i}- {name}" for i, name in enumerate(
+            ["picard_sam_to_fastq", "trimmomatic", "bwa_mem", "mark_duplicates",
+             "haplotype_caller", "metrics", "report"], 1))
+
+    risks, stop = modify.step_risk("1-2,5-7", help_text)
+    r.equal("an internal gap is not a hard stop", stop, None)
+    r.check("but it is a risk", bool(risks))
+    r.contains("naming what is skipped", risks[0], "3-4")
+    r.contains("and reasoning rather than asserting", risks[0], "usually")
+
+    risks, stop = modify.step_risk("1-7", help_text)
+    r.equal("a complete range raises nothing", risks, [])
+    r.equal("and stops nothing", stop, None)
+
+    risks, stop = modify.step_risk("5-9", help_text)
+    r.check("a step past the end is a hard stop", stop is not None)
+    r.contains("and says what the range really is", stop, "1-7")
+
+    r.equal("with no --help there is no opinion",
+            modify.step_risk("1-5", ""), ([], None))
+
+    # ------------------------------------------------------------------ #
+    r.section("one sentence, whatever the number of changes")
+
+    text = modify.sentence(PROPOSAL, {"protocol": "atacseq", "steps": "1-8"})
+    r.contains("names the flag, not the row", text, "-t")
+    r.contains("both sides of the delta", text, "from chipseq to atacseq")
+    r.contains("the second change too", text, "1-8")
+    # The half that earns its length: a model told only what to change
+    # regenerates everything and drifts on a flag nobody asked it to touch.
+    r.contains("and what must not move", text, "leave")
+    r.contains("-d among them", text, "-d")
+
+    r.equal("a rename alone produces no sentence at all",
+            modify.sentence(PROPOSAL, {"name": "better-name"}), "")
+
+    # ------------------------------------------------------------------ #
+    r.section("cross-field consequences surface before submission")
+
+    notes = modify.cross_check({"slots": {"pipeline": "rnaseq",
+                                          "protocol": "variants"}},
+                               {"protocol": "stringtie"})
+    r.check("a protocol that now needs a design says so",
+            any("design" in n for n in notes))
+
+    notes = modify.cross_check({"slots": {"pipeline": "chipseq",
+                                          "protocol": "chipseq"}},
+                               {"protocol": "atacseq"})
+    r.check("chipseq's optional design is not reported as missing",
+            not any("needs a design" in n for n in notes))
+    r.check("but the mark column is", any("atac" in n for n in notes))
+
+    # ------------------------------------------------------------------ #
+    r.section("the rows offered are the ones this run actually has")
+
+    rows = dict(modify.rows_for(PROPOSAL, "chipseq-0728"))
+    r.check("name comes first",
+            modify.rows_for(PROPOSAL, "x")[0][0] == "name")
+    r.check("a germline run is not offered a pairs file",
+            "pairs" not in dict(modify.rows_for(
+                {"slots": {"pipeline": "dnaseq", "protocol": "germline_snv"}})))
+    r.check("a somatic one is",
+            "pairs" in dict(modify.rows_for(
+                {"slots": {"pipeline": "dnaseq",
+                           "protocol": "somatic_fastpass"}})))
+    r.check("a pipeline with no -t is not asked for a protocol",
+            "protocol" not in dict(modify.rows_for(
+                {"slots": {"pipeline": "rnaseq_light"}})))
+    r.equal("current values come from the proposal", rows["steps"], "1-5")
+
+    # ------------------------------------------------------------------ #
+    r.section("/reject is terminal, and leaves no pending decision behind")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = runs.Registry(tmp)
+        registry.hold("chipseq-0728", "chat-1", PROPOSAL, tmp)
+        r.equal("held to begin with", len(registry.held()), 1)
+
+        registry.abandon("chipseq-0728", "wrong samples")
+        r.equal("gone from held()", len(registry.held()), 0)
+        r.equal("gone from /list", len(registry.live()), 0)
+        record = registry.get("chipseq-0728")
+        r.equal("but still in history", record["status"], runs.ABANDONED)
+        r.equal("with the reason kept", record["abandoned_because"],
+                "wrong samples")
+        r.check("and nothing submitted", record["job_list"] is None)
+
+        # A submitted run is not abandonable: its name is the handle for jobs
+        # that really are on the scheduler.
+        registry.mark_submitted("live-0728", os.path.join(tmp, "jl"))
+        registry.abandon("live-0728", "no")
+        r.equal("a submitted run is left alone",
+                registry.get("live-0728")["status"], runs.SUBMITTED)
+
+    # ------------------------------------------------------------------ #
+    r.section("a rename is a registry write, and leaves no ghost")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = runs.Registry(tmp)
+        registry.hold("chipseq-chipseq-0728", "chat-1", PROPOSAL, tmp)
+        # Reach the gate twice on the same run, which is what a modify cycle
+        # does -- so there are two records under the old name to rewrite.
+        registry.hold("chipseq-chipseq-0728", "chat-1", PROPOSAL, tmp)
+
+        settled = registry.rename("chipseq-chipseq-0728", "h3k27ac-rep1")
+        r.equal("renamed", settled, "h3k27ac-rep1")
+        r.check("findable under the new name",
+                registry.get("h3k27ac-rep1") is not None)
+        # The ghost. get() takes the LAST record for a name, so rewriting only
+        # the current one would leave the run reachable under a name /list no
+        # longer shows -- approvable, and invisible.
+        r.equal("and not under the old one",
+                registry.get("chipseq-chipseq-0728"), None)
+        r.equal("still held", registry.get("h3k27ac-rep1")["status"], runs.HELD)
+        r.equal("and still the thread's held run",
+                registry.held_for_thread("chat-1")["name"], "h3k27ac-rep1")
+
+        # A collision gets the -2 suffix rather than shadowing.
+        registry.hold("taken", "chat-2", PROPOSAL, tmp)
+        registry.hold("other", "chat-3", PROPOSAL, tmp)
+        r.equal("a taken name is suffixed",
+                registry.rename("other", "taken"), "taken-2")
+
+        registry.mark_submitted("gone-live", os.path.join(tmp, "jl"))
+        r.equal("a submitted run refuses to be renamed",
+                registry.rename("gone-live", "anything"), None)
+
+    # ------------------------------------------------------------------ #
+    r.section("/sort hides rows without losing them")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = runs.Registry(tmp)
+        registry.hold("a", "chat-a", PROPOSAL, tmp)
+        registry.hold("b", "chat-b", PROPOSAL, tmp)
+        registry.hide("a")
+        r.equal("hidden from /list", [x["name"] for x in registry.live()], ["b"])
+        r.check("still in /history",
+                any(x["name"] == "a" for x in registry.all()))
+        registry.hide("a", False)
+        r.equal("and reversible", len(registry.live()), 2)
+
+    return r.finish()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

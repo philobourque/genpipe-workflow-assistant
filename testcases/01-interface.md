@@ -46,14 +46,14 @@ offer.
 | 8 | — | a run name is suggested, derived from the request rather than a timestamp |
 | 9 | accept it | the agent generates, and the gate draws with `HOLD` |
 | 10 | — | the gate shows the command and the output directory |
-| 11 | — | `/approve <name>` and `/reject <name>` are both offered |
-| 12 | `/reject <name> use steps 1-4 instead` | the run returns to the model rather than submitting |
+| 11 | — | `/approve`, `/modify` and `/reject` are all offered, each with its consequence on the line beneath it |
+| 12 | `/modify <name> use steps 1-4 instead` | the run returns to the model rather than submitting, under the same name |
 | 13 | — | the redrawn gate's `steps` row reads **1-4**, not the original 1-5 |
 | 14 | `/approve <name>` | submission runs; a job list is written |
 | 15 | `/list` | the run is listed |
 | 16 | `/jobs <name>` | jobs are listed with real states |
 | 17 | — | broken jobs and downstream cancellations are counted **separately** |
-| 18 | `/why <name>` | a diagnosis names the failing step |
+| 18 |  `/diagnose <name>` | a diagnosis names the failing step |
 | 19 | `/where` | prints the real registry and checkpoint paths |
 | 20 | type `run dnaseq` | the protocol panel appears with **exactly seven** options |
 | 21 | pick `somatic_ensemble` | the readset is asked for first, then a **pairs** panel, because that protocol needs one |

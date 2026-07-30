@@ -12,11 +12,24 @@ understands what an agent message contains is not written twice. Nothing here is
 load-bearing: if this module breaks, run() can fall back to Biomni's
 pretty_print and lose only appearance, never behaviour.
 
-Nothing is hidden. Every part of every message is shown -- the visual hierarchy
-just makes clear what matters most:
+What is shown, and what is folded away
+--------------------------------------
+The transcript is a conversation, so it is drawn as one: the line you typed,
+once, beside a `>`, and the reply as plain prose underneath. No speaker labels.
+Nothing is labelled PBOURQUE or ASSISTANT, for the same reason nothing in a
+chat window is -- there are two participants, they alternate, and naming them
+every time is furniture.
+
+The agent's working -- the commands it runs, the output it reads, its
+connective prose -- is folded away by default and kept, not discarded. It is
+the equivalent of a chain of thought: worth being able to see, not worth
+reading every time. `/verbose` unfolds it, permanently, and unfolds what has
+already scrolled past as well. When it is folded, one dim line says how many
+steps were taken, so the fold is visible rather than silent.
+
+Unfolded, the hierarchy is:
 
   GATE      heavy red box. The one moment the run stops and needs a human.
-  ASSISTANT green. Where the agent commits to a claim; read it closely.
   GENERATE  amber. Writing the pipeline script.        } one <execute> block,
   SUBMIT    amber. Putting it on the scheduler.        } labelled by what it
   SCHEDULER amber. Asking Slurm or GenPipes how it is. } is actually doing --
@@ -25,15 +38,11 @@ just makes clear what matters most:
   answered  one dim line. The receipt for a choice panel.
   note      thin rule, grey. The model's connective prose. Present, but quiet.
 
-Two things are parsed and then not drawn -- a documentation lookup and its output,
-and the model's checklist. See render() for why.
+Three things are never drawn even unfolded -- a documentation lookup and its
+output, and the model's checklist. See render() for why.
 
-The person's own turns are labelled with their name (see who()), and the agent's
-with ASSISTANT. Two named speakers, which is what a transcript of a conversation
-is -- "YOU" and "SOLUTION" described the two halves of a form.
-
-Labels are always bright; bodies are dimmed only where the content is long and
-secondary (machine output, connective prose). The signal is in the labels.
+The gate is the one thing that is never folded. It is not the agent thinking;
+it is the agent stopping.
 """
 
 import getpass
@@ -42,6 +51,8 @@ import random
 import re
 import shutil
 import textwrap
+
+from . import mirror
 
 # ---------------------------------------------------------------------------
 # ANSI escape codes. \033[<n>m sets an attribute; \033[0m clears everything.
@@ -184,7 +195,7 @@ def _right_column(w):
     lines.append(f"{BOLD}Once it's running{RESET}")
     lines += _wrap("You can monitor it, cancel it, or diagnose a failure:", w)
     lines.append(f"  {GREEN}/check{RESET}  {GREEN}/jobs{RESET}  "
-                 f"{GREEN}/cancel{RESET}  {GREEN}/why{RESET}")
+                 f"{GREEN}/cancel{RESET}  {GREEN}/diagnose{RESET}")
     # The approval promise used to close this screen. It says more where it is
     # demonstrated -- at the gate, holding a real submission -- than as a claim
     # made to someone who has not yet typed anything.
@@ -526,15 +537,41 @@ def _clipped(text, head=10, tail=4):
     return "\n".join(lines[:head] + [f"… {hidden} more lines …"] + lines[-tail:])
 
 
+# Whether the caller draws the person's own turns itself. The CLI sets this,
+# because it needs the echo to land before anything else it prints about that
+# line. Off by default so a different front end (web/server.py) still gets the
+# turn drawn for it by render().
+ECHOED = False
+
+
+def echo(text):
+    """The person's line, drawn once, beside the chevron the prompt uses.
+
+    This is the whole of "show each user message once". The input box is the
+    editor and takes itself down on submit (see ui._Editor.finish); this is the
+    record.
+    """
+    for line in (text or "").splitlines() or [""]:
+        print(f"  {GREEN}❯{RESET} {line}")
+    print()
+
+
 def _draw(event):
     """Draw one parsed event."""
     k = event["kind"]
 
     if k == "prompt":
-        # Their own name, not "YOU". Upper-cased to sit in the same column of
-        # labels as RUN and OUT -- it is a speaker label, and a transcript where
-        # one name is styled differently from the others reads as a mistake.
-        _rule(CYAN, "\u258c", who().upper(), event["text"])
+        # The line as typed, beside the same chevron the prompt uses, once.
+        # It appeared twice before -- in the input box and again under a
+        # speaker label -- which is the one thing a transcript must not do,
+        # because the reader cannot tell whether they said it once or twice.
+        #
+        # Skipped when the caller has already drawn it. The CLI does, the
+        # moment the line is read, because it needs the echo to land BEFORE
+        # anything it prints about the line -- "Preparing run\u2026" above the
+        # sentence that caused it reads backwards.
+        if not ECHOED:
+            echo(event["text"])
 
     elif k == "note":
         # Connective prose. No label, thin rule, grey. Present but subordinate.
@@ -553,11 +590,13 @@ def _draw(event):
         print(f"{CYAN}{DIM}\u258f {_answer_line(event['text'])}{RESET}\n")
 
     elif k == "solution":
-        # "SOLUTION" is Biomni's word for the tag, and it made every reply sound
-        # like the answer to an exercise. Most of what arrives in one now is the
-        # agent talking -- an answer to a question, an explanation, a refusal --
-        # so it is labelled as the speaker it is.
-        _rule(GREEN, "\u258c", "ASSISTANT", event["text"])
+        # The reply itself. Plain text, no rule, no label -- this is the agent
+        # talking, and in a two-party conversation the second party does not
+        # need to be introduced. "SOLUTION" was Biomni's word for the tag and
+        # made every answer sound like the end of an exercise.
+        for line in (event["text"] or "").splitlines():
+            print(f"  {line}" if line.strip() else "")
+        print()
 
 
 def _answer_line(text):
@@ -579,20 +618,92 @@ _HIDDEN = ("HELP",)
 # rendered, the command runs, and the output turns up on the next call.
 _swallowing = False
 
+# ---------------------------------------------------------------------------
+# Folding. The agent's working is kept and not shown.
+#
+# What the reader wants from a transcript is the answer. What the agent emits
+# on the way to it -- a --help lookup, a generation, its output, a paragraph of
+# reasoning about what the output meant -- is the equivalent of a chain of
+# thought: genuinely useful when something has gone wrong, noise on every turn
+# where nothing has. Claude Code makes the same call and it is the right one.
+#
+# Kept, not discarded, and that distinction is the whole design. Every folded
+# event goes into _folded, so /verbose can print what already scrolled past
+# rather than only changing what happens next. A fold you cannot open is a
+# deletion with better manners.
+#
+# Two things are never folded: the agent's actual reply, and the gate.
+# ---------------------------------------------------------------------------
+
+VERBOSE = bool(os.environ.get("GENPIPE_VERBOSE"))
+
+# Every folded event this session, in order, so /verbose can replay them.
+_folded = []
+
+# How many steps have been folded since the last thing that WAS drawn. Reset by
+# anything visible, so the marker counts this answer's working rather than the
+# session's.
+_folded_here = 0
+
+
+def set_verbose(on):
+    """Turn folding off (or back on). Returns the new setting."""
+    global VERBOSE
+    VERBOSE = bool(on)
+    return VERBOSE
+
+
+def replay():
+    """Draw every event folded so far. What /verbose shows for the work that
+    has already happened -- without this, turning verbose on would only affect
+    the next turn, which is never the turn you wanted it for."""
+    if not _folded:
+        nothing("Nothing has been folded away yet.")
+        return
+    print()
+    print(f"  {DIM}│ {len(_folded)} step(s), replayed{RESET}")
+    print()
+    for event in _folded:
+        _draw(event)
+
+
+def _fold(event):
+    """Set an event aside instead of drawing it."""
+    global _folded_here
+    _folded.append(event)
+    _folded_here += 1
+
+
+def _flush_fold():
+    """Say that working happened, in one line, then stop counting.
+
+    Printed before the thing that follows it, so the marker sits above the
+    answer it produced rather than orphaned at the end of the turn.
+    """
+    global _folded_here
+    if not _folded_here:
+        return
+    n = _folded_here
+    _folded_here = 0
+    print(f"  {DIM}│ {n} step{'s' if n > 1 else ''}"
+          f"  ·  /verbose to see the working{RESET}")
+
 
 def render(message):
     """Parse a message and draw what is worth drawing.
 
-    Two things are deliberately not drawn, and both are the same judgement --
-    that a transcript is for following the work, not for auditing the agent:
+    Three things are never drawn, at any verbosity, and all three are the same
+    judgement -- that a transcript is for following the work, not for auditing
+    the agent:
 
       the model's checklist   It re-emits the whole list every turn with one more
                               box ticked, which is six lines of repetition for one
-                              line of news. What it is doing now is on screen
-                              anyway, in the block underneath.
+                              line of news.
       documentation lookups   see _HIDDEN.
 
-    Everything else -- prose, code, output, answers, conclusions -- is shown.
+    Everything else is drawn when VERBOSE is on. When it is off -- the default --
+    only the person's own line and the agent's reply are drawn; the working is
+    folded away, counted, and kept for /verbose.
     """
     global _swallowing
     for event in parse(message):
@@ -606,7 +717,30 @@ def render(message):
         elif kind == "observation" and _swallowing:
             _swallowing = False
             continue
+        if not VERBOSE and kind in ("code", "observation", "note"):
+            _fold(event)
+            continue
+        if kind in ("solution", "prompt"):
+            _flush_fold()
+        if kind == "solution" and _DEFER_SOLUTION:
+            # /diagnose draws its own answer, once, after the whole thing has
+            # arrived and been parsed into sections. Letting the transcript draw
+            # it too would print the same conclusion twice in two different
+            # shapes -- the raw markdown first, the structured version under it.
+            continue
         _draw(event)
+
+
+# Set only while /diagnose is streaming. A global, like VERBOSE and
+# _swallowing, because render() is called from inside the graph's stream and
+# there is nowhere to thread an argument through.
+_DEFER_SOLUTION = False
+
+
+def defer_solution(on):
+    """Stop render() drawing <solution> blocks, so a caller can draw its own."""
+    global _DEFER_SOLUTION
+    _DEFER_SOLUTION = bool(on)
 
 # ---------------------------------------------------------------------------
 # The gate. The one moment the run stops and hands a decision to a human, so it
@@ -694,61 +828,253 @@ def environment(findings):
     print()
 
 
-def gate(proposal, thread_id, blockers=()):
+# Columns for the command mirror. The label column is narrower than the gate's
+# old 18 because the flag now sits beside it and the two together have to leave
+# room for a path -- 13 + 4 puts the value at column 23 of 74, which fits an
+# absolute ini path without wrapping in the common case.
+_MIRROR_LABEL = 13
+_MIRROR_FLAG = 4
+
+
+def _mirror_state(row, active, pending, changed):
+    """Which of the four states a mirror line is in, as (tint, strong).
+
+    Three states plus the default, and each gets a colour AND a marker at the
+    call site. Colour alone carries this badly -- it is the first thing a
+    terminal theme, a screenshot or a colour-blind reader flattens -- and the
+    whole point of the mirror is that somebody can SEE which line their cursor
+    is about to change.
+
+        pending   selected, not yet applied. Red. Reads as "about to move".
+        changed   applied, and this is the run coming back. Green.
+        active    the row under the cursor. Bright. Implies nothing -- it is
+                  where you are looking, not what you have chosen.
+
+    Checked in that order, so a row that is both active and pending reads as
+    pending: what a line is about to become matters more than where the cursor
+    happens to be resting.
+    """
+    if row is not None and row in pending:
+        return RED, f"{RED}{BOLD}"
+    if row is not None and row in changed:
+        return GREEN, f"{GREEN}{BOLD}"
+    if row is not None and row == active:
+        return WHITE, f"{BOLD}{WHITE}"
+    return DIM, ""
+
+
+def _mirror_body(line, tint, strong):
+    """One mirror line's text from the label column rightwards, and the
+    continuation lines its extra values need."""
+    label = f"{tint}{line.label:<{_MIRROR_LABEL}}{RESET}"
+    flag = f"{tint}{line.flag:<{_MIRROR_FLAG}}{RESET}"
+    values = [_tilde(v) for v in line.values]
+    body = f"{strong}{values[0]}{RESET}" if values else ""
+    if line.note:
+        # A warning keeps its red whatever state the line is in; an observation
+        # takes the line's own tint, so a row nobody has touched stays quiet.
+        aside = RED if line.warn else (tint or DIM)
+        body = (f"{body}  {DIM}{line.note}{RESET}" if body
+                else f"{aside}{line.note}{RESET}")
+    # A `-c` stack is the one row that is routinely several values, and stacking
+    # them under each other is the only way its ORDER stays readable -- which is
+    # the whole meaning of an ini stack.
+    return f"{label}{flag}{body}", [f"{strong or DIM}{v}{RESET}" for v in values[1:]]
+
+
+def mirror_lines(m, active=None, pending=(), changed=(), indent="      "):
+    """The command mirror as a list of printable lines, for the gate.
+
+    Returned rather than printed because it is drawn in two very different
+    places: the gate prints it once and moves on, while modify_panel() repaints
+    it on every cursor move with a checkbox beside each changeable line. A
+    function that printed could not serve the second, and two renderers would
+    drift on exactly the detail that has to match -- which line a row owns.
+    """
+    if not m:
+        return []
+    pending, changed = set(pending or ()), set(changed or ())
+    out = []
+    pad = " " * (_MIRROR_LABEL + _MIRROR_FLAG)
+
+    for line in m.lines:
+        tint, strong = _mirror_state(line.row, active, pending, changed)
+        mark = (f"{RED}●{RESET}" if line.row in pending else
+                f"{GREEN}●{RESET}" if line.row in changed else
+                f"{GREEN}❯{RESET}" if line.row is not None and line.row == active
+                else " ")
+        if line.head:
+            out.append(f"{indent[:-2]}{mark} {strong or f'{BOLD}{WHITE}'}"
+                       f"{line.value}{RESET}")
+            out.append("")
+            continue
+        body, extras = _mirror_body(line, tint, strong)
+        out.append(f"{indent[:-2]}{mark} {body}")
+        out.extend(f"{indent}{pad}{extra}" for extra in extras)
+    return out
+
+
+# Where the label column starts in the /modify panel: two spaces, the cursor
+# arrow, a space, the checkbox, then three. Wider than the gate's gutter because
+# the panel has two markers to fit where the gate has one.
+_PANEL_GUTTER = 8
+
+
+def modify_panel(m, options, extras=(), changed=(), required=()):
+    """The /modify chooser: the command itself, with a box beside what can move.
+
+    Returns a draw function for ui.choose, not lines, because the panel is
+    repainted on every keystroke and only ui.choose knows where the cursor is.
+
+    THE MIRROR IS THE LIST. The obvious build -- a mirror printed above a
+    separate menu of row names -- was tried on paper and is worse than either
+    half alone: every changeable row appears twice, three lines apart, and the
+    person has to hold the mapping between the two columns in their head while
+    the thing they are trying to read is a command. Here there is one list. A
+    line you can change has a box; a line you cannot -- `-g cmd.sh`, `-j slurm`
+    -- has none and is simply shown, because "what else is in this command" is a
+    question the panel should answer without being asked.
+
+        options   the row keys the cursor moves through, in ui.choose's order.
+                  Every one that names a mirror line gets that line's box.
+        extras    trailing rows with no line of their own, as (value, label,
+                  description) -- 'something else…' and nothing else so far.
+        changed   rows a previous round already moved. Green, and they stay
+                  green while the next set is being picked, so a second pass
+                  through /modify can see what the first one did.
+        required  rows an earlier answer has made mandatory, as {row: why}.
+                  Drawn red with the reason beside them whether or not they are
+                  selected, because "you have to answer this" is a fact about
+                  the row, not a state somebody put it in.
+    """
+    lines = list(m.lines) if m else []
+    index = {row: i for i, row in enumerate(options)}
+    required = dict(required or {})
+    pad = " " * (_PANEL_GUTTER + _MIRROR_LABEL + _MIRROR_FLAG)
+
+    def draw(cursor, picked):
+        active = options[cursor] if 0 <= cursor < len(options) else None
+        pending = {options[i] for i in picked if 0 <= i < len(options)}
+        out = []
+
+        for line in lines:
+            slot = index.get(line.row)
+            tint, strong = _mirror_state(line.row, active, pending, changed)
+            if line.row in required:
+                tint, strong = RED, f"{RED}{BOLD}"
+            if slot is None:
+                gutter = " " * _PANEL_GUTTER
+            else:
+                arrow = f"{GREEN}❯{RESET}" if slot == cursor else " "
+                box = (f"{RED}◉{RESET}" if slot in picked
+                       else f"{RED}◯{RESET}" if line.row in required
+                       else f"{DIM}◯{RESET}")
+                gutter = f"  {arrow} {box}   "
+            if line.head:
+                out.append(f"{gutter}{strong or f'{BOLD}{WHITE}'}"
+                           f"{line.value}{RESET}")
+                out.append("")
+                continue
+            body, more = _mirror_body(line, tint, strong)
+            if line.row in required:
+                body = f"{body}  {RED}required — {required[line.row]}{RESET}"
+            out.append(f"{gutter}{body}")
+            out.extend(f"{pad}{extra}" for extra in more)
+
+        for value, label, note in extras:
+            slot = index.get(value)
+            if slot is None:
+                continue
+            arrow = f"{GREEN}❯{RESET}" if slot == cursor else " "
+            box = f"{RED}◉{RESET}" if slot in picked else f"{DIM}◯{RESET}"
+            tint = (RED if slot in picked else
+                    f"{BOLD}{WHITE}" if slot == cursor else "")
+            out.append(f"  {arrow} {box}   {tint}{label}{RESET}"
+                       f"   {DIM}{note}{RESET}")
+        return out
+
+    return draw
+
+
+def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
+         resources=""):
     """Print the submission gate: what is about to run, and how to answer it.
 
-    The approve/reject commands are printed here on purpose. The moment you are
-    asked to make a decision is the worst moment to be recalling an API.
+    The three commands are printed here on purpose. The moment you are asked to
+    make a decision is the worst moment to be recalling an API.
+
+    Each one carries its consequence on a line beneath it, and that is the whole
+    change from the version that printed bare command names. This is the single
+    point in the product where consequences matter, and "approve" and "reject"
+    are not self-explanatory when one of them spends an allocation and cannot be
+    undone and the other quietly abandons a run. The consequence goes on its own
+    line rather than in a trailing column, because a trailing column breaks
+    alignment the moment a run name is long.
 
     `blockers` are environment findings that would make this submission fail no
     matter how good the command is. When there are any, the approve line is
-    replaced rather than merely annotated: offering an action that cannot work,
+    removed rather than merely annotated: offering an action that cannot work,
     next to an explanation of why it cannot work, invites trying it anyway.
-    """
-    slots = proposal.get("slots") or {}
+    /modify and /reject stay, because both are still things you can usefully do.
 
-    rows = []
-    if slots.get("protocol"):
-        rows.append(("protocol", slots["protocol"]))
-    if slots.get("steps"):
-        rows.append(("steps", slots["steps"]))
-    if slots.get("inis"):
-        # dict.fromkeys de-duplicates while keeping order: the same ini can be
-        # matched twice, once by full path and once by bare filename.
-        rows.append(("config", " , ".join(dict.fromkeys(slots["inis"]))))
-    if slots.get("design"):
-        rows.append(("design", os.path.basename(str(slots["design"]))))
-    if slots.get("pairs"):
-        rows.append(("pairs", os.path.basename(str(slots["pairs"]))))
-    if slots.get("output_dir"):
-        rows.append(("output", slots["output_dir"]))
-    else:
-        rows.append(("output", f"{RED}cwd (no -o flag){RESET}"))
+    `warnings` are risks that do not block -- a step range that skips a
+    dependency, a protocol switch that now wants a design file. They are shown
+    here, at the moment of decision, and not earlier, because that is when
+    somebody is actually reading.
+
+    `changed` are the rows a /modify just moved, drawn green in the mirror. It
+    is what makes the returning gate legible: the box is otherwise identical to
+    the one rejected a moment ago, and having to diff two screens by eye to
+    confirm a change landed is how somebody approves a command they did not
+    mean to.
+    """
+    _flush_fold()
 
     print("\n")
     print(f"  {RED}{REVERSE}{BOLD} HOLD {RESET}  {RED}{UNDER}submission requires approval{RESET}")
     print()
     print(f"      {BOLD}{WHITE}{proposal.get('command', '?')}{RESET}")
-    print()
-    for label, value in rows:
-        print(f"      {DIM}{label:<18}{RESET}{value}")
-    if rows:
+    # `bash cmd.sh` is what runs and says nothing on its own -- two runs a week
+    # apart submit the same three words -- so what that script was BUILT from is
+    # the part worth reading, and with the agent's working folded away by
+    # default this is the only place it is seen before it is approved. Laid out
+    # by mirror.py rather than wrapped as prose: the people this is for know a
+    # GenPipes command by its shape, and a paragraph does not have one.
+    m = (mirror.read(proposal.get("generated"), name=thread_id,
+                     resources=resources)
+         or mirror.from_slots(proposal, name=thread_id, resources=resources))
+    drawn = mirror_lines(m, changed=changed)
+    if drawn:
         print()
+        for line in drawn:
+            print(line)
+        print()
+
+    for text in warnings or ():
+        first, _, rest = str(text).partition("\n")
+        print(f"      {AMBER}{'warning':<17}{RESET}{first}")
+        for line in rest.splitlines():
+            print(f"      {'':<17}{DIM}{line}{RESET}")
+    if warnings:
+        print()
+
     if blockers:
         for finding in blockers:
-            print(f"      {RED}{'cannot submit':<18}{RESET}"
+            print(f"      {RED}{'cannot submit':<17}{RESET}"
                   f"{finding.variable} {finding.problem}")
-            print(f"      {DIM}{'fix':<18}{RESET}{WHITE}{finding.fix}{RESET}")
+            print(f"      {DIM}{'fix':<17}{RESET}{WHITE}{finding.fix}{RESET}")
         print()
-        print(f"      {DIM}{'reject':<18}{RESET}/reject {WHITE}{thread_id}{RESET} \u2026")
-        print()
-        print(f"  {DIM}Nothing has reached the scheduler. Fix the above and "
-              f"restart to approve.{RESET}")
-        print("\n")
-        return
+    else:
+        print(f"      {DIM}{'approve':<17}{RESET}/approve {WHITE}{thread_id}{RESET}")
+        print(f"      {'':<17}{DIM}submits to Slurm \u2014 cannot be undone{RESET}")
 
-    print(f"      {DIM}{'approve':<18}{RESET}/approve {WHITE}{thread_id}{RESET}")
-    print(f"      {DIM}{'reject':<18}{RESET}/reject {WHITE}{thread_id}{RESET} \u2026")
+    print(f"      {DIM}{'modify':<17}{RESET}/modify {WHITE}{thread_id}{RESET} "
+          f"{DIM}<what to change>{RESET}")
+    print(f"      {'':<17}{DIM}rewrites the command, asks you again{RESET}")
+    print(f"      {'':<17}{DIM}omit the change to pick from what's there{RESET}")
+    print(f"      {DIM}{'reject':<17}{RESET}/reject {WHITE}{thread_id}{RESET} "
+          f"{DIM}[why]{RESET}")
+    print(f"      {'':<17}{DIM}abandons this run; nothing is submitted{RESET}")
     print()
     print(f"  {DIM}Nothing has reached the scheduler.{RESET}")
     print("\n")
@@ -801,20 +1127,218 @@ def post_approve(thread_id, approved):
 
 BAR_WIDTH = 46
 
-_BAD = {"FAILED", "TIMEOUT", "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY",
-        "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
-# States meaning this job itself broke. CANCELLED is not one: a GenPipes failure
-# cancels everything downstream of it, so those jobs never ran. Kept in step with
-# runs.BROKE_STATES, and separate from _BAD because both distinctions are needed
-# -- red still marks anything wrong, but the counts must not conflate the two.
-_BROKE = _BAD - {"CANCELLED"}
+# How many of a root cause's jobs /check names before it stops counting them
+# out, and how wide their names get. Six is enough for the shapes that actually
+# happen -- a tumour/normal pair, a handful of samples -- and short enough that
+# the tally above it stays on screen. Past that the answer is /jobs, which
+# exists to list all of them.
+_CAUSE_JOBS = 6
+_CAUSE_NAME_W = 34
+
+# Imported, not restated. These lived here as a second copy of runs.BAD_STATES
+# and runs.BROKE_STATES, which is two literals that have to be edited together
+# forever and will not be. runs.py is stdlib-only, so this costs nothing.
+from .runs import BAD_STATES as _BAD, BROKE_STATES as _BROKE  # noqa: E402
+
 _ORDER = ["COMPLETED", "RUNNING", "PENDING", "FAILED", "TIMEOUT",
           "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED",
           "BOOT_FAIL", "DEADLINE", "UNKNOWN"]
 
 
+def _bar(status):
+    """The progress bar, one glyph per job state.
+
+    Broke and cancelled are drawn differently on purpose: two red blocks among
+    forty dim ones sends the eye to the cause rather than to the casualties,
+    which is the whole shape of a GenPipes failure. A failure that would round
+    away to zero width still gets one character -- one failed job out of six
+    hundred is exactly the case you must not lose.
+    """
+    total = status.total or 1
+    counts = status.counts or {}
+    broke = sum(n for s, n in counts.items() if s in _BROKE)
+    cancelled = counts.get("CANCELLED", 0)
+    unknown = counts.get("UNKNOWN", 0)
+    done = counts.get("COMPLETED", 0)
+    live = counts.get("RUNNING", 0)
+
+    def width(n, floor=0):
+        w = int(round(BAR_WIDTH * n / total))
+        return max(w, floor) if n else 0
+
+    n_broke = width(broke, 1)
+    n_unknown = width(unknown, 1)
+    n_done = width(done)
+    n_live = width(live)
+    n_cancel = width(cancelled, 1)
+    used = n_done + n_live + n_broke + n_cancel + n_unknown
+    n_rest = max(BAR_WIDTH - used, 0)
+
+    return (f"{WHITE}{'▓' * n_done}{RESET}"
+            f"{WHITE}{'▒' * n_live}{RESET}"
+            f"{RED}{'█' * n_broke}{RESET}"
+            f"{RED}{DIM}{'▒' * n_cancel}{RESET}"
+            f"{RED}{'?' * n_unknown}{RESET}"
+            f"{DIM}{'░' * n_rest}{RESET}")
+
+
+def _tally_table(status, gutter):
+    """The state table. Only states actually present get a row -- a column of
+    zeroes is noise -- and the total row is there to prove the denominator."""
+    print(f"{gutter}  {DIM}{'state':<20}{'number of jobs':>14}{'%':>8}{RESET}")
+    print(f"{gutter}  {DIM}{'─' * 42}{RESET}")
+    present = [s for s in _ORDER if s in status.counts]
+    present += [s for s in status.counts if s not in _ORDER]
+    for state in present:
+        n = status.counts[state]
+        colour = RED if state in _BAD or state == "UNKNOWN" else DIM
+        emphasis = BOLD if state in _BROKE or state == "UNKNOWN" else ""
+        pct = 100.0 * n / status.total if status.total else 0.0
+        print(f"{gutter}  {colour}{emphasis}{state:<20}{RESET}"
+              f"{colour}{n:>14}{pct:>8.1f}{RESET}")
+    print(f"{gutter}  {DIM}{'─' * 42}{RESET}")
+    print(f"{gutter}  {DIM}{'total':<20}{status.total:>14}{100.0 if status.total else 0.0:>8.1f}{RESET}")
+
+
+def _job_tail(job, step):
+    """A job name with its step prefix removed, trimmed from the LEFT if it is
+    still too long.
+
+    GenPipes names jobs `<step>.<sample>`, and under a heading that already says
+    the step the prefix is thirty characters of the word you just read. Worse,
+    it is thirty characters at the FRONT: truncating on the right turned
+    `gatk_sam_to_fastq.tumorPair_COLO829N` and `...COLO829T` into two identical
+    rows, deleting the one letter that said which was the tumour and which the
+    normal. What distinguishes these names is always at the end, so that is the
+    end that survives.
+    """
+    text = str(job or "?")
+    if step and text.startswith(f"{step}."):
+        text = text[len(step) + 1:]
+    return text if len(text) <= _CAUSE_NAME_W else "…" + text[-(_CAUSE_NAME_W - 1):]
+
+
+def run_status(name, status):
+    """/check <name> -- what the scheduler says this run is doing.
+
+    Everything drawn here comes from runs.resolve(), which asks sacct and, only
+    when something is still in the queue, squeue. Nothing is read off the
+    filesystem, which is the entire point: the artifacts GenPipes leaves are
+    written by the jobs themselves, so a job that never started and a job that
+    was killed leave the same trace as a job that has not got to it yet.
+
+    The footer is provenance, not decoration. It names which tools were actually
+    queried and how many of the manifest's jobs they accounted for, so
+    "44/46 resolved · 2 UNKNOWN" is visible rather than rounded away into a
+    percentage that looks fine.
+    """
+    gutter = f"  {DIM}▌{RESET}"
+
+    if status.source == "unavailable":
+        print()
+        print(f"{gutter} {BOLD}{name}{RESET}  {DIM}·{RESET}  "
+              f"{RED}could not reach the scheduler{RESET}")
+        print(gutter)
+        print(f"{gutter}   {DIM}{status.total} job(s) in the manifest, no state "
+              f"for any of them{RESET}")
+        print(f"{gutter}   {DIM}nothing is guessed from files on disk — see "
+              f"runs.resolve{RESET}")
+        print()
+        return
+
+    if not status.total:
+        print()
+        print(f"{gutter} {BOLD}{name}{RESET}  {DIM}·{RESET}  {DIM}no jobs{RESET}")
+        print(gutter)
+        print(f"{gutter}   {DIM}the job list is empty — nothing was submitted "
+              f"under this name{RESET}")
+        print()
+        return
+
+    verdict = (f"{RED}{status.verdict}{RESET}"
+               if (status.doomed or any(s in _BAD for s in status.counts)
+                   or status.unknown)
+               else f"{DIM}{status.verdict}{RESET}")
+
+    print()
+    print(f"{gutter} {BOLD}{name}{RESET}  {DIM}·{RESET}  {verdict}")
+    print(gutter)
+    print(f"{gutter}  {_bar(status)}  {BOLD}{status.percent:.0f}% done{RESET}")
+    print(gutter)
+    _tally_table(status, gutter)
+
+    cause = status.root_cause
+    if cause:
+        print(gutter)
+        print(f"{gutter}  {RED}{'root cause':<20}{RESET}{WHITE}{cause['step']}{RESET}"
+              f"  {DIM}·{RESET}  {cause['count']} job(s) "
+              f"{(cause['state'] or '').lower()}")
+        if cause.get("timelimit"):
+            print(f"{gutter}  {'':<20}{DIM}against a limit of "
+                  f"{cause['timelimit']}{RESET}")
+        # The jobs themselves. Named here rather than left to /jobs, because a
+        # root cause without its jobs is a count: "2 job(s) timeout" does not
+        # say that one is the tumour and one the matched normal, or that they
+        # died 28 seconds apart. Capped, because one step failing across ninety
+        # samples is a normal shape and printing ninety rows buries the tally
+        # above it.
+        listed = cause.get("jobs") or []
+        for job in listed[:_CAUSE_JOBS]:
+            detail = job.get("elapsed") or ""
+            if job.get("maxrss"):
+                detail = f"{detail}  {job['maxrss']}".strip()
+            print(f"{gutter}  {'':<20}"
+                  f"{DIM}{_job_tail(job.get('name'), cause['step']):<{_CAUSE_NAME_W}}"
+                  f"{RESET}{DIM}{detail}{RESET}")
+        if len(listed) > _CAUSE_JOBS:
+            print(f"{gutter}  {'':<20}{GREY}+{len(listed) - _CAUSE_JOBS} more"
+                  f"{RESET}")
+        if cause.get("maxrss") and not listed:
+            print(f"{gutter}  {'':<20}{DIM}peak memory {cause['maxrss']}{RESET}")
+        if cause.get("cancelled_after"):
+            print(f"{gutter}  {'':<20}{DIM}{cause['cancelled_after']} job(s) "
+                  f"cancelled downstream — they never started{RESET}")
+
+    if status.reasons:
+        print(gutter)
+        for i, (reason, n) in enumerate(sorted(status.reasons.items(),
+                                               key=lambda kv: -kv[1])):
+            label = "waiting on" if i == 0 else ""
+            doomed = reason == "DependencyNeverSatisfied"
+            colour = RED if doomed else DIM
+            note = ("these will never run" if doomed else
+                    "queued, waiting for a slot" if reason == "Priority" else
+                    "upstream steps not finished yet" if reason.startswith("Depend")
+                    else "")
+            print(f"{gutter}  {DIM}{label:<20}{RESET}{colour}{n:>3}  "
+                  f"{reason:<26}{RESET}{DIM}{note}{RESET}")
+
+    for job in status.at_risk or ():
+        print(gutter)
+        print(f"{gutter}  {AMBER}⚠{RESET}  {WHITE}{job.name}{RESET}   "
+              f"{DIM}{job.elapsed} of {job.timelimit}   near its limit{RESET}")
+
+    if any(s in _BROKE for s in status.counts):
+        print(gutter)
+        print(f"{gutter}  {DIM}/diagnose {RESET}{WHITE}{name}{RESET}"
+              f"{DIM}    read what the logs say{RESET}")
+        print(f"{gutter}  {DIM}/jobs {RESET}{WHITE}{name}{RESET}"
+              f"{DIM}   every job and its state{RESET}")
+
+    print(gutter)
+    resolved = (f"{RED}{status.resolved}/{status.total} jobs resolved · "
+                f"{status.unknown} UNKNOWN{RESET}" if status.unknown
+                else f"{status.resolved}/{status.total} jobs resolved")
+    print(f"{gutter}  {DIM}{status.source}  ·  {resolved}{DIM}  ·  {status.at}{RESET}")
+    print()
+
+
 def status(name, parsed, raw=""):
     """Draw a run's progress from log_report's already-parsed counts.
+
+    Kept for /diagnose and for the fake-cluster tests, which still exercise the
+    log_report path. Nothing on the /check path reaches this any more -- see
+    run_status() and the comment above runs.resolve() for why.
 
     The parsing lives in runs.parse_log_report -- this only draws. If no total
     was found the raw text is printed unchanged: better to show something
@@ -939,6 +1463,10 @@ _STATUS_TAG = {
     "held": lambda: f"{RED}{BOLD}held{RESET}",
     "submitted": lambda: f"{GREEN}live{RESET}",
     "gone": lambda: f"{DIM}gone{RESET}",
+    # Terminal, and grey rather than red: it is not a problem, it is a decision
+    # somebody made. It only ever appears in /history -- /list filters it out,
+    # which is the entire reason the status exists.
+    "abandoned": lambda: f"{DIM}abandoned{RESET}",
 }
 
 
@@ -976,7 +1504,8 @@ def run_list(records):
             cmd = ((r.get("proposal") or {}).get("command") or "").strip()
             if cmd:
                 print(f"  {DIM}\u258c{RESET}   {WHITE}{cmd}{RESET}")
-            print(f"  {DIM}\u258c{RESET}   {GREY}awaiting your approval{RESET}")
+            print(f"  {DIM}\u258c{RESET}   {GREY}awaiting your approval{RESET}"
+                  f"   {DIM}/approve \u00b7 /modify \u00b7 /reject{RESET}")
         else:
             snap = _snapshot(r)
             if snap:
@@ -989,7 +1518,10 @@ def run_list(records):
                 print(f"  {DIM}\u258c{RESET}   {GREY}no jobs \u2014 everything was already "
                       f"up to date{RESET}")
     print(f"  {DIM}\u258c{RESET}")
-    print(f"  {DIM}\u258c   /check <name> \u00b7 /jobs <name> \u00b7 /why <name>{RESET}")
+    print(f"  {DIM}\u258c   /check all \u00b7 /check <name> \u00b7 /jobs <name> \u00b7 "
+          f"/diagnose <name>{RESET}")
+    print(f"  {DIM}\u258c   /sort to hide rows \u00b7 /scan <path> to adopt runs "
+          f"already on disk{RESET}")
     print()
 
 
@@ -997,7 +1529,7 @@ def history(records):
     """/history -- every recorded run, live and gone, newest first.
 
     A gone entry is shown, marked as such, so a run can still be found after its
-    job_list file has been cleaned up from Rorqual. Notes left by /why are shown
+    job_list file has been cleaned up from Rorqual. Notes left by /diagnose are shown
     too: months later, "OOM in picard_mark_duplicates" is the only part of this
     record anyone still wants."""
     print()
@@ -1072,9 +1604,9 @@ def jobs(name, job_list, only_failed=False):
               f"{DIM}{detail}{RESET}")
     print(f"  {DIM}\u258c{RESET}")
     if broke:
-        # Offered only when something actually broke: /why on a run whose jobs
+        # Offered only when something actually broke: /diagnose on a run whose jobs
         # were merely cancelled downstream has nothing to diagnose.
-        print(f"  {DIM}\u258c   /why {WHITE}{name}{RESET}{DIM} to diagnose{RESET}")
+        print(f"  {DIM}\u258c   /diagnose {WHITE}{name}{RESET}{DIM} to diagnose{RESET}")
     print()
 
 
@@ -1108,6 +1640,92 @@ def triage(name, report):
     print(f"  {RED}\u258c{RESET}")
     print(f"  {DIM}  reading the logs, then explaining{RESET}")
     print()
+
+
+def diagnosis(name, parsed, logs=()):
+    """What /diagnose concluded, drawn rather than dumped.
+
+    The old ending printed the model's markdown straight to the terminal:
+    asterisks, backticks, fenced ini blocks and all. It read as a chat window
+    that had escaped into a tool, and it buried the two things somebody actually
+    needs -- what to change, and what to type next -- in the middle of a wall of
+    justified prose.
+
+    So it is drawn in the same house style as the gate: manner and cause as
+    separate claims, because they are separate claims; the evidence indented
+    under them; and the fix at the bottom next to the command that applies it.
+    An answer the model did not shape falls back to its own prose, printed
+    plainly. See diagnosis.parse -- degrading to the old behaviour is a
+    requirement, not an accident.
+
+    `logs` are the log files the evidence came from, printed in full. The point
+    is not that anybody reads them here; it is that "go and look yourself" stops
+    being an invitation without an address.
+    """
+    if not parsed.get("shaped"):
+        print()
+        for line in (parsed.get("prose") or "").splitlines():
+            print(f"  {line}" if line.strip() else "")
+        print()
+        return
+
+    confidence = parsed.get("confidence")
+    tint = {"certain": WHITE, "likely": AMBER, "unclear": RED}.get(confidence, DIM)
+
+    print()
+    print(f"  {RED}▌{RESET} {BOLD}{name}{RESET}  {DIM}·{RESET}  "
+          f"{DIM}diagnosis{RESET}"
+          + (f"   {tint}{confidence}{RESET}" if confidence else ""))
+    print(f"  {RED}▌{RESET}")
+    for label, key in (("died", "manner"), ("because", "cause")):
+        if parsed.get(key):
+            _labelled(f"  {RED}▌{RESET}", label, parsed[key])
+    if parsed.get("evidence"):
+        print(f"  {RED}▌{RESET}")
+        for i, item in enumerate(parsed["evidence"]):
+            _labelled(f"  {RED}▌{RESET}", "evidence" if i == 0 else "", item,
+                      style=DIM)
+    if logs:
+        print(f"  {RED}▌{RESET}")
+        for i, path in enumerate(logs):
+            _labelled(f"  {RED}▌{RESET}", "read it yourself" if i == 0 else "",
+                      _tilde(str(path)), style=DIM, wrap=False)
+    if parsed.get("fix"):
+        print(f"  {RED}▌{RESET}")
+        _labelled(f"  {RED}▌{RESET}", "fix", parsed["fix"], style=WHITE)
+    for section, keys in (parsed.get("override") or {}).items():
+        print(f"  {RED}▌{RESET}")
+        print(f"  {RED}▌{RESET}   {'':<18}{WHITE}[{section}]{RESET}")
+        for key, value in keys.items():
+            print(f"  {RED}▌{RESET}   {'':<18}{DIM}{key} = {RESET}{value}")
+    if parsed.get("relaunch"):
+        print(f"  {RED}▌{RESET}")
+        _labelled(f"  {RED}▌{RESET}", "resubmit", parsed["relaunch"])
+        print(f"  {RED}▌{RESET}   {'':<18}{DIM}the whole range — GenPipes skips "
+              f"steps that already have output{RESET}")
+    print(f"  {RED}▌{RESET}")
+    if parsed.get("override"):
+        print(f"  {RED}▌{RESET}   {DIM}/modify {RESET}{WHITE}{name}{RESET}"
+              f"{DIM}   writes this into the run's override ini{RESET}")
+    print(f"  {RED}▌{RESET}   {DIM}/jobs {RESET}{WHITE}{name}{RESET}"
+          f"{DIM}    every job and its state{RESET}")
+    print()
+
+
+def _labelled(gutter, label, text, style="", wrap=True):
+    """A label column and a wrapped body, the shape the gate uses. The label is
+    printed once and the continuation lines align under the body, so a long
+    sentence stays one visual block instead of becoming several rows.
+
+    `wrap=False` is for paths. Wrapping one breaks it across lines mid-token,
+    which costs the only thing a printed path is for: being copied. Letting the
+    terminal overflow is uglier and works.
+    """
+    body = (textwrap.wrap(str(text), max(24, WIDTH - 26)) or [""] if wrap
+            else [str(text)])
+    for i, line in enumerate(body):
+        shown = label if i == 0 else ""
+        print(f"{gutter}   {DIM}{shown:<18}{RESET}{style}{line}{RESET}")
 
 
 def pending(records):
@@ -1148,4 +1766,259 @@ def where(paths):
     width = max(len(k) for k, _ in paths) + 2
     for label, value in paths:
         print(f"  {DIM}\u258c{RESET} {DIM}{label:<{width}}{RESET}{_tilde(str(value))}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# The multi-run view. /check all.
+#
+# There were briefly two of these -- a flat table under /check all and a grouped
+# one under /status all -- rendering the same query in two layouts, with
+# /status <name> an exact alias for /check <name>. Two layouts of one query is
+# one layout too many. The grouped one won, because the question a listing
+# answers is "what should I be doing" and the answer to that is never
+# chronological; the flat one's progress figure moved into these rows.
+# ---------------------------------------------------------------------------
+
+# What /check all sorts runs into. Three categories, because there are three
+# things a person does with a listing: leave it alone, act on it, or forget it.
+ACTIVE = "ACTIVE"
+ATTENTION = "NEEDS ATTENTION"
+FINISHED = "FINISHED"
+
+
+def status_overview(groups):
+    """/check all -- every registered run, grouped by what it needs from you.
+
+    NEEDS ATTENTION first and always, whatever it contains, because a listing
+    whose most urgent group is below the fold is a listing that trained you to
+    scroll. Blank lines between the title and its first row, and more between
+    groups, so the groups stay separable at a glance rather than reading as one
+    long table with headings in it.
+
+    No paths, no job-list filenames, no log excerpts. This is an overview; the
+    evidence lives behind /check <name> and /diagnose.
+    """
+    order = [ATTENTION, ACTIVE, FINISHED]
+    if not any(groups.get(k) for k in order):
+        nothing("No runs registered yet.",
+                "/scan <path> adopts runs that already exist on disk.")
+        return
+
+    for title in order:
+        rows = groups.get(title) or []
+        if not rows:
+            continue
+        colour = RED if title == ATTENTION else (WHITE if title == ACTIVE else DIM)
+        print()
+        print(f"  {colour}{BOLD}{title}{RESET}  {DIM}({len(rows)}){RESET}")
+        print()
+        for row in rows:
+            what = "  ·  ".join(x for x in (row.get("what"), row.get("when")) if x)
+            print(f"    {BOLD}{row['name']}{RESET}"
+                  + (f"   {DIM}{what}{RESET}" if what else ""))
+            print(f"      {DIM}{row.get('line', '')}{RESET}")
+            if row.get("suggest"):
+                print(f"      {DIM}{row['suggest']}{RESET}")
+        print()
+
+    print(f"  {DIM}/check <name>{RESET}{DIM}  ·  /diagnose <name>  ·  /jobs <name>"
+          f"  ·  /scan [path]{RESET}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Confirmations for the new gate verbs and for /scan. All three mirror
+# post_approve()'s shape so the outcomes of a decision read as one family.
+# ---------------------------------------------------------------------------
+
+def abandoned(name, reason=None):
+    """/reject, which is now terminal. Says plainly that nothing was submitted,
+    because "rejected" used to mean "sent back for rework" and somebody who
+    learned it that way has to be told it no longer does."""
+    print()
+    print(f"  {DIM}▌ {BOLD}{name}{RESET}  {DIM}·{RESET}  {DIM}abandoned{RESET}")
+    if reason:
+        print(f"  {DIM}▌{RESET}   {GREY}{reason}{RESET}")
+    print(f"  {DIM}▌{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}nothing was submitted  ·  /history to see it{RESET}")
+    print()
+
+
+def renamed(old, new):
+    """A rename is a registry write and nothing else -- no model call, no
+    regeneration, no new command. Saying so is the point of the second line:
+    every other row at the gate changes what would run."""
+    print()
+    print(f"  {DIM}▌{RESET} {DIM}{old}{RESET}  {DIM}→{RESET}  {BOLD}{new}{RESET}")
+    print(f"  {DIM}▌{RESET} {DIM}still held  ·  nothing regenerated{RESET}")
+    print()
+
+
+def now_required(rows):
+    """Rows a change just made mandatory, announced before they are asked.
+
+    Announced as a set, ahead of the prompts, rather than arriving one at a
+    time. Being asked three unexpected questions in a row feels like a form that
+    will not end; being told "changing the pipeline means three things have to
+    move, here they are" is the same three questions with a reason attached, and
+    the reason is what makes them answerable.
+    """
+    if not rows:
+        return
+    print()
+    n = len(rows)
+    print(f"  {RED}▌{RESET} {BOLD}{n} more {'answer' if n == 1 else 'answers'} "
+          f"needed{RESET}  {DIM}·{RESET}  {DIM}that change invalidated "
+          f"{'it' if n == 1 else 'them'}{RESET}")
+    print(f"  {RED}▌{RESET}")
+    for row, why in rows.items():
+        print(f"  {RED}▌{RESET}   {RED}{row:<12}{RESET}{GREY}{why}{RESET}")
+    print()
+
+
+def still_required(rows):
+    """Rows that were asked, left unanswered, and still matter.
+
+    Not a refusal. The change goes through, because a flow that will not let you
+    out is worse than a run you were warned about -- and GenPipes' own
+    generation is the authoritative check, which will name exactly what it
+    rejected. This is the warning that makes that rejection legible when it
+    comes.
+    """
+    if not rows:
+        return
+    print()
+    print(f"  {AMBER}▌{RESET} {BOLD}left unanswered{RESET}  {DIM}·{RESET}  "
+          f"{DIM}generation may refuse this{RESET}")
+    for row, why in rows.items():
+        print(f"  {AMBER}▌{RESET}   {AMBER}{row:<12}{RESET}{GREY}{why}{RESET}")
+    print()
+
+
+def overrides(name, rows, path):
+    """What the private override ini is about to say, before it is written.
+
+    Shown as the file's own contents rather than as "3 settings changed",
+    because this is the one artifact of a /modify that outlives the session:
+    it sits on the `-c` line, it wins over every GenPipes ini, and somebody will
+    open it in six weeks. Seeing it in the shape it will have on disk is what
+    makes it recognisable then.
+
+    The path is printed in full for the same reason, and the last line says
+    where it lands in the stack -- an override ini that is not last is silently
+    overruled, which looks exactly like a change that did not take.
+    """
+    print()
+    if not rows:
+        print(f"  {DIM}▌ {BOLD}{name}{RESET}  {DIM}·{RESET}  "
+              f"{DIM}no overrides{RESET}")
+        print()
+        return
+    print(f"  {DIM}▌ {BOLD}{name}{RESET}  {DIM}·{RESET}  "
+          f"{DIM}private overrides{RESET}")
+    print(f"  {DIM}▌{RESET}")
+    step = None
+    for this, label, value in rows:
+        if this != step:
+            step = this
+            print(f"  {DIM}▌{RESET}   {WHITE}[{step}]{RESET}")
+        print(f"  {DIM}▌{RESET}     {DIM}{label:<14}{RESET}{value}")
+    print(f"  {DIM}▌{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}{_tilde(path)}{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}goes last on -c, so it wins over every "
+          f"GenPipes ini{RESET}")
+    print()
+
+
+def forked(original, new):
+    """A /modify that made a second run instead of rewriting the first.
+
+    Both names are printed, and the original first, because the whole reason to
+    fork is that you want to keep it -- and a confirmation that named only the
+    new run would leave somebody wondering what happened to the old one at the
+    exact moment they were trying not to lose it.
+    """
+    print()
+    print(f"  {DIM}▌{RESET} {BOLD}{new}{RESET}  {DIM}·{RESET}  "
+          f"{DIM}held, a variant of {original}{RESET}")
+    print(f"  {DIM}▌{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}{original} is unchanged and still held{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}both are waiting  ·  /list{RESET}")
+    print()
+
+
+def change_plan(deltas, notes=()):
+    """The apply screen for a guided /modify: every change as old → new.
+
+    Shown for every change set, including a single row. It used to be skipped
+    for one change on the grounds that the re-rendered gate is already the
+    review -- true when the only question was "apply or not", and false now that
+    the screen underneath it asks which of four things should happen to the
+    change. Holding it for later and forking it into a second run are not
+    confirmations of a decision already made; they are the decision.
+    """
+    print()
+    print(f"  {GREEN}▌{RESET} {BOLD}Ready to apply{RESET}")
+    print()
+    width = max((len(d[0]) for d in deltas), default=8) + 4
+    for slot, old, new in deltas:
+        old_text = old if old not in (None, "") else "—"
+        print(f"    {WHITE}{slot:<{width}}{RESET}{DIM}{old_text}{RESET}"
+              f"  {DIM}→{RESET}  {BOLD}{new}{RESET}")
+    for note in notes or ():
+        print()
+        print(f"    {DIM}{'note':<{width}}{RESET}{AMBER}{note}{RESET}")
+    print()
+
+
+def reading_as(name, text):
+    """Prose at the gate, and how it was understood. Printed before anything
+    acts on it, so a misreading is visible while it is still cheap."""
+    print()
+    print(f"  {DIM}▌ Reading that as a change to {RESET}{WHITE}{name}{RESET}"
+          f"{DIM}: {text}{RESET}")
+    print()
+
+
+def scan_results(root, found, added=(), skipped=()):
+    """What /scan discovered and what was adopted from it.
+
+    The directory is echoed because /scan takes a path and a person who typed
+    the wrong one will otherwise read "no runs found" as a fact about GenPipes
+    rather than about their typo.
+    """
+    if not found:
+        print()
+        print(f"  {DIM}▌{RESET} {DIM}No GenPipes runs under{RESET} "
+              f"{WHITE}{_tilde(root)}{RESET}")
+        print(f"  {DIM}▌{RESET}   {GREY}a run is a directory with a "
+              f"job_output/*.job_list.* in it{RESET}")
+        print(f"  {DIM}▌{RESET}   {DIM}/scan <path> to look somewhere else{RESET}")
+        print()
+        return
+    print()
+    if added:
+        print(f"  {GREEN}▌{RESET} {BOLD}{len(added)} run"
+              f"{'s' if len(added) != 1 else ''} added{RESET}"
+              f"  {DIM}from {_tilde(root)}{RESET}")
+        for name in added:
+            print(f"  {DIM}▌{RESET}   {WHITE}{name}{RESET}")
+    else:
+        print(f"  {DIM}▌{RESET} {DIM}Nothing added{RESET}"
+              f"  {DIM}·  {len(found)} run(s) found under {_tilde(root)}{RESET}")
+    for name, why in skipped or ():
+        print(f"  {DIM}▌{RESET}   {DIM}{name} — {why}{RESET}")
+    print(f"  {DIM}▌{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}/list  ·  /check <name>  ·  /check all{RESET}")
+    print()
+
+
+def scan_found(root, found):
+    """The discovered runs, before any of them are adopted. Read-only, and
+    said out loud: /scan touches nothing it finds."""
+    print()
+    print(f"  {DIM}▌{RESET} {BOLD}{len(found)} run"
+          f"{'s' if len(found) != 1 else ''}{RESET}"
+          f"  {DIM}under {_tilde(root)}  ·  nothing has been changed{RESET}")
     print()

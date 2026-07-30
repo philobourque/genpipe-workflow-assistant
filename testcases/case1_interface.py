@@ -67,7 +67,7 @@ def run():
         r.section("the choice panel")
         before = len(app.emitted())
         app.line("run rnaseq on the test samples")
-        app.pump(2.0)
+        _await(app, lambda new: "readset" in new.lower(), timeout=60)
         new = app.emitted()[before:]
         # rnaseq defaults to stringtie, so asking would be noise.
         r.check("5  no protocol panel for rnaseq", "Which rnaseq protocol" not in new)
@@ -76,6 +76,7 @@ def run():
         r.check("6  a readset panel appears", "readset" in new.lower())
         app.send("1")                      # readset.rnaseq.txt -- send(), not
         app.pump(2.0)                      # line(): a digit selects at once
+        _await(app, lambda new: "design" in new.lower(), timeout=60)
         r.check("6  a design panel follows it", "design" in app.emitted().lower())
         app.send("1")                      # design.rnaseq.txt
         app.pump(1.5)
@@ -84,15 +85,29 @@ def run():
 
         # -- 8..11: naming and the gate ----------------------------------
         r.section("naming and the gate")
-        r.check("8  a name is suggested from the request",
-                app.wait_for("name this run"))
-        app.line("")                       # accept the suggestion
         r.check("9  the gate draws", app.wait_for("HOLD", timeout=120))
         drawn = app.emitted()
-        r.check("10 the gate shows the command", "genpipes" in drawn)
+        # Named at the gate, from what the run turned out to BE, and never
+        # asked for: a name invented before anyone has seen what they are
+        # naming is a name nobody recognises later.
+        r.check("8  the run is named without being asked",
+                "name this run" not in drawn)
+        r.check("8  after the command exists, not before", "rnaseq" in drawn)
+        # The generation command, shown under `bash cmd.sh`. It has to be here:
+        # the transcript folds the agent's working away, so this is the only
+        # place it appears before it is approved.
+        r.check("10 the gate shows the command it was built from",
+                "genpipes" in drawn)
         r.check("10 and the output directory", "output" in drawn)
         r.check("11 approve is offered", "/approve" in drawn)
+        r.check("11 modify is offered", "/modify" in drawn)
         r.check("11 reject is offered", "/reject" in drawn)
+        # Each verb states its consequence. This is the one point in the product
+        # where consequences matter, and "approve" and "reject" are not
+        # self-explanatory when one spends an allocation irreversibly and the
+        # other quietly abandons a run.
+        r.check("11 and each says what it does",
+                "cannot be undone" in drawn and "nothing is submitted" in drawn)
 
         name = _name_from(drawn)
         r.check("a run name was parsed from the gate", bool(name), f"got={name!r}")
@@ -106,14 +121,16 @@ def run():
         # by an *earlier* action satisfy the check -- which is how the first
         # draft of this file "passed" action 12 against the first gate's own
         # HOLD banner.
-        r.section("rejection")
+        r.section("modification")
         # Read the gate's own `steps` row, not the generation command in the
         # transcript. The gate's command line is `bash cmd.sh` on every
         # submission -- identical before and after a rejection -- so what the
         # operator actually reads to tell the proposals apart is the slot table.
         first = _slot_from(drawn, "steps")
         mark = len(app.emitted())
-        app.line(f"/reject {name} use steps 1-4 instead")
+        # /modify, not /reject. Rework used to be what /reject did; /reject is
+        # terminal now and would abandon the run instead of regenerating it.
+        app.line(f"/modify {name} use steps 1-4 instead")
         _await(app, lambda new: "HOLD" in new and _slot_from(new, "steps"),
                timeout=180)
         after = app.emitted()[mark:]
@@ -155,7 +172,7 @@ def run():
 
         # -- 18, 19 ------------------------------------------------------
         r.section("diagnosis and orientation")
-        app.line(f"/why {name}")
+        app.line(f"/diagnose {name}")
         app.pump(10.0)
         r.check("18 a diagnosis is produced", "step" in app.emitted().lower())
 
@@ -165,9 +182,16 @@ def run():
 
         # -- 20, 21, 22: the closed-option panel -------------------------
         r.section("a pipeline that really does need asking")
+        # A fresh conversation first. Everything above named a readset, a design
+        # and a pipeline, and an agent reading its own history is right not to
+        # ask again for what it was already told -- so asking dnaseq's protocol
+        # question on that thread would be asking it to forget. /new is what a
+        # person does here, and it is the thing being relied on.
+        app.line("/new")
+        _quiet(app)
         before = len(app.emitted())
         app.line("run dnaseq")
-        app.pump(2.5)
+        _await(app, lambda new: "protocol" in new.lower(), timeout=60)
         panel = app.emitted()[before:]
         r.check("20 the dnaseq protocol panel appears",
                 "protocol" in panel.lower())
@@ -178,14 +202,14 @@ def run():
                 f"missing={set(('germline_snv','germline_sv','germline_high_cov','somatic_tumor_only','somatic_fastpass','somatic_ensemble','somatic_sv')) - set(present)}")
         mark = len(app.emitted())
         app.send("6")                       # somatic_ensemble
-        app.pump(2.0)
+        _await(app, lambda new: "readset" in new.lower(), timeout=60)
         # The readset is asked for before the pairs file: gaps are answered in
         # the order the command needs them, and a pairs file is only known to be
         # required once the protocol is settled.
         r.check("21 the readset is asked first",
                 "readset" in app.emitted()[mark:].lower())
         app.send("1")
-        app.pump(2.0)
+        _await(app, lambda new: "pairs" in new.lower(), timeout=60)
         r.check("21 then a pairs panel, because somatic_ensemble needs one",
                 "pairs" in app.emitted()[mark:].lower(),
                 app.emitted()[mark:][-400:])
@@ -203,14 +227,14 @@ def run():
         # next prompt really is the name prompt.
         app.line("run rnaseq stringtie with readset.rnaseq.txt "
                  "and design.rnaseq.txt")
-        app.wait_for("name this run", timeout=60)
-        app.send("\x15")                    # the suggestion is pre-typed
-        app.pump(0.3)
-        app.line(name)                      # deliberately reuse it
-        app.pump(3.0)
-        r.check("23 the reused name is redirected",
-                "taken" in app.emitted()[mark:].lower(),
-                app.emitted()[mark:][-400:])
+        _await(app, lambda new: "HOLD" in new, timeout=120)
+        # The same request derives the same name, so the second run collides
+        # with the first. It must be advanced rather than allowed to shadow it:
+        # a name has to identify exactly one run, because it is what /approve,
+        # /check and /diagnose are given.
+        second = _name_from(app.emitted()[mark:])
+        r.check("23 the reused name is redirected", bool(second) and second != name,
+                f"first={name!r} second={second!r}")
         app.send("\x03")
         app.pump(1.0)
 

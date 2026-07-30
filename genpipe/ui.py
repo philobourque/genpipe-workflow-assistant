@@ -327,10 +327,20 @@ class _Editor:
         sys.stdout.flush()
 
     def finish(self):
-        """Close the box for good: redraw without the menu and leave the cursor
-        below the closing rule, so the line the user typed stays in the
-        scrollback framed exactly as they saw it."""
-        sys.stdout.write("\r\033[J" + self._input_line() + "\r\n" + self.rule + "\r\n")
+        """Take the box down and leave nothing behind.
+
+        It used to close by redrawing itself without the menu, so the line stayed
+        in the scrollback framed exactly as it had been typed. That was the wrong
+        call once the transcript started drawing the same line: the message
+        appeared TWICE, once in the box and once below it, and a reader cannot
+        tell a transcript that repeats itself from a person who said something
+        twice.
+
+        The box is the editor, and an editor is furniture -- it exists while you
+        are typing and has no business in the record afterwards. The line itself
+        is drawn once, by display.echo, as `❯ what you said`.
+        """
+        sys.stdout.write("\r\033[J")
         sys.stdout.flush()
 
     def open(self):
@@ -589,7 +599,8 @@ class Prompt:
 _ELSEWHERE = object()          # sentinel for the free-text row
 
 
-def choose(question, options, note="", free_text=True, free_label="Something else"):
+def choose(question, options, note="", free_text=True, free_label="Something else",
+           multi=False, draw=None, cursor=0):
     """A numbered choice panel. Returns the chosen value, or None if cancelled.
 
     `options` are slots.Option-shaped: anything with .value, .label and
@@ -603,44 +614,92 @@ def choose(question, options, note="", free_text=True, free_label="Something els
     confirms. The hint line says which mode is in force rather than leaving it
     to be discovered.
 
+    `multi` turns the same panel into a multi-select and returns a LIST of
+    values instead of one. Space toggles a row, enter confirms the set, and
+    selected rows are drawn with a filled marker in green. It is a mode on this
+    function rather than a second panel elsewhere on purpose: the keyboard
+    handling, the headless fallback, the paste guard and the escape behaviour
+    are the fiddly parts, and a parallel implementation would drift from them
+    one fix at a time.
+
+    `draw` hands the ROWS -- and only the rows -- to somebody else. It is called
+    as draw(cursor, picked) on every repaint and returns the lines to print in
+    their place; the question, the note and the key hints stay here. /modify
+    uses it to draw the command mirror instead of a plain list, so moving the
+    cursor lights up the flag it is about to change. The split is the same
+    argument as `multi` above, made once more: the fiddly part of a panel is the
+    raw-mode keyboard, not the text, so what varies is the text.
+
+    A drawn panel may show lines that are not options at all -- `-g cmd.sh` is
+    worth seeing and cannot be changed -- and that costs nothing here, because
+    the cursor only ever indexes `options`. Context is drawn; only choices are
+    counted.
+
+    `cursor` is where the highlight starts, and defaults to the top. /modify
+    moves it, because the first line of its panel is the invocation -- the
+    pipeline -- and that is the single most destructive thing on the screen.
+    Opening with the cursor already resting on it undoes the reason the rows are
+    ordered the way they are: the panel has to be safe to explore, which means
+    the row you land on by accident should be one where nothing happens.
+
     Falls back to a printed list and input() with no terminal, so the panel
-    works over a pipe and in tests.
+    works over a pipe and in tests. The fallback ignores `draw` and prints the
+    plain list: a repaint hook is meaningless without a cursor to repaint for.
     """
     rows = list(options)
     if free_text:
         rows = rows + [_FreeRow(free_label)]
     if not rows:
-        return None
+        return [] if multi else None
 
     quick = len(rows) <= 9
 
     if not sys.stdin.isatty():
-        return _choose_headless(question, rows, note, quick)
+        return _choose_headless(question, rows, note, quick, multi=multi)
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    cursor = 0
+    cursor = cursor if 0 <= cursor < len(rows) else 0
     painted = 0
+    picked = set()
 
     def block():
         out = []
-        out.append(f"  {display.GREEN}▌{display.RESET} "
-                   f"{display.BOLD}{question}{display.RESET}")
+        head = f"  {display.GREEN}▌{display.RESET} {display.BOLD}{question}{display.RESET}"
+        if multi:
+            head += (f"          {display.DIM}space to select · enter when "
+                     f"done{display.RESET}")
+        out.append(head)
         out.append("")
-        for i, row in enumerate(rows):
-            here = i == cursor
-            mark = f"{display.GREEN}❯{display.RESET}" if here else " "
-            num = f"{display.DIM}{i + 1:>2}{display.RESET}"
-            label = (f"{display.BOLD}{display.WHITE}{row.label}{display.RESET}"
-                     if here else row.label)
-            line = f"  {mark} {num}  {label}"
-            if row.description:
-                line += f"   {display.DIM}{row.description}{display.RESET}"
-            out.append(line)
+        if draw:
+            out.extend(draw(cursor, set(picked)))
+        else:
+            for i, row in enumerate(rows):
+                here = i == cursor
+                mark = f"{display.GREEN}❯{display.RESET}" if here else " "
+                if multi:
+                    box = (f"{display.GREEN}◉{display.RESET}" if i in picked
+                           else f"{display.DIM}◯{display.RESET}")
+                    num = box
+                else:
+                    num = f"{display.DIM}{i + 1:>2}{display.RESET}"
+                if i in picked:
+                    label = f"{display.GREEN}{row.label}{display.RESET}"
+                elif here:
+                    label = f"{display.BOLD}{display.WHITE}{row.label}{display.RESET}"
+                else:
+                    label = row.label
+                line = f"  {mark} {num}  {label}"
+                if row.description:
+                    line += f"   {display.DIM}{row.description}{display.RESET}"
+                out.append(line)
         out.append("")
         if note:
             out.append(f"     {display.DIM}{note}{display.RESET}")
-        keys = ("1-9 to pick" if quick else "digits move, enter picks")
+        if multi:
+            keys = "space toggles, enter confirms"
+        else:
+            keys = ("1-9 to pick" if quick else "digits move, enter picks")
         out.append(f"     {display.DIM}↑↓ · {keys} · esc cancels{display.RESET}")
         return out
 
@@ -655,6 +714,7 @@ def choose(question, options, note="", free_text=True, free_label="Something els
         sys.stdout.flush()
 
     chosen = None
+    confirmed = False
     try:
         tty.setraw(fd)
         print()
@@ -665,7 +725,16 @@ def choose(question, options, note="", free_text=True, free_label="Something els
             if isinstance(key, tuple):            # a paste; ignore in a menu
                 continue
             if key in ("\r", "\n"):
-                chosen = rows[cursor]
+                if multi:
+                    # Enter on an empty set takes the row under the cursor.
+                    # Confirming nothing is almost always a missed space bar,
+                    # and answering it with "cancelled" teaches the wrong
+                    # lesson about a key that did work.
+                    if not picked:
+                        picked.add(cursor)
+                    confirmed = True
+                else:
+                    chosen = rows[cursor]
                 break
             if key == "\x03":
                 raise KeyboardInterrupt
@@ -674,7 +743,9 @@ def choose(question, options, note="", free_text=True, free_label="Something els
             # panel would be inescapable.
             if key in ("escape", "\x1b", "\x04"):
                 break
-            if key == "up":
+            if key == " " and multi:
+                picked.symmetric_difference_update({cursor})
+            elif key == "up":
                 cursor = (cursor - 1) % len(rows)
             elif key == "down":
                 cursor = (cursor + 1) % len(rows)
@@ -686,12 +757,29 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                 index = int(key) - 1
                 if index < len(rows):
                     cursor = index
-                    if quick:
+                    if multi and quick:
+                        picked.symmetric_difference_update({cursor})
+                    elif quick:
                         chosen = rows[cursor]
                         break
             paint()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    if multi:
+        if not confirmed:
+            print()
+            return None
+        out = []
+        for i in sorted(picked):
+            row = rows[i]
+            if row.value is _ELSEWHERE:
+                extra = ask(question)
+                if extra:
+                    out.append(extra)
+            else:
+                out.append(row.value)
+        return out
 
     if chosen is None:
         print()
@@ -713,11 +801,15 @@ class _FreeRow:
         self.description = "type your own"
 
 
-def _choose_headless(question, rows, note, quick):
+def _choose_headless(question, rows, note, quick, multi=False):
     """No terminal: print the list, read a number or free text.
 
     Deliberately accepts the option *text* as well as its number, so a scripted
     test reads as what it means -- "somatic_ensemble" rather than "5".
+
+    In multi mode a comma-separated answer selects several rows, by number or by
+    text or a mix of both. This is what keeps the multi-select testable without
+    a tty, which is the only way the panel gets exercised in CI at all.
     """
     print(f"\n{question}")
     for i, row in enumerate(rows):
@@ -726,11 +818,28 @@ def _choose_headless(question, rows, note, quick):
     if note:
         print(f"      {note}")
     try:
-        answer = input("choice: ").strip()
+        answer = input("choices: " if multi else "choice: ").strip()
     except EOFError:
-        return None
+        return [] if multi else None
     if not answer:
-        return None
+        return [] if multi else None
+
+    if multi:
+        out = []
+        for part in (p.strip() for p in answer.split(",")):
+            if not part:
+                continue
+            if part.isdigit() and 1 <= int(part) <= len(rows):
+                row = rows[int(part) - 1]
+                if row.value is _ELSEWHERE:
+                    continue
+                out.append(row.value)
+                continue
+            match = next((r for r in rows if r.value is not _ELSEWHERE
+                          and (str(r.value) == part or r.label == part)), None)
+            out.append(match.value if match else part)
+        return out
+
     if answer.isdigit():
         index = int(answer) - 1
         if 0 <= index < len(rows):

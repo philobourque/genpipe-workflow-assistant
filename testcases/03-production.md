@@ -56,7 +56,7 @@ which case 2 never touches.
 | 9 | if the run exceeds the queue cap | `chunk_genpipes` / `submit_genpipes` is used, not a bare `bash cmd.sh` |
 | 10 | `/runs`, `/jobs`, `/check` over the following hours | states track reality; the app survives being left open |
 | 11 | close the terminal, reopen, `/runs` | the run is still there with its jobs — the registry is on disk, not in scrollback |
-| 12 | on any failure | `/why` produces a diagnosis that traces to a `.sh` and a config section |
+| 12 | on any failure | `/diagnose` produces a diagnosis that traces to a `.sh` and a config section |
 | 13 | at completion | outputs exist; `log_report` and `sacct` agree |
 
 Action 11 is worth the whole case on its own. A production run outlives the

@@ -68,10 +68,10 @@ Monitoring, in three sizes:
                    record so /list can show where things stood without re-asking.
   jobs(name)       every individual job and its Slurm state -- the per-job view
                    check() aggregates away.
-  why(name, ...)   the only one that costs a model call. runs.triage() first
+  diagnose(name, ...)   the only one that costs a model call. runs.triage() first
                    establishes deterministically WHICH jobs failed and reads
                    their logs, then the model is asked to explain the cause. It
-                   runs on its own thread (see why()'s docstring) so it can
+                   runs on its own thread (see diagnose()'s docstring) so it can
                    never disturb the run it is diagnosing.
 
 A run enters runs.jsonl at the GATE, not at submission -- see runs.py's
@@ -86,9 +86,11 @@ import sqlite3
 import uuid
 import json
 import datetime
+from . import diagnosis
 from . import display
 from . import gate
 from . import intake
+from . import override
 from . import preflight
 from . import runs as runs_store
 from . import slots as slot_table
@@ -212,7 +214,7 @@ Reading the scheduler is free and ungated -- squeue, sacct, GenPipes' own
 log_report, the .o log of a failed job. Use <execute> for those whenever they ask
 how something is going, and answer from what came back rather than guessing.
 Their own runs are named, and they can type /list, /check <name>, /jobs <name>
-and /why <name> at any time; mention the one that fits when it saves them asking
+and /diagnose <name> at any time; mention the one that fits when it saves them asking
 you.
 """
 
@@ -598,7 +600,7 @@ class GenpipeA1(A1):
     #  Runs and jobs. The store itself is runs.Registry (stdlib-only, in     #
     #  runs.py); what lives here is only the part that needs the agent --    #
     #  the working directory a submission ran in, and the model call in      #
-    #  why(). Everything else delegates.                                    #
+    #  diagnose(). Everything else delegates.                                    #
     # --------------------------------------------------------------------- #
     @property
     def registry(self):
@@ -673,7 +675,7 @@ class GenpipeA1(A1):
     def _stream(self, payload, config, on_step=None):
         """Drive the graph once, rendering every message as it arrives.
 
-        Shared by _drive() and why() so the transcript looks the same regardless
+        Shared by _drive() and diagnose() so the transcript looks the same regardless
         of which one produced it.
 
         Each message is drawn by display.render (the structured, coloured view)
@@ -729,7 +731,7 @@ class GenpipeA1(A1):
                 return
             payload = Command(resume={"answer": self._answer(value)})
 
-    def run(self, prompt, thread_id, on_step=None):
+    def run(self, prompt, thread_id, on_step=None, name=_UNSET):
         """Add one turn to a conversation and drive it to a stop.
 
         thread_id names the CONVERSATION, not the run. It is the checkpoint key
@@ -738,11 +740,17 @@ class GenpipeA1(A1):
         blank agent. Runs get their own names, minted at the gate -- see
         _settle().
 
+        `name` overrides that minting, and exists for one caller: /modify's
+        "hold as a new launch", where the person has already typed the name and
+        would not recognise a derived one. It is passed through as _settle's
+        `held`, which is the existing way of saying "the caller already knows
+        which run this is".
+
         The history is replayed explicitly because Biomni's AgentState declares
         `messages` with no reducer, making it last-value-wins: passing only the
         new message would REPLACE the conversation instead of extending it. The
         alternative -- redeclaring the state with add_messages -- would change
-        the semantics of a channel that /why deliberately relies on, so the
+        the semantics of a channel that /diagnose deliberately relies on, so the
         replay stays here where it is visible.
         """
         config = self._config(thread_id)
@@ -771,7 +779,123 @@ class GenpipeA1(A1):
         # values mode gives no signal on a pause, so we don't inspect here;
         # _gate_status reads the checkpoint afterward to tell which happened.
         self._drive(inputs, config, on_step)
-        return self._settle(thread_id, config, task=prompt)
+        return self._settle(thread_id, config, task=prompt, held=name)
+
+    def abandon(self, name, reason=None):
+        """/reject, which is now terminal. Retire a held run without submitting.
+
+        Nothing reaches the scheduler, nothing is regenerated, and no model is
+        called -- which is the whole difference from /modify, and the reason
+        this is a registry write and not a graph resume.
+
+        The conversation's interrupt is deliberately left standing. LangGraph
+        has no "discard this pause" operation, and inventing one by streaming a
+        fresh input would destroy the checkpoint rather than tidy it. The run is
+        out of held(), so nothing offers it any more; the thread simply ends its
+        life parked, which costs a row in a sqlite file and no correctness.
+        """
+        record = self.registry.get(name)
+        if record is None:
+            record = self.registry.held_for_thread(name)
+            if record:
+                name = record["name"]
+        if record is None:
+            display.problem(f"No run named '{name}'.", "/list shows what there is.")
+            return None
+        if record["status"] != runs_store.HELD:
+            display.problem(f"'{name}' is not held — it is {record['status']}.",
+                            "Only a run waiting at the gate can be abandoned.")
+            return None
+        self.registry.abandon(name, reason)
+        display.abandoned(name, reason)
+        return name
+
+    def rename(self, name, wanted):
+        """Give a held run a different name. No model, no regeneration.
+
+        The one row at the gate that changes nothing about what would run. It is
+        here rather than in the registry alone because the refusals belong to
+        the interface: a submitted run's name is tied to a job list and to jobs
+        already on the scheduler, and moving it would strand both.
+        """
+        record = self.registry.get(name)
+        if record is None:
+            display.problem(f"No run named '{name}'.", "/list shows what there is.")
+            return None
+        if record["status"] != runs_store.HELD:
+            display.problem(f"'{name}' has already been submitted.",
+                            "Its name is tied to a job list now.")
+            return None
+        settled = self.registry.rename(name, wanted)
+        if settled is None:
+            display.problem(f"Could not rename '{name}'.")
+            return None
+        display.renamed(name, settled)
+        if settled != wanted:
+            display.nothing(f"'{wanted}' was taken, so it is '{settled}'.")
+        return settled
+
+    def scan(self, root, chosen=None):
+        """Adopt GenPipes runs that already exist on disk. Read-only discovery.
+
+        The discovery is deterministic local code -- runs.discover() -- and not
+        a model wandering a filesystem. It reads job-list filenames, generated
+        command names and directory names; it never opens a FASTQ, a BAM, a VCF
+        or a readset. Nothing found is modified, renamed, regenerated,
+        resubmitted or cancelled.
+
+        `chosen` is the subset the user picked. Nothing is adopted without it:
+        a scan that silently registered everything it found would be unusable
+        the second time you ran it, and would put runs in /list that nobody
+        asked to be responsible for.
+        """
+        root = os.path.abspath(os.path.expanduser(root or "."))
+        found = runs_store.discover(root)
+        if not found:
+            display.scan_results(root, found)
+            return []
+        if chosen is None:
+            display.scan_found(root, found)
+            return found
+
+        wanted = {str(c) for c in chosen}
+        added, skipped = [], []
+        for entry in found:
+            if entry["name"] not in wanted and entry["job_list"] not in wanted:
+                continue
+            duplicate = runs_store.already_known(self.registry, entry)
+            if duplicate:
+                skipped.append((entry["name"],
+                                f"already known as {duplicate['name']}"))
+                continue
+            name = self.registry.unique_name(entry["name"])
+            if name != entry["name"]:
+                skipped.append((entry["name"], f"name taken — added as {name}"))
+            self.registry.adopt(name, entry)
+            added.append(name)
+        display.scan_results(root, found, added=added, skipped=skipped)
+        return added
+
+    def step_help(self, pipeline, protocol=None):
+        """`genpipes <pipeline> [-t <protocol>] --help`, as text.
+
+        The only authority on what a protocol's steps are and what they do.
+        There is no step table in this repo and there must not be one:
+        genpipes.md says so outright, because the numbered list is version-exact
+        and a copy here would be wrong on the next GenPipes release while
+        looking authoritative.
+
+        Returns "" when it cannot be reached -- on a laptop, or with no module
+        system -- and the caller must treat that as "no opinion", never as "no
+        problem".
+        """
+        if not pipeline:
+            return ""
+        proto = f" -t {protocol}" if protocol else ""
+        raw, code = runs_store._run(
+            f"module load {runs_store.GENPIPES_MODULE} >/dev/null 2>&1; "
+            f"genpipes {pipeline}{proto} --help")
+        return raw if code == 0 or "Steps:" in raw else ""
 
     def resume(self, name, approved, feedback=None, on_step=None):
         """Continue a run paused at the gate. approved=True lets the command
@@ -863,8 +987,46 @@ class GenpipeA1(A1):
             blockers = self._blockers()
             status["blockers"] = blockers
             status["name"] = name
-            display.gate(proposal, name, blockers=blockers)
+            # Risks carried over from the /modify that produced this proposal.
+            # They belong in the box rather than in the modify flow's own output,
+            # because the box is what a person reads at the moment of approving
+            # -- a warning printed two screens earlier has already scrolled.
+            # What the /modify that produced this proposal wants said about it.
+            # Read and cleared in one move, whatever it held: a run that reaches
+            # the gate by any other route has changed nothing since it was last
+            # looked at, and a leftover note would claim it had.
+            note = dict(getattr(self, "_gate_note", None) or {})
+            self._gate_note = {}
+            risks = list(note.get("warnings") or ())
+            if risks:
+                self.registry.update(name, warnings=risks)
+            status["warnings"] = risks
+            moved = list(note.get("changed") or ())
+            self.registry.update(name, changed=moved)
+            status["changed"] = moved
+            # `quiet` is /modify's "hold for later": the change is applied and
+            # the run stays held, but the box is not redrawn. Somebody working
+            # through several runs does not want to be handed a decision every
+            # time they finish editing one, and the held run is findable from
+            # /list and from the startup pending line either way.
+            if not note.get("quiet"):
+                display.gate(proposal, name, blockers=blockers, warnings=risks,
+                             changed=moved,
+                             resources=self._resource_summary(name))
         return status
+
+    def _resource_summary(self, name):
+        """One line describing this run's private override ini, or ''.
+
+        Read off disk at draw time rather than carried on the record, because
+        the file is the truth: /modify writes it, /diagnose will write it, and a
+        person can edit it by hand between two glances at the gate. A cached
+        summary would be the one thing on that screen that could be stale, on
+        the screen whose entire job is to be current.
+        """
+        record = self.registry.get(name) or {}
+        path = override.path_for(name, record.get("workdir") or os.getcwd())
+        return override.summary(override.read(path))
 
     def _run_name(self, thread_id, proposal, task, held=_UNSET):
         """What to call the run now sitting at the gate.
@@ -988,7 +1150,7 @@ class GenpipeA1(A1):
 
     # --------------------------------------------------------------------- #
     #  Monitoring, in three sizes. check() is one aggregate number, jobs() is #
-    #  every job, why() is the only one that costs a model call.             #
+    #  every job, diagnose() is the only one that costs a model call.             #
     # --------------------------------------------------------------------- #
     def _record_submission(self, name, since):
         """Called from resume() right after an approved submission runs. Records
@@ -1003,7 +1165,7 @@ class GenpipeA1(A1):
 
         The working directory is recorded rather than inferred. A job's log path
         in the job list is relative to wherever the submission ran, so without
-        this a later /why can only find logs if you happen to still be sitting in
+        this a later /diagnose can only find logs if you happen to still be sitting in
         the same directory. Pinning it here is what makes analysis work from
         anywhere, in any later session.
         """
@@ -1061,23 +1223,141 @@ class GenpipeA1(A1):
         return record
 
     def check(self, name):
-        """Show a run's progress: GenPipes' own log_report, drawn as a bar.
+        """Show a run's progress, as the scheduler sees it.
 
-        This is the cheap, deterministic answer to "how is it going" -- no model,
-        no cost, and the number GenPipes itself would give you. The result is
-        cached on the record so /list can show where each run stood without
-        re-running a module load per row.
+        The cheap, deterministic answer to "how is it going" -- no model, no
+        cost. What changed here is where the answer comes from: this used to
+        report GenPipes' own `tools log_report`, which never contacts Slurm and
+        infers state from files on disk. On a run that died at 10:12 it reported
+        1 COMPLETED, 2 RUNNING, 43 PENDING; sacct said 1 COMPLETED, 2 TIMEOUT,
+        43 CANCELLED. The run had been dead for hours and this command called it
+        healthy and in progress. See the comment above runs.resolve() for why no
+        amount of better file-reading could have fixed that.
+
+        The result is cached on the record so /list can show where each run
+        stood without a scheduler round-trip per row -- and the pending reasons
+        are cached too, which is the one thing here that genuinely cannot be
+        recovered later.
         """
+        if str(name).lower() == "all":
+            return self.check_all()
         record = self._need_run(name)
         if record is None:
             return None
-        raw = runs_store.log_report(record["job_list"])
-        parsed = runs_store.parse_log_report(raw)
-        if parsed["total"]:
-            self.registry.remember_check(name, parsed["counts"], parsed["total"],
-                                         runs_store.verdict(parsed["counts"]))
-        display.status(name, parsed, raw)
-        return raw
+        status = runs_store.resolve(record)
+        if status.total:
+            self.registry.remember_check(name, status.counts, status.total,
+                                         status.verdict)
+        self.registry.remember_reasons(name, status.reasons)
+        display.run_status(name, status)
+        return status
+
+    def check_all(self):
+        """/check all -- every live run, grouped by what it needs from you.
+
+        One scheduler query, whatever the number of runs. Job ids are globally
+        unique, so every manifest's ids go into a single sacct call and the
+        results are attributed back by id. Looping check() would be one sacct
+        and one squeue per run, and on a login node with a fortnight of
+        experiments in the registry that is the difference between a listing and
+        a wait.
+
+        Grouped rather than listed, and that is the whole design of this view.
+        The question it answers is "what should I be doing", and the answer to
+        that is never chronological and never alphabetical: anything failed,
+        blocked or held goes to the top whatever else is happening, and a run
+        that finished cleanly is one line at the bottom saying so.
+
+        There was briefly a second command for this -- /status all -- rendering
+        the same query as a flat table, and /status <name> was an exact alias
+        for check(). Two layouts of one query is one layout too many, so the
+        grouped one won and the flat one went; the progress figure it carried
+        moved into these rows.
+
+        One run that cannot be checked must not cost the whole command. It gets
+        a row reading unavailable and the rest are still resolved -- a monitor
+        that fails entirely when one of twenty runs has a purged job list is a
+        monitor you learn not to run.
+        """
+        records = self.registry.live()
+        rows = runs_store.resolve_all(records)
+        groups = {display.ACTIVE: [], display.ATTENTION: [], display.FINISHED: []}
+
+        for record, status in rows:
+            name = record["name"]
+            slots_ = (record.get("proposal") or {}).get("slots") or {}
+            what = " ".join(str(slots_[k]) for k in ("pipeline", "protocol")
+                            if slots_.get(k)) or None
+            when = (record.get("submitted_at") or record.get("held_at") or "")
+            when = when.replace("T", " ")[5:16] or None
+
+            if record.get("status") == runs_store.HELD:
+                groups[display.ATTENTION].append({
+                    "name": name, "what": what, "when": when,
+                    "line": "held at the gate, nothing submitted",
+                    "suggest": f"/approve {name}  ·  /modify {name}  ·  /reject {name}"})
+                continue
+            if status is None and not record.get("job_list"):
+                # A submission where every step was already up to date creates
+                # no jobs and writes no list. That is a real and successful
+                # outcome, and filing it under NEEDS ATTENTION would send
+                # somebody looking for a problem that does not exist.
+                groups[display.FINISHED].append({
+                    "name": name, "what": what, "when": when,
+                    "line": "no jobs — everything was already up to date",
+                    "suggest": None})
+                continue
+            if status is None or status.source == "unavailable":
+                groups[display.ATTENTION].append({
+                    "name": name, "what": what, "when": when,
+                    "line": "status unavailable — the scheduler could not be reached",
+                    "suggest": None})
+                continue
+
+            # Both the count and the percentage. The count is what you act on --
+            # "1 of 46" is a different situation from "45 of 46" even though
+            # both are unfinished -- and the percentage is what the eye reads
+            # first. It came from the flat table this view replaced.
+            done = (f"{status.counts.get('COMPLETED', 0)} of {status.total} done"
+                    f"  ({status.percent:.0f}%)")
+            broke = sum(n for s, n in status.counts.items()
+                        if s in runs_store.BROKE_STATES)
+            if broke or status.doomed or status.unknown:
+                trouble = (f"{broke} failed" if broke else
+                           f"{status.doomed} will never run" if status.doomed else
+                           f"{status.unknown} unaccounted for")
+                cause = status.root_cause
+                if cause:
+                    trouble += f" — {cause['step']}"
+                groups[display.ATTENTION].append({
+                    "name": name, "what": what, "when": when,
+                    "line": f"{trouble}  ·  {done}",
+                    "suggest": f"/diagnose {name}"})
+            elif status.finished:
+                groups[display.FINISHED].append({
+                    "name": name, "what": what, "when": when,
+                    "line": done, "suggest": None})
+            else:
+                live = status.counts.get("RUNNING", 0)
+                queued = status.counts.get("PENDING", 0)
+                groups[display.ACTIVE].append({
+                    "name": name, "what": what, "when": when,
+                    "line": f"{live} running, {queued} queued  ·  {done}",
+                    "suggest": None})
+
+        # NEEDS ATTENTION by urgency: something broken outranks something merely
+        # waiting on a person, because the broken one is already costing time.
+        groups[display.ATTENTION].sort(key=lambda r: "held" in r["line"])
+        groups[display.ACTIVE].sort(key=lambda r: r.get("when") or "", reverse=True)
+        groups[display.FINISHED].sort(key=lambda r: r.get("when") or "", reverse=True)
+
+        for record, status in rows:
+            if status is not None and status.total:
+                self.registry.remember_check(record["name"], status.counts,
+                                             status.total, status.verdict)
+                self.registry.remember_reasons(record["name"], status.reasons)
+        display.status_overview(groups)
+        return groups
 
     def jobs(self, name, only_failed=False):
         """List the individual Slurm jobs inside a run, with their live states.
@@ -1121,7 +1401,7 @@ class GenpipeA1(A1):
             self.registry.add_note(name, f"cancelled {n} job(s)")
         return n
 
-    def why(self, name, question=None, on_step=None):
+    def diagnose(self, name, question=None, on_step=None):
         """Ask the model why a run failed, having first established what failed.
 
         Two deliberate decisions here.
@@ -1151,30 +1431,69 @@ class GenpipeA1(A1):
         if record is None:
             return None
 
-        report = runs_store.triage(record)
-        if not report["failed_total"]:
+        # Resolved first, so the diagnosis is anchored on what the scheduler
+        # says rather than on what triage happened to find logs for. It also
+        # supplies the two facts triage cannot: the root cause ordered by start
+        # time, and the pending reasons -- which sacct never records and squeue
+        # forgets, so if they were not captured while the run was alive they are
+        # gone. A run that is dead because 28 jobs are queued behind a
+        # dependency that will never be satisfied has NO failed job to triage,
+        # and the old refusal below would have sent that person away.
+        status = runs_store.resolve(record)
+        report = runs_store.triage(record, jobs=status.jobs)
+        stored = (record.get("last_reasons") or {}).get("reasons") or {}
+        reasons = status.reasons or stored
+
+        if not report["failed_total"] and not status.doomed:
             display.problem(f"Nothing in '{name}' has failed.",
                             f"/check {name} for where it's up to.")
             return None
 
-        display.triage(name, report)
+        if report["failed_total"]:
+            display.triage(name, report)
+        else:
+            display.run_status(name, status)
 
         thread = f"{name}::why-{datetime.datetime.now():%m%d%H%M%S}"
-        prompt = self._why_prompt(name, record, report, question)
+        prompt = self._diagnose_prompt(name, record, report, question,
+                                  status=status, reasons=reasons)
         self.critic_count = 0
         self.user_task = prompt
         self.log = []
-        self._drive({"messages": [HumanMessage(content=prompt)], "next_step": None},
-                    self._config(thread), on_step)
+        display.defer_solution(True)
+        try:
+            self._drive({"messages": [HumanMessage(content=prompt)],
+                         "next_step": None}, self._config(thread), on_step)
+        finally:
+            display.defer_solution(False)
         status = self._gate_status(self._config(thread))
 
-        # Record the conclusion on the RUN, not the investigation thread, so it
-        # shows up next to the run in /history months later.
-        if status.get("final"):
-            self.registry.add_note(name, _one_line(status["final"]))
+        # Drawn here rather than left to _drive's transcript renderer, because
+        # the answer has a shape now and the transcript renderer only knows
+        # prose. An answer that came back unshaped falls through to exactly the
+        # prose rendering it always had -- see display.diagnosis.
+        parsed = diagnosis.parse(status.get("final") or "")
+        # Not when the investigation itself hit the gate. A read-only intent is
+        # not a guarantee -- the graph is gated for exactly that reason -- and
+        # if the model decided to resubmit, `final` is the pause, not an answer.
+        if status.get("final") and status.get("status") != "paused":
+            display.diagnosis(name, parsed,
+                              logs=[f["log"] for f in report["findings"]
+                                    if f.get("log")])
+            # The one-line note keeps the CAUSE where there is one. /history six
+            # weeks later wants "gatk_sam_to_fastq killed at its walltime", not
+            # the first 140 characters of a heading.
+            self.registry.add_note(
+                name, _one_line(parsed["cause"] or status["final"]))
+        # Parsed and kept, so /modify's resources row can offer to write the
+        # override the diagnosis proposed instead of making somebody retype it.
+        if parsed.get("override"):
+            self.registry.update(name, proposed_override=parsed["override"])
+        status["diagnosis"] = parsed
         return status
 
-    def _why_prompt(self, name, record, report, question):
+    def _diagnose_prompt(self, name, record, report, question, status=None,
+                    reasons=None):
         """Build the diagnosis prompt out of facts, not prose.
 
         Every value here was parsed from a command or read from the scheduler, so
@@ -1182,14 +1501,46 @@ class GenpipeA1(A1):
         above it. The instruction to answer in a <solution> block matters: without
         it the agent's default is to start running code, and the first thing worth
         having is a hypothesis, not more shell.
+
+        Three facts are stated that the log tails cannot supply, and each one
+        exists to head off a specific wrong answer:
+
+          the full state tally    so "three things failed" is not concluded from
+                                  forty cancellations.
+          the root cause          the EARLIEST independent failure. Without it a
+                                  model reads the logs it was given in the order
+                                  it was given them and names whichever it liked.
+          the pending reasons     the only place a dependency that will never be
+                                  satisfied is recorded. sacct never had it and
+                                  squeue has already forgotten.
         """
         slots = (record.get("proposal") or {}).get("slots") or {}
         lines = [
-            f"A GenPipes run named '{name}' has failed jobs. Diagnose the cause.",
+            f"A GenPipes run named '{name}' needs diagnosing.",
             "",
             "What is known, gathered from the scheduler and the run's own files:",
             f"  working directory: {record.get('workdir') or 'unknown'}",
         ]
+        if status is not None:
+            tally = ", ".join(f"{n} {s}" for s, n in sorted(status.counts.items()))
+            lines.append(f"  scheduler says: {tally} (of {status.total} submitted)")
+            lines.append(f"  source: {status.source}")
+            cause = status.root_cause
+            if cause:
+                lines.append(
+                    f"  earliest independent failure: {cause['step']}, "
+                    f"{cause['count']} job(s) {cause['state']}"
+                    + (f", ran {cause['elapsed']} of {cause['timelimit']}"
+                       if cause.get("timelimit") else ""))
+                lines.append("  CANCELLED jobs downstream of it never ran and "
+                             "their logs explain nothing.")
+        if reasons:
+            lines.append("  jobs still queued, and what they are waiting on: "
+                         + ", ".join(f"{n} {why}" for why, n in
+                                     sorted(reasons.items(), key=lambda kv: -kv[1])))
+            if reasons.get(runs_store.DOOMED_REASON):
+                lines.append("  DependencyNeverSatisfied means those jobs will "
+                             "NEVER run, whatever sacct calls them.")
         for label, key in (("pipeline", "pipeline"), ("protocol", "protocol"),
                            ("steps", "steps"), ("readset", "readset")):
             if slots.get(key):
@@ -1203,6 +1554,9 @@ class GenpipeA1(A1):
             f"across {report['steps_affected']} step(s)",
             "",
         ]
+        if not report["findings"]:
+            lines += ["No job wrote a log worth reading -- which is itself the "
+                      "finding. Explain what that means for this run.", ""]
         for f in report["findings"]:
             lines.append(f"--- step {f['step']}: {f['count']} job(s) {f['state']} ---")
             if f["maxrss"]:
@@ -1216,13 +1570,16 @@ class GenpipeA1(A1):
             lines.append("")
         if question:
             lines += [f"The user specifically asks: {question}", ""]
+        if slots.get("steps"):
+            lines += [f"The run was originally submitted with -s {slots['steps']}.",
+                      ""]
         lines += [
-            "Explain, in a <solution> block: the single most likely cause, the "
-            "evidence in the logs above that supports it, and the concrete fix "
-            "(which ini key, which resource, which file). If a resubmission is "
-            "needed, say exactly which steps to rerun -- do not resubmit now.",
-            "Only use <execute> if you genuinely need to read a file that is not "
-            "quoted above.",
+            diagnosis.SHAPE,
+            "",
+            diagnosis.RELAUNCH_RULE,
+            "",
+            "Do not resubmit anything now. Only use <execute> if you genuinely "
+            "need to read a file that is not quoted above.",
         ]
         return "\n".join(lines)
 

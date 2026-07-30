@@ -51,6 +51,27 @@ jobs:
         # trains the operator to ignore the warning that matters.
         run: python tests/test_preflight.py
 
+      - name: What the scheduler says a run is doing
+        # The suite for the bug that started all of this: log_report reported a
+        # run that died at 10:12 as healthy and in progress, because it reads
+        # files on disk and the filesystem structurally cannot record a job that
+        # never started or one that was killed.
+        run: python tests/test_resolve.py
+
+      - name: The three gate verbs
+        # Includes the one property here that is a safety property rather than
+        # behaviour: prose at the gate never approves.
+        run: python tests/test_modify.py
+
+      - name: Telling a run request from a question
+        run: python tests/test_prep.py
+
+      - name: Readset files, built from structure alone
+        run: python tests/test_readset.py
+
+      - name: Discovering runs already on disk, without reading any data
+        run: python tests/test_scan.py
+
       - name: Intake, slots, and the grammar they must agree with
         # Also the tripwire on genpipes.md's size, and the check that the ini
         # table in slots.py still matches the one in genpipes.md. They are the
@@ -61,5 +82,5 @@ jobs:
         # A stdlib-only module that quietly grows a heavy import would break CI
         # in a confusing way later; catching it as its own step names the cause.
         run: |
-          python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui; print('ok')"
+          python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui, modify, prep, readset; print('ok')"
           python -c "import genpipe, sys; assert 'biomni' not in sys.modules; print('no biomni')"

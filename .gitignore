@@ -36,6 +36,10 @@ tracks/
 variants/
 methylation/
 peak_call/
+raw_reads/
+pairedVariants/
+SVariants/
+deliverables/
 *.config.trace.ini
 # Scratch inputs and generated scripts from walking testcases/SCENARIOS.md.
 design.tsv

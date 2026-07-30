@@ -72,21 +72,28 @@ Python interpreter. You get a prompt box:
 Type a task in plain English and it runs — you're asked to name it first. Anything starting with
 `/` is a command instead, and the command list appears live as you type: press `/` to see all of
 them, `Tab` to complete, `↑`/`↓` to pick one. Any unambiguous abbreviation works, so `/appr` is
-`/approve`. `↑` at an empty prompt walks back through the session's history, `Ctrl+C` clears the
-line, `Ctrl+D` leaves.
+`/approve`. `↑` at an empty prompt walks back through the session's history, `Ctrl+D` leaves.
 
 ```
-deciding    /approve patient-42
-            /reject  patient-42 use steps 6-12 instead
+talking     /new
+            /verbose [off]
+deciding    /approve  patient-42
+            /modify   patient-42 [use steps 6-12 instead]
+            /reject   patient-42 [why]
 watching    /list
-            /check   patient-42
-            /jobs    patient-42 [failed]
+            /check    patient-42 | all
+            /monitor  patient-42 [seconds]
+            /jobs     patient-42 [failed]
             /history
-fixing      /why     patient-42 [is the memory limit too low?]
-            /cancel  patient-42
-            /track   some-other-run /path/to/Pipeline.protocol.job_list.TIMESTAMP
-setup       /where
-            /model   [provider [model-name]]
+fixing      /diagnose patient-42 [is the memory limit too low?]
+            /hold     patient-42 [release]
+            /cancel   patient-42
+            /sort     [names...]
+            /scan     [path]
+            /track    some-other-run /path/to/Pipeline.protocol.job_list.TIMESTAMP
+setup       /readset  [directory|schema]
+            /where
+            /model    [provider [model-name]]
             /key
             /help
             /exit
@@ -94,8 +101,18 @@ setup       /where
 
 While a run is working, a spinner sits below the transcript with the elapsed time, and it says what
 the agent is currently doing — `generating the script`, `asking Slurm`, `submitting` — rather than a
-static "thinking". Output scrolls up past it as it arrives. `Ctrl+C` stops a run without submitting
-anything.
+static "thinking". Output scrolls up past it as it arrives.
+
+**Ctrl+C stops the agent, not the session.** It abandons the answer in flight and hands the prompt
+back with the conversation intact — the same thing it means in every other assistant with a spinner
+in it. At an idle prompt it clears the line. It never leaves; `Ctrl+D` and `/exit` do that, and a
+single key that sometimes clears a line and sometimes ends the session is the thing that made people
+afraid to press it.
+
+The transcript shows your line once, beside `❯`, and the reply as plain prose. The agent's working —
+the commands it runs, the machine output, its connective prose — is folded away and kept, the way a
+chain of thought is: one dim line says how many steps were taken, and `/verbose` unfolds them,
+including what has already scrolled past.
 
 Pasting is safe: multi-line pastes are folded onto the input line instead of the first newline
 submitting a half-finished command.
@@ -110,11 +127,37 @@ The distinction runs through the whole tool:
   them, one per step per sample. A job is a unit of execution, with its own id, state and log file.
 
 "Did it work?" is a question about a run. "What broke?" is only ever answerable about a job. So
-`/check` reports the run (GenPipes' own `log_report`, drawn as a bar) and `/jobs` reports each job
-(from `sacct`, grouped by step, since a failure is nearly always one step failing across many
-samples rather than one unlucky job).
+`/check` reports the run and `/jobs` reports each job, grouped by step, since a failure is nearly
+always one step failing across many samples rather than one unlucky job. Both read `sacct`.
 
-A run's life is `held → submitted → gone`:
+**Both read `sacct`, and that is a correction.** `/check` used to report GenPipes' own
+`tools log_report`, which never contacts Slurm — it infers state from files on disk. On a real
+46-job run that died at 10:12 on 2026-07-27 it reported `1 COMPLETED, 2 RUNNING, 43 PENDING`;
+`sacct` said `1 COMPLETED, 2 TIMEOUT, 43 CANCELLED`. The run had been dead for hours and the tool
+called it healthy and in progress.
+
+No amount of better file-reading fixes that. Every artifact GenPipes leaves is written *by the job
+itself*: the prologue needs the job to have started, the epilogue needs the shell to exit normally
+(a SIGKILL bypasses a bash `EXIT` trap), and only exit status 0 writes a `.done`. So *never started*
+and *died violently* — the two states that define a dead run — are exactly the two the filesystem is
+structurally incapable of recording. `log_report` was not lying; its vocabulary is about artifacts,
+not about Slurm. The defect was reading filesystem words as scheduler words.
+
+`runs.resolve()` is the replacement. The manifest is the denominator (every job ever submitted,
+never one dropped, never one invented), `sacct` is the authoritative spine, and `squeue` annotates
+only the jobs `sacct` still reports as non-terminal — because a pending job's *reason* exists in
+exactly one place and stops existing the moment it leaves the queue. `DependencyNeverSatisfied`
+means those jobs will never run while `sacct` goes on calling them `PENDING`, so the run is reported
+as dead. A job `sacct` does not know is `UNKNOWN`, which never renders as healthy; a scheduler that
+cannot be reached says so and guesses nothing.
+
+`/check all` does the same over every run at the cost of **one** scheduler round-trip — job ids are
+globally unique, so one batched query is attributed back by id rather than looping per run. It
+groups rather than lists: NEEDS ATTENTION first and always, then ACTIVE, then FINISHED, because the
+question a listing answers is "what should I be doing" and the answer to that is never
+chronological.
+
+A run's life is `held → submitted → gone`, with `abandoned` as the terminal branch off `held`:
 
 - **held** — stopped at the gate, nothing submitted. A run is recorded here, *before* anything
   reaches Slurm, so a decision you left behind survives closing the terminal. Relaunching announces
@@ -122,21 +165,98 @@ A run's life is `held → submitted → gone`:
 - **submitted** — on the scheduler, artifacts on disk.
 - **gone** — the job list file is no longer on disk (a scratch purge, manual cleanup). The run drops
   out of `/list` but nothing is deleted: `/history` still shows it, marked `gone`, along with
-  anything `/why` concluded about it.
+  anything `/diagnose` concluded about it.
+- **abandoned** — you said no. `/reject` is terminal now: nothing is submitted, nothing regenerated,
+  the reason is recorded, and the run leaves `/list` and the startup pending line. Rework moved to
+  `/modify`, which is what `/reject` secretly did before — so there was no way to abandon a run at
+  all, and one you had mentally dropped kept asking to be decided forever.
 
 Name every run. The name is how you approve it and how you check on it later. You are offered a name
 derived from the task, pre-filled and editable, so Enter accepts it. If the name is already taken it
 is quietly advanced (`patient-42` → `patient-42-2`) — reusing one would replace that run's stored
 conversation, including a pending approval.
 
-`/why <name>` is the only command that costs a model call. It works in two stages, deliberately
+`/diagnose <name>` is the only command that costs a model call. It works in two stages, deliberately
 visible as two: first it asks Slurm which jobs failed and reads those specific logs off disk, prints
 that as evidence, and only then asks the model to explain the cause. A GenPipes run has hundreds of
 `.o` files, and a model told to "go look" burns context rediscovering what one `sacct` call already
 knows. The investigation runs on its own thread, so it can never disturb the run it is diagnosing.
 
+The answer comes back in a fixed shape — manner, cause, evidence, fix, override, relaunch,
+confidence — rather than as free prose, so it is drawn rather than dumped and so the parts that are
+actionable can be acted on. The `override` section is a real ini fragment: `/modify <name>` offers to
+write it into the run's private override ini rather than leaving you to create the file, spell the
+step name right and remember which end of `-c` wins. The `relaunch` range is always the **full**
+original one — GenPipes skips steps whose output is already up to date, so resubmitting everything
+costs nothing and a narrowed range silently leaves the cancelled cascade undone.
+
+There is no `/why`. It existed, as an alias for this same function under a second name, and the only
+thing the pair achieved was making people wonder which to reach for. `/check` already gives the quick
+version, in its root-cause block, with no model call at all.
+
 `/track <name> <job_list_path>` registers a run you launched outside the agent entirely, so
-`/check`/`/jobs`/`/why` can find it by name with no prior conversation required.
+`/check`/`/jobs`/`/diagnose` can find it by name with no prior conversation required. `/scan [path]` is
+the same thing without the path-hunting: it walks a directory you name, recognises runs by their
+job-list filenames and directory structure, and offers them for you to pick from. It is read-only
+and metadata-only — it never opens a FASTQ, a BAM, a VCF or a readset, and it changes nothing it
+finds. Nothing is adopted that you did not select.
+
+## Changing a proposal at the gate
+
+The gate offers three verbs, each with its consequence printed under it, because this is the one
+point in the product where consequences matter:
+
+```
+approve           /approve chipseq-0728
+                  submits to Slurm — cannot be undone
+modify            /modify chipseq-0728 <what to change>
+                  rewrites the command, asks you again
+                  omit the change to pick from what's there
+reject            /reject chipseq-0728 [why]
+                  abandons this run; nothing is submitted
+```
+
+`/modify <name> <change>` is one model call and back to the gate. `/modify <name>` opens a
+multi-select of the rows this proposal actually has — protocol, steps, design, pairs, readset,
+config, output, and the run's own name — fills each in turn with the right widget, reviews the whole
+set as `old → new`, and applies it as **one** model call however many rows changed.
+
+Validation runs in three tiers with genuinely different sources of truth. Tier 1 is enumerable from
+`slots.py`: a protocol from the wrong pipeline is answered inline with that pipeline's real ones and
+never reaches the model, and a design file that is not on disk is caught before a generation is
+spent on it. Tier 2 is form — is that a well-formed `-s` range, is that a path. Tier 3 is steps and
+their dependencies, and it is reasoned about against `genpipes <pipeline> -t <protocol> --help` at
+the moment of applying. **There is no step table in this repo and there must not be one**:
+`genpipes.md` says so outright, because the numbered list is version-exact and a copy here would be
+wrong on the next GenPipes release while looking authoritative. A tier-3 finding is reported as a
+`warning` row in the re-rendered gate — a risk with its reasoning, not a verdict — and you may
+proceed anyway, because GenPipes' own generation is the authoritative check and its error names
+exactly which step it rejected.
+
+The run's **name** is the one row that costs no model call: it changes no flag and needs no
+regeneration, so it is a registry write. Only a held run can be renamed; after submission the name
+is tied to a job list and to jobs already on the scheduler.
+
+Prose typed at the gate routes to `/modify`, stating its interpretation first so a misreading is
+visible while it is still free. With one exception: **a line that means "yes" is refused**, with the
+`/approve` command that would work. Approval is typed, never inferred. No prose may ever cause a
+submission, and a helpful assistant that reads "looks good" as consent is the exact failure the gate
+exists to prevent.
+
+## Readset files
+
+`/readset [directory]` builds one from what is on disk — pairing `_R1`/`_R2` by **filename**, never
+by opening a file — and shows it before offering to write it, with its guesses flagged (lanes of one
+sample must share a `Sample` name, and a filename cannot say whether they do). It refuses to
+overwrite: a readset file is hand-corrected after it is generated.
+
+`/readset schema [pipeline]` prints the format instead. That is the version you can send to a
+colleague, and it is the whole privacy argument in one artifact: the columns, their types and which
+are mandatory are enough to write, test and review every piece of code that touches a readset, and
+contain no sample name, no path and nothing real. Development and testing run on synthetic rows that
+satisfy the same schema (`fake_A`, `/fake/r1.fq.gz`), and anything written against those works
+unchanged on real data — because the logic depends on where a column is and what is allowed in it,
+not on what is inside.
 
 `/model` alone shows the current provider/model; `/model <provider>` (`anthropic`/`openai`/`gemini`/
 `groq`) switches to it using that provider's already-configured key, and `/model <provider>
@@ -173,7 +293,7 @@ not this UI, until it grows its own gate.
 GenPipes "generates" a `cmd.sh`, running it writes a `job_output/` tree with per-job `.o` logs and a
 `*.job_list.*`, and `sacct` answers about those job ids. The registry, the job parser, the triage and
 every renderer run unmodified. `--fake-llm` adds a scripted stand-in for the model, so the entire
-interface — gate, approve, check, jobs, why, cancel — can be clicked through on a laptop.
+interface — gate, approve, check, jobs, diagnose, cancel — can be clicked through on a laptop.
 
 Dev mode says so on every launch, in amber, under the banner. A simulation you can mistake for the
 real thing is worse than no simulation.
@@ -298,7 +418,7 @@ Inside the package, in dependency order — each module depends only on the ones
 | `display.py` | Rendering (`parse()` is UI-agnostic; a future web UI can reuse it) | stdlib |
 | `ui.py` | The terminal input side: prompt box, live completion, spinner, paste | stdlib |
 | `fakecluster.py` | Stubbed GenPipes + Slurm + model, for dev mode and the tests | stdlib |
-| `agent.py` | `GenpipeA1`: the gated graph, and run/resume/check/jobs/why/cancel | biomni |
+| `agent.py` | `GenpipeA1`: the gated graph, and run/resume/check/jobs/diagnose/cancel | biomni |
 | `cli.py` | Builds the agent, owns the command table and the loop (`_repl()`) | biomni |
 | `genpipes.md` | The GenPipes grammar fed to the model as "software" | — |
 

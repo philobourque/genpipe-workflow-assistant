@@ -36,6 +36,23 @@ def drawn(fn, *args, **kwargs):
     return re.sub(r"\033\[[0-9;]*[A-Za-z]", "", buf.getvalue())
 
 
+def loud(fn, *args, **kwargs):
+    """drawn(), with the transcript unfolded.
+
+    The working -- commands, machine output, connective prose -- is folded away
+    by default now, the way a chain of thought is. Everything that asserts on
+    what a code block or an observation LOOKS like is asserting about the
+    unfolded view, so it says so rather than relying on a default that has
+    deliberately changed.
+    """
+    was = display.VERBOSE
+    display.set_verbose(True)
+    try:
+        return drawn(fn, *args, **kwargs)
+    finally:
+        display.set_verbose(was)
+
+
 class Msg:
     def __init__(self, content):
         self.content = content
@@ -73,7 +90,12 @@ def main():
     r.contains("how to reject", out, "/reject patient-42")
     r.contains("and that nothing has happened yet", out,
                "Nothing has reached the scheduler")
-    r.contains("with no -o, it says where output will land", out, "no -o flag")
+    # The wording moved into mirror._absent when the gate started drawing the
+    # command as structure. The assertion is on where the output lands, not on
+    # the phrase: the old "cwd (no -o flag)" named the flag and left the reader
+    # to know what cwd meant.
+    r.contains("with no -o, it says where output will land", out,
+               "current directory")
 
     # ---------------------------------------------------------------- #
     r.section("held runs, surfaced at startup")
@@ -122,7 +144,7 @@ def main():
     r.contains("with its cached verdict", out, "6 running")
     r.contains("labelled as a snapshot, not live truth", out, "as of")
     r.contains("a zero-job run says so plainly", out, "already")
-    r.contains("and the next commands are offered", out, "/why")
+    r.contains("and the next commands are offered", out, "/diagnose")
 
     # ---------------------------------------------------------------- #
     r.section("/history keeps gone runs and their findings")
@@ -176,7 +198,7 @@ def main():
     r.contains("groups by step", out, "picard_mark_duplicates")
     r.contains("shows per-job state", out, "out_of_memory")
     r.contains("and the memory that explains it", out, "8192000K")
-    r.contains("offering the diagnosis", out, "/why patient-42")
+    r.contains("offering the diagnosis", out, "/diagnose patient-42")
 
     r.section("...and filters to failures on request")
     out = drawn(display.jobs, "patient-42", jobs, only_failed=True)
@@ -238,9 +260,9 @@ def main():
     out = drawn(display.help_text, [
         ("approve", "<name>", "let it through", "deciding"),
         ("check", "<name>", "how it is doing", "watching"),
-        ("why", "<name>", "diagnose it", "fixing"),
+        ("diagnose", "<name>", "explain it", "fixing"),
     ])
-    for word in ("deciding", "watching", "fixing", "/approve", "/check", "/why"):
+    for word in ("deciding", "watching", "fixing", "/approve", "/check", "/diagnose"):
         r.contains(f"shows {word}", out, word)
 
     # ---------------------------------------------------------------- #
@@ -332,18 +354,18 @@ def main():
     r.equal("a documentation lookup is HELP",
             label("module load mugqic/genpipes/6.1.1 && genpipes rnaseq --help"),
             "HELP")
-    r.contains("and the label is what gets drawn", drawn(
+    r.contains("and the label is what gets drawn", loud(
         display.render, Msg("<execute>\nbash cmd.sh\n</execute>")), "SUBMIT")
 
     # ---------------------------------------------------------------- #
     r.section("long machine output is clipped at both ends, not one")
     flood = "<observation>" + "\n".join(f"line {i}" for i in range(60)) + "</observation>"
-    out = drawn(display.render, Msg(flood))
+    out = loud(display.render, Msg(flood))
     r.contains("the start survives", out, "line 0")
     r.contains("the end survives -- where an error is", out, "line 59")
     r.contains("and it says how much it left out", out, "more lines")
     r.check("the middle is gone", "line 30" not in out)
-    short = drawn(display.render, Msg("<observation>one\ntwo</observation>"))
+    short = loud(display.render, Msg("<observation>one\ntwo</observation>"))
     r.contains("short output is untouched", short, "two")
     r.check("with nothing about lines left out", "more lines" not in short)
 
@@ -365,7 +387,7 @@ def main():
     r.equal("biomni's correction is not drawn", scold.strip(), "")
     r.check("least of all as code about to run", "CODE" not in scold)
 
-    rejected = drawn(display.render, HumanMessage(
+    rejected = loud(display.render, HumanMessage(
         "The proposed submission was not approved. use steps 6-12 instead. "
         "Regenerate the command accordingly."))
     r.check("nor is the rejection sent back", me not in rejected)
@@ -374,8 +396,8 @@ def main():
     # Command output arrives as a user turn now (the Anthropic API rejects a
     # conversation that ends on the assistant's side), so it must render as OUT
     # from either role.
-    from_machine = drawn(display.render,
-                         HumanMessage("<observation>Generated cmd.sh</observation>"))
+    from_machine = loud(display.render,
+                        HumanMessage("<observation>Generated cmd.sh</observation>"))
     r.contains("output on the user channel is still TERMINAL", from_machine,
                "TERMINAL")
     r.check("and is not attributed to them", me not in from_machine)
@@ -390,7 +412,9 @@ def main():
         intake.brief("run rnaseq stringtie with readset.tsv", ".")))
     r.contains("their own words are shown", briefed, "run rnaseq stringtie")
     r.check("the appended context is not", "do not ask again" not in briefed)
-    r.contains("and it is still their turn", briefed, me)
+    r.contains("and it is still their turn, marked by the prompt chevron",
+               briefed, "\u276f")
+    r.check("with no speaker label above it", me not in briefed)
 
     text = drawn(display.fresh, [])
     r.check("/new says the conversation is gone", "New conversation" in text)
@@ -426,9 +450,187 @@ def main():
     stopped = drawn(display.gate, proposal, "run-1", blockers=[block])
     r.check("a blocked gate withholds approve", "/approve" not in stopped)
     r.check("but still allows reject", "/reject run-1" in stopped)
+    r.check("and still allows modify", "/modify run-1" in stopped)
     r.check("and says what to fix", "RAP_ID" in stopped)
     r.check("and confirms nothing was spent",
             "Nothing has reached the scheduler" in stopped)
+
+
+    # ---------------------------------------------------------------- #
+    r.section("the transcript folds the working away, and keeps it")
+
+    was = display.VERBOSE
+    display.set_verbose(False)
+    try:
+        code = drawn(display.render, Msg("<execute>\nbash cmd.sh\n</execute>"))
+        r.check("a command is not drawn", "cmd.sh" not in code)
+        out = drawn(display.render, Msg("<observation>Submitted 46</observation>"))
+        r.check("nor is its output", "Submitted 46" not in out)
+        # But the reply is, and the marker above it says work happened. A fold
+        # you cannot see is a deletion with better manners.
+        answer = drawn(display.render, Msg("<solution>46 jobs went in.</solution>"))
+        r.contains("the answer is", answer, "46 jobs went in")
+        r.contains("under a count of what was folded", answer, "step")
+        r.contains("and how to see it", answer, "/verbose")
+        r.check("with no speaker label", "ASSISTANT" not in answer)
+
+        replayed = drawn(display.replay)
+        r.contains("and /verbose can replay what scrolled past", replayed, "cmd.sh")
+        r.contains("including the output", replayed, "Submitted 46")
+    finally:
+        display.set_verbose(was)
+
+    # ---------------------------------------------------------------- #
+    r.section("the gate states the consequence of each verb")
+
+    proposal = {"command": "bash cmd.sh",
+                "slots": {"pipeline": "chipseq", "protocol": "chipseq",
+                          "steps": "1-5", "design": "design.tsv"}}
+    box = drawn(display.gate, dict(proposal, generated="genpipes chipseq -t "
+                                   "chipseq -s 1-5 -d design.tsv -g cmd.sh"),
+                "chipseq-0728")
+    # `bash cmd.sh` is what runs and says nothing on its own. With the agent's
+    # working folded away by default this is the only place the generation
+    # command is seen before it is approved.
+    r.contains("shows what the script was built from", box, "genpipes chipseq")
+    box = drawn(display.gate, proposal, "chipseq-0728")
+    for verb in ("/approve chipseq-0728", "/modify chipseq-0728",
+                 "/reject chipseq-0728"):
+        r.contains(f"offers {verb}", box, verb)
+    # The change from a version that printed bare command names: this is the one
+    # point in the product where consequences matter.
+    r.contains("approve says it cannot be undone", box, "cannot be undone")
+    r.contains("modify says it asks again", box, "asks you again")
+    r.contains("reject says nothing is submitted", box, "nothing is submitted")
+    r.contains("and the standing promise holds", box,
+               "Nothing has reached the scheduler")
+
+    risky = drawn(display.gate, proposal, "chipseq-0728",
+                  warnings=["skipping 3-4 (trimming, alignment) but running 5"])
+    r.contains("a risk is shown at the moment of decision", risky, "warning")
+    r.contains("with its reasoning", risky, "skipping 3-4")
+
+    # ---------------------------------------------------------------- #
+    r.section("run status: the scheduler's words, with its provenance")
+
+    def status_for(counts, **kw):
+        st = runs.RunStatus(counts=counts, total=sum(counts.values()),
+                            resolved=sum(counts.values()), unknown=0,
+                            finished=True, verdict="failed, nothing still running",
+                            reasons={}, at_risk=[], root_cause=None,
+                            source="sacct", at="14:22", done_files=0, doomed=0,
+                            jobs=[])
+        for k, v in kw.items():
+            setattr(st, k, v)
+        return st
+
+    dead = status_for({"COMPLETED": 1, "TIMEOUT": 2, "CANCELLED": 43},
+                      root_cause={"step": "gatk_sam_to_fastq", "state": "TIMEOUT",
+                                  "count": 2, "job": "gatk_sam_to_fastq.x",
+                                  "elapsed": "00:10:01", "timelimit": "00:10:00",
+                                  "maxrss": None, "cancelled_after": 43})
+    text = drawn(display.run_status, "dnaseq-somatic-fastpass-0727", dead)
+    r.contains("the run is named", text, "dnaseq-somatic-fastpass-0727")
+    r.contains("every state present gets a row", text, "CANCELLED")
+    r.check("and only those present do", "NODE_FAIL" not in text)
+    r.contains("the total proves the denominator", text, "total")
+    r.contains("percentages are shown", text, "93.5")
+    r.contains("the root cause is the thing that broke", text, "gatk_sam_to_fastq")
+    r.contains("not the jobs it took with it", text, "cancelled downstream")
+    # The footer is provenance, not decoration: which tools were asked, and how
+    # much of the manifest they accounted for.
+    r.contains("the source is named", text, "sacct")
+    r.contains("and the coverage", text, "46/46 jobs resolved")
+
+    unknown = status_for({"COMPLETED": 44, "UNKNOWN": 2}, unknown=2, resolved=44,
+                         finished=False, verdict="state unknown")
+    text = drawn(display.run_status, "x", unknown)
+    r.contains("an unaccounted job is said out loud", text, "2 UNKNOWN")
+    r.check("and never rendered as healthy", "complete" not in text)
+
+    live = status_for({"COMPLETED": 12, "RUNNING": 3, "PENDING": 31},
+                      finished=False, verdict="running, 3 active",
+                      reasons={"Dependency": 28, "Priority": 3})
+    text = drawn(display.run_status, "x", live)
+    r.contains("the reason block makes 31 PENDING legible", text, "waiting on")
+    r.contains("naming the reason", text, "Dependency")
+
+    doomed = status_for({"COMPLETED": 1, "FAILED": 1, "PENDING": 28},
+                        verdict="dead — 28 waiting on a dependency that will never come",
+                        reasons={"DependencyNeverSatisfied": 28}, doomed=28)
+    text = drawn(display.run_status, "x", doomed)
+    r.contains("a run queued behind a dead job reads as dead", text, "dead")
+    r.contains("and says those jobs will never run", text, "never run")
+
+    gone = status_for({}, total=0, resolved=0, source="unavailable",
+                      verdict="scheduler unreachable", finished=False)
+    text = drawn(display.run_status, "x", gone)
+    r.contains("an unreachable scheduler says so", text, "could not reach")
+    r.check("and guesses nothing", "PENDING" not in text)
+
+    # ---------------------------------------------------------------- #
+    r.section("the multi-run view")
+
+    # One view, not two. /check all used to be a flat table and /status all the
+    # grouped one, over the same query -- with /status <name> an exact alias for
+    # /check <name>. The grouped one won: a listing answers "what should I be
+    # doing", and the answer to that is never chronological.
+    r.check("there is no second, flat renderer",
+            not hasattr(display, "run_status_all"))
+
+    groups = {display.ATTENTION: [{"name": "a", "what": "dnaseq somatic_fastpass",
+                                   "when": "07-27 10:00",
+                                   "line": "2 failed — gatk_sam_to_fastq  ·  "
+                                           "1 of 46 done  (2%)",
+                                   "suggest": "/diagnose a"}],
+              display.ACTIVE: [{"name": "b", "what": "rnaseq stringtie",
+                                "when": None, "line": "3 running, 31 queued",
+                                "suggest": None}],
+              display.FINISHED: [{"name": "c", "what": None, "when": None,
+                                  "line": "12 of 12 done", "suggest": None}]}
+    text = drawn(display.status_overview, groups)
+    r.contains("the urgent group is named", text, "NEEDS ATTENTION")
+    r.check("and comes first",
+            text.index("NEEDS ATTENTION") < text.index("ACTIVE"))
+    r.contains("with a count", text, "(1)")
+    r.contains("and the next thing to type", text, "/diagnose a")
+    r.contains("carrying the progress the flat table used to", text, "(2%)")
+    r.contains("and naming the step that broke", text, "gatk_sam_to_fastq")
+    r.check("no paths or job-list filenames leak in", "job_list" not in text)
+    r.check("the footer offers /check, not a second listing command",
+            "/check <name>" in text and "/status" not in text)
+
+    # ---------------------------------------------------------------- #
+    r.section("the confirmations for the new verbs")
+
+    text = drawn(display.abandoned, "chipseq-0728", "wrong samples")
+    r.contains("says what happened", text, "abandoned")
+    r.contains("keeps the reason", text, "wrong samples")
+    r.contains("and states plainly that nothing was submitted",
+               text, "nothing was submitted")
+
+    text = drawn(display.renamed, "old-0728", "h3k27ac-rep1")
+    r.contains("both names", text, "h3k27ac-rep1")
+    r.contains("and that the run is untouched", text, "nothing regenerated")
+
+    text = drawn(display.change_plan,
+                 [("protocol", "chipseq", "atacseq"), ("steps", "1-5", "1-8")],
+                 ["atacseq needs the mark column to be 'atac'"])
+    r.contains("every delta as old to new", text, "chipseq")
+    r.contains("the second one too", text, "1-8")
+    r.contains("and the cross-field consequence", text, "atac")
+
+    text = drawn(display.reading_as, "chipseq-0728", "steps 1-5 → 1-8")
+    r.contains("prose states its interpretation", text, "Reading that as")
+
+    text = drawn(display.scan_results, "/scratch/me", [], [])
+    r.contains("an empty scan says where it looked", text, "/scratch/me")
+    r.contains("and what a run looks like", text, "job_output")
+
+    text = drawn(display.scan_results, "/scratch/me",
+                 [{"name": "a"}], added=["a"], skipped=[("b", "already known")])
+    r.contains("what was added", text, "1 run added")
+    r.contains("and what was not, with why", text, "already known")
 
     return r.finish()
 

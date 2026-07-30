@@ -22,6 +22,7 @@ without a cluster or an agent stack.
 """
 
 import os
+import platform
 import re
 
 BLOCK = "block"
@@ -145,6 +146,42 @@ def check_job_mail(value):
                 f"export JOB_MAIL={value.rsplit('@', 1)[0]}@{known}",
             )
     return None
+
+
+# Alliance clusters this has been run on, by the prefix their login nodes use.
+# The value is the cluster ini GenPipes ships for them, which is the one thing
+# that genuinely differs between the two: partitions, walltimes and the resource
+# macros all come from it, and using another cluster's generates and submits
+# happily before every job is rejected for a partition that does not exist.
+CLUSTERS = {
+    "rorqual": "rorqual.ini",
+    "narval": "narval.ini",
+    "beluga": "beluga.ini",
+    "cedar": "cedar.ini",
+    "graham": "graham.ini",
+    "niagara": "niagara.ini",
+}
+
+
+def cluster(hostname=None):
+    """Which Alliance cluster this is, or None off-cluster.
+
+    Read from the hostname rather than configured, because it is not a
+    preference -- it is a fact about the machine, it changes when you ssh
+    somewhere else, and anything a person has to remember to update is
+    something that will be wrong on the day it matters.
+    """
+    host = (hostname or os.environ.get("GENPIPE_CLUSTER")
+            or platform.node() or "").lower()
+    for name in CLUSTERS:
+        if host.startswith(name):
+            return name
+    return None
+
+
+def cluster_ini(hostname=None):
+    """The cluster ini for this machine, or None if it is not a known one."""
+    return CLUSTERS.get(cluster(hostname) or "")
 
 
 def check(env=None):

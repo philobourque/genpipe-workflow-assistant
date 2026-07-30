@@ -6,6 +6,7 @@ import readline  # noqa: F401 -- side-effect only: gives input() arrow-key histo
 import sys
 import termios
 import textwrap
+import time
 import tty
 import io, contextlib
 from pathlib import Path
@@ -14,8 +15,14 @@ from biomni.llm import get_llm
 
 from . import display
 from . import intake
+from . import mirror
+from . import modify
+from . import override
 from . import preflight
+from . import prep
+from . import readset
 from . import runs as runs_store
+from . import slots
 from . import ui
 from .agent import GenpipeA1
 
@@ -382,6 +389,24 @@ def build_agent(path=None, llm=None, source=None):
     #    not a path tied to any one person's home directory.
     content = GRAMMAR_PATH.read_text()
 
+    #    Pin the one fact in that document that is different per machine. The
+    #    grammar is written for the Alliance in general and names the cluster ini
+    #    as `common_ini/<cluster>.ini`; which cluster that is depends on where
+    #    this process is running, and getting it wrong generates and submits
+    #    cleanly before every job is rejected for a partition that does not exist
+    #    there. Stated as a fact rather than left to be inferred from a hostname.
+    here = preflight.cluster()
+    if here:
+        content += (f"\n\n## This machine\n\nYou are on **{here}**. The cluster "
+                    f"ini for every `-c` stack is "
+                    f"`$GENPIPES_INIS/common_ini/{preflight.cluster_ini()}`. "
+                    f"Do not use another cluster's.\n")
+    else:
+        content += ("\n\n## This machine\n\nThis is not a recognised Alliance "
+                    "login node, so the cluster ini cannot be assumed. Ask "
+                    "which one to use before generating a command that "
+                    "submits.\n")
+
     # 3. Register the grammar as software; this also reconfigures the agent, which is
     #    what rebuilds the gated graph. Biomni's add_software prints the full
     #    description it registers (a1.py:799) -- here, the entire grammar -- so
@@ -541,23 +566,864 @@ def _cmd_approve(agent, args):
 
 
 def _cmd_reject(agent, args):
+    """/reject <name> [why] -- abandon a held run. Terminal.
+
+    This used to be rework: it regenerated and came back to the gate. That
+    behaviour now lives in /modify, and this is the verb that was missing --
+    there was no way to abandon a run at all, so a run you had mentally dropped
+    kept appearing in /list and in the startup pending line forever.
+    """
     if not args:
-        display.problem("usage: /reject <name> [feedback...]")
+        display.problem("usage: /reject <name> [why...]")
         return
     name, *rest = args
-    with ui.Activity("reworking") as act:
-        status = agent.resume(name, approved=False, feedback=" ".join(rest),
+    agent.abandon(name, " ".join(rest) or None)
+
+
+def _rework(agent, name, feedback, warnings=(), changed=(), quiet=False):
+    """Send a run back to the model with feedback and return to the gate.
+
+    The single seam every /modify path funnels through -- direct, guided, and
+    prose at the gate -- so there is one place where a change becomes a model
+    call and one place where the run keeps its name.
+
+    `changed` names the rows this rework is moving, and rides the same seam as
+    `warnings` for the same reason: the gate that comes back is where somebody
+    reads, and it is otherwise identical to the gate they just rejected.
+    Confirming a change landed by diffing two screens from memory is how a
+    person approves a command they did not mean to, so the rows that moved come
+    back green. The guided flow knows them exactly; a prose change does not, and
+    passes nothing rather than guessing -- a green line that did not move is
+    worse than no green at all.
+    """
+    agent._gate_note = {"warnings": list(warnings or ()),
+                        "changed": list(changed or ()),
+                        "quiet": bool(quiet)}
+    with ui.Activity("modifying") as act:
+        status = agent.resume(name, approved=False, feedback=feedback,
                               on_step=_narrate(act))
-    if (status or {}).get("status") != "unknown":
-        display.post_approve(name, False)
+    return status
+
+
+def _modify_direct(agent, name, change):
+    """/modify <name> <change> -- one change, stated in prose, one model call.
+
+    No apply screen: the re-rendered gate is the review, and confirming a change
+    that has a confirmation coming is how a two-keystroke edit becomes four.
+    """
+    risks, stop = _step_risks(agent, name, change)
+    if stop:
+        display.problem(stop, "Re-read the step list before changing anything else.")
+        return
+    _rework(agent, name, change, warnings=risks)
+
+
+def _step_risks(agent, name, change):
+    """Tier 3, for a change that mentions steps. Returns (risks, hard_stop).
+
+    Only fires when the change actually names a step range -- reading --help
+    costs a subprocess and a module load, and paying that to validate a protocol
+    swap would put a two-second pause in front of every modify.
+    """
+    m = re.search(r"\b(\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)\b", change or "")
+    if not m or not modify.valid_steps(m.group(1)):
+        return [], None
+    record = agent.registry.get(name) or {}
+    values = (record.get("proposal") or {}).get("slots") or {}
+    help_text = agent.step_help(values.get("pipeline"), values.get("protocol"))
+    if not help_text:
+        return [], None
+    return modify.step_risk(m.group(1), help_text)
+
+
+def _cmd_modify(agent, args):
+    """/modify <name> [what to change] -- rewrite a held run's command.
+
+    With a change, it is one model call and back to the gate. Without one, it
+    opens the guided flow: pick the rows, fill them in, review, apply.
+    """
+    if not args:
+        held = agent.registry.held()
+        if len(held) == 1:
+            args = [held[0]["name"]]
+        else:
+            display.problem("usage: /modify <name> [what to change]",
+                            "/list shows what is held.")
+            return
+    name, *rest = args
+    record = agent.registry.get(name)
+    if record is None:
+        display.problem(f"No run named '{name}'.", "/list shows what there is.")
+        return
+    if record["status"] != runs_store.HELD:
+        display.problem(f"'{name}' is not held — it is {record['status']}.",
+                        "Only a run waiting at the gate can be modified.")
+        return
+    if rest:
+        _modify_direct(agent, name, " ".join(rest))
+        return
+    _modify_guided(agent, name, record)
+
+
+def _modify_guided(agent, name, record):
+    """The guided /modify: multi-select the rows, fill each, review, apply.
+
+    One model call for the whole set, however many rows changed -- composed into
+    a single unambiguous sentence by modify.sentence(). The command string is
+    never rebuilt here, even for a change as trivial as a flag swap: that would
+    diverge the model's view of the conversation from what is queued, and its
+    next turn would reason about a command it did not write.
+    """
+    proposal = record.get("proposal") or {}
+    directory = record.get("workdir") or os.getcwd()
+    candidates = intake.candidates(directory)
+
+    picked = None
+    changes = {}
+    # Rows a previous pass left mandatory and unanswered. They come back red in
+    # the panel rather than only in the round that raised them: somebody who
+    # chose "change something else" is now looking at the command again, and the
+    # obligation did not go away because the screen did.
+    required = {}
+    while True:
+        # The mirror is built from the run's own generated command, so what the
+        # panel offers to change and what is actually queued cannot disagree.
+        # Rows that modify.rows_for() withholds -- a `-p` on a germline run --
+        # still appear if the command has them, without a box: the panel is
+        # allowed to show more than it will change, never less.
+        #
+        # The override summary is re-read every pass rather than captured once
+        # before the loop. It is a file on disk, and tuning a step that was
+        # already tuned rewrites it without changing the command -- which is
+        # exactly the case a summary read once would show stale.
+        tuned = override.summary(
+            override.read(override.path_for(name, directory)))
+        rows = modify.rows_for(proposal, name, resources=tuned)
+        m = (mirror.read(proposal.get("generated"), name=name, resources=tuned)
+             or mirror.from_slots(proposal, name=name, resources=tuned)).ensure(
+                 [row for row, _ in rows])
+        # Cursor order follows the mirror, not ROWS, so ↓ moves down the screen.
+        # They agree today; they would not the moment a command carried a flag
+        # in an order the table does not know, and an arrow key that skips a
+        # line is the kind of wrongness nobody reports and everybody distrusts.
+        offered = {row for row, _ in rows}
+        order = [line.row for line in m.lines if line.row in offered]
+        options = [slots.Option(row, row, "") for row in order]
+        options.append(slots.Option("__else__", "something else…",
+                                    "describe it instead"))
+        extras = [("__else__", "something else…", "describe it instead")]
+        picked = ui.choose("What should change?", options, free_text=False,
+                           multi=True,
+                           # Open on `name`, not on the invocation the mirror
+                           # draws above it. The pipeline is the most
+                           # destructive row on the panel and it is drawn first
+                           # because it is the command; the cursor starts on the
+                           # row where nothing happens, which is what the offer
+                           # order in modify.ROWS is arranged around.
+                           cursor=max(order.index("name"), 0)
+                           if "name" in order else 0,
+                           # No green here. Green is the gate's word for "this
+                           # moved since you last read it", and re-entering
+                           # /modify starts that reading over -- carrying the
+                           # last round's colour in would make the panel argue
+                           # with the box it just came from.
+                           draw=display.modify_panel(m, order + ["__else__"],
+                                                     extras,
+                                                     required=required))
+        if not picked:
+            display.nothing("Left alone.", f"'{name}' is still held.")
+            return
+        if "__else__" in picked:
+            try:
+                text = ui.ask("What should change?")
+            except (EOFError, KeyboardInterrupt):
+                return
+            if text:
+                _modify_direct(agent, name, text)
+            return
+
+        # `changes` carries across passes. "Change something else" means add to
+        # what is already there, not start again -- discarding three answered
+        # fields because somebody wanted to touch a fourth is a flow people stop
+        # using the fourth option of.
+        filled = _fill_rows(agent, name, proposal, picked, directory,
+                            candidates, changes)
+        if filled is None:
+            return
+        changes = filled
+        if not changes:
+            display.nothing("Nothing changed.", f"'{name}' is still held.")
+            return
+
+        deltas = [(row, modify.current(proposal, row) if row != "name" else name,
+                   new) for row, new in changes.items()]
+        notes = modify.cross_check(proposal, changes)
+        display.change_plan(deltas, notes)
+        ending = ui.choose(
+            "What should happen to these changes?",
+            [slots.Option("launch", "back to launch",
+                          "apply them and show the submission gate"),
+             slots.Option("hold", "hold for later",
+                          "apply them; decide another time"),
+             slots.Option("fork", "hold as a new launch",
+                          "keep this run as it is and make a second one"),
+             slots.Option("again", "change something else",
+                          "back to the command")],
+            free_text=False,
+            note="nothing is submitted by any of these")
+        if ending == "again":
+            required = {row: why for row, why
+                        in modify.required_after(proposal, changes).items()
+                        if not changes.get(row)}
+            continue
+        if ending == "fork":
+            _fork_run(agent, name, record, proposal, changes)
+            return
+        if ending in ("launch", "hold"):
+            break
+        # esc, or a headless caller that answered nothing. Silence is not
+        # consent for a change set somebody spent four prompts assembling, but
+        # it is not a change either.
+        display.nothing("Left alone.", f"'{name}' is still held.")
+        return
+
+    _apply_changes(agent, name, proposal, changes, quiet=(ending == "hold"))
+
+
+def _fill_rows(agent, name, proposal, picked, directory, candidates,
+               changes=None):
+    """Ask for each selected row's new value, validating inline, then chase
+    whatever those answers have just made mandatory.
+
+    Inline is the point. Making somebody fill three fields and then telling them
+    the first was wrong is the worst version of a form, and a tier-1 failure --
+    a protocol from the wrong pipeline, a design file that is not on disk -- is
+    knowable the instant it is typed, without a model and without a generation.
+
+    DEPENDENCY ORDER, NOT PICK ORDER. The rows are asked in modify.FILL_ORDER,
+    so the pipeline is settled before anything that reads it. Asking in the
+    order somebody happened to tick the boxes means offering rnaseq's protocols
+    to a run that is about to become chipseq, and the answer looks right on
+    screen while being an answer to the wrong question.
+
+    THEN THE CASCADE. Changing the pipeline invalidates the protocol, the -c
+    stack and the step numbers -- see modify.required_after. Those rows come
+    back as a second round, drawn red and labelled required, because leaving
+    them is not an option: a run generated from them does not fail, it generates
+    and runs for hours with the wrong parameters, which is the shape of failure
+    genpipes.md keeps returning to.
+    """
+    # Answers from an earlier pass, if the caller is coming back round. Copied
+    # rather than mutated so a caller that decides to discard the pass still has
+    # what it started with.
+    changes = dict(changes or {})
+    queue = modify.fill_order(picked)
+    asked = set(changes)
+    round_note = ""
+
+    while queue:
+        total = len(queue)
+        for i, row in enumerate(queue, 1):
+            asked.add(row)
+            print()
+            head = (f"{display.RED}▌ required · {i} of {total} — {row}"
+                    if round_note else
+                    f"{display.DIM}▌ {total} change{'s' if total > 1 else ''} · "
+                    f"{i} of {total} — {row}")
+            print(f"  {head}{display.RESET}")
+            if round_note:
+                print(f"  {display.RED}▌{display.RESET} "
+                      f"{display.GREY}{round_note.get(row, '')}{display.RESET}")
+            if row == "name":
+                print(f"  {display.DIM}▌ the command does not change; this is "
+                      f"only what you call it{display.RESET}")
+
+            if row == modify.RESOURCES:
+                # Not a value somebody types. It is a file this tool writes, and
+                # the flow that writes it asks a different set of questions --
+                # which step, which keys, what values -- so it gets its own
+                # function rather than a fourth branch inside a loop meant for
+                # one prompt.
+                path = _fill_resources(agent, name, proposal, directory)
+                if path is None:
+                    return None
+                if path:
+                    changes[row] = path
+                continue
+
+            options = modify.options_for(row, proposal, candidates,
+                                         pending=changes)
+            while True:
+                question = modify.question_for(row, proposal, pending=changes)
+                try:
+                    value = (ui.choose(question, options, free_text=True)
+                             if options else ui.ask(question))
+                except (EOFError, KeyboardInterrupt):
+                    return None
+                if value is None or not str(value).strip():
+                    break                   # skipped this row, keep the rest
+                verdict = modify.check(row, str(value), proposal, directory,
+                                       registry=agent.registry, name=name,
+                                       pending=changes)
+                if verdict.ok:
+                    if verdict.note:
+                        print(f"  {display.AMBER}▌{display.RESET} "
+                              f"{display.DIM}{verdict.note}{display.RESET}")
+                    changes[row] = str(value).strip()
+                    break
+                print(f"  {display.RED}▌{display.RESET} {verdict.message}")
+                if verdict.options:
+                    options = verdict.options
+
+        # What the answers just given have made mandatory. Rows already asked
+        # once are not asked again even if they are still unsatisfied -- somebody
+        # who skipped a required field twice has said what they mean, and a loop
+        # that will not let them out is worse than a run they were warned about.
+        required = modify.required_after(proposal, changes)
+        pending = [row for row in required if row not in asked]
+        if not pending:
+            unmet = [r for r in required if not changes.get(r)]
+            if unmet:
+                display.still_required(
+                    {r: why for r, why in required.items() if r in unmet})
+            return changes
+        display.now_required(
+            {row: why for row, why in required.items() if row in pending})
+        queue = modify.fill_order(pending)
+        round_note = required
+    return changes
+
+
+def _fill_resources(agent, name, proposal, directory):
+    """Tune one or more steps' cluster resources into this run's override ini.
+
+    Returns the ini's path, "" if nothing was written, or None if the person
+    backed out. The path is what the caller turns into a change, because from
+    the COMMAND's point of view that is the whole of it: one more entry at the
+    end of `-c`. Everything else happened in a file.
+
+    Step names come from `genpipes <pipeline> -t <protocol> --help`, read at the
+    moment of asking. There is no step table in this repo and there must not be
+    one -- genpipes.md says so, because the list is version-exact -- so when
+    --help cannot be reached the panel degrades to free text rather than to a
+    guess. A typed step name is still checked for SHAPE, because a section
+    header GenPipes does not recognise is not an error: it is ignored, and the
+    run fails a second time in exactly the same way.
+
+    No value is ever suggested. genpipes.md forbids proposing a resource number
+    that was not computed from something observed, and its own worked example is
+    a TIMEOUT whose obvious walltime fix was the wrong one. The examples in the
+    prompts are shapes, not recommendations.
+    """
+    values = (proposal or {}).get("slots") or {}
+    path = override.path_for(name, directory)
+    sections = override.read(path)
+
+    # An override /diagnose already worked out from the logs. Offered, never
+    # applied: it was computed from evidence and is very likely right, and it is
+    # still a resource number somebody is about to spend an allocation on. The
+    # offer is the whole point of parsing it -- the alternative was reading a
+    # fenced ini block off the screen and retyping it, which is where a step
+    # name gets misspelled and the override silently does nothing.
+    proposed = (agent.registry.get(name) or {}).get("proposed_override") or {}
+    proposed = {s: k for s, k in proposed.items() if s not in sections}
+    if proposed:
+        display.overrides(name, override.describe(proposed), path)
+        take = ui.choose("Use what /diagnose worked out?",
+                         [slots.Option("yes", "yes", "start from these"),
+                          slots.Option("no", "no", "set them myself")],
+                         free_text=False,
+                         note="nothing is written until you are done")
+        if take == "yes":
+            for step, keys in proposed.items():
+                sections = override.merge(sections, step, keys)
+
+    help_text = agent.step_help(values.get("pipeline"), values.get("protocol"))
+    known = modify.steps_from_help(help_text)
+
+    while True:
+        step = _ask_step(known, sections)
+        if step is None:
+            return None
+        if not step:
+            break
+        settings = _ask_settings(step, sections.get(step) or {})
+        if settings is None:
+            return None
+        sections = override.merge(sections, step, settings)
+
+        again = ui.choose("Tune another step?",
+                          [slots.Option("no", "no", "write what is there"),
+                           slots.Option("yes", "yes", "pick another step")],
+                          free_text=False)
+        if again != "yes":
+            break
+
+    display.overrides(name, override.describe(sections), path)
+    written = override.write(path, sections, run=name)
+    if not written:
+        display.nothing("No overrides left.",
+                        f"{os.path.basename(path)} was removed.")
+    return written
+
+
+def _ask_step(known, sections):
+    """Which step to tune. '' to stop, None if the person backed out."""
+    options = [slots.Option(step, step, f"{len(keys)} override(s) already")
+               for step, keys in sorted(sections.items())]
+    options += [slots.Option(n, n, f"step {i}") for i, n in known
+                if n not in sections]
+    while True:
+        try:
+            if options:
+                answer = ui.choose("Which step should be tuned?", options,
+                                   free_text=True, free_label="another step…",
+                                   note="section names are the step names "
+                                        "--help prints")
+            else:
+                answer = ui.ask("Which step should be tuned? (its --help name, "
+                                "e.g. gatk_sam_to_fastq)")
+        except (EOFError, KeyboardInterrupt):
+            return None
+        answer = (answer or "").strip()
+        if not answer or override.valid_section(answer):
+            return answer
+        print(f"  {display.RED}▌{display.RESET} {answer!r} is not shaped like a "
+              f"step name.")
+        print(f"  {display.RED}▌{display.RESET} {display.GREY}GenPipes would "
+              f"ignore the section silently, and the run would fail the same "
+              f"way again.{display.RESET}")
+
+
+def _ask_settings(step, existing):
+    """Which keys to set on one step, and to what. None if backed out.
+
+    An empty answer to a prompt CLEARS that key rather than skipping it, which
+    is how an override added a minute ago is undone without opening the file.
+    """
+    options = []
+    for key, label, _, example in override.SETTINGS:
+        now = existing.get(key)
+        options.append(slots.Option(key, label,
+                                    f"now {now}" if now else f"e.g. {example}"))
+    try:
+        picked = ui.choose(f"What should change for {step}?", options,
+                           free_text=False, multi=True,
+                           note="empty answer clears a setting")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not picked:
+        return {}
+
+    out = {}
+    for key, label, prompt, example in override.SETTINGS:
+        if key not in picked:
+            continue
+        # `ram` is the one prefilled field, and only because its idiomatic value
+        # is a REFERENCE rather than a number: `%(cluster_mem)s` means "whatever
+        # the memory ends up being", which cannot be the wrong size. Prefilling
+        # a walltime or a memory figure would be proposing a value nobody
+        # computed, which genpipes.md forbids for good reasons.
+        default = example if key == "ram" else ""
+        while True:
+            try:
+                answer = ui.ask(f"{step} · {prompt}", default=default)
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if answer is None or not str(answer).strip():
+                out[key] = ""             # clear it
+                break
+            verdict = override.validate(key, str(answer))
+            if verdict.ok:
+                out[key] = str(answer).strip()
+                break
+            print(f"  {display.RED}▌{display.RESET} {verdict.message}")
+    return out
+
+
+def _fork_run(agent, name, record, proposal, changes):
+    """Apply a change set as a SECOND run, leaving the first one untouched.
+
+    The reason this is not a rename: a thread parked at the gate holds exactly
+    one interrupt, so a variant produced by reworking the original replaces it.
+    Anybody comparing a ten-minute walltime against a thirty-minute one wants
+    both, and there is no way back to the first once the model has regenerated
+    over it.
+
+    So the fork opens its own conversation. It costs the same single model call
+    a rework does, the original stays parked and approvable exactly as it was,
+    and the new run gets its own thread, its own name and its own gate. What it
+    does NOT get is the original's history, which is why the request carries the
+    base command with it -- see modify.fork_sentence.
+    """
+    wanted = changes.pop("name", None)
+    if not wanted:
+        try:
+            wanted = ui.ask("What should the new run be called?")
+        except (EOFError, KeyboardInterrupt):
+            return
+    verdict = modify.check("name", str(wanted or ""), proposal,
+                           registry=agent.registry)
+    if not verdict:
+        display.problem(verdict.message, f"'{name}' is unchanged.")
+        return
+
+    new_name = agent.registry.unique_name(str(wanted).strip())
+    request = modify.fork_sentence(proposal, changes)
+    if not request:
+        display.problem("There is no generation command to copy from.",
+                        f"/modify {name} on its own changes this run instead.")
+        return
+
+    risks = []
+    if "steps" in changes:
+        risks, stop = _step_risks(agent, name, changes["steps"])
+        if stop:
+            display.problem(stop, f"Nothing was changed; '{name}' is unchanged.")
+            return
+
+    agent._gate_note = {"warnings": risks, "changed": list(changes),
+                        "quiet": False}
+    thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
+    with ui.Activity("building the variant") as act:
+        agent.run(request, thread, on_step=_narrate(act), name=new_name)
+    display.forked(name, new_name)
+
+
+def _apply_changes(agent, name, proposal, changes, quiet=False):
+    """Apply a validated change set: at most one model call, then the rename.
+
+    The rename goes LAST, after resume() returns, so the gate re-renders once
+    and under the new name. Doing it first would draw the box twice -- once
+    under each name -- which reads as two runs.
+    """
+    new_name = changes.pop("name", None)
+    sentence = modify.sentence(proposal, changes)
+
+    if sentence:
+        risks, stop = [], None
+        if "steps" in changes:
+            risks, stop = _step_risks(agent, name, changes["steps"])
+            if stop:
+                display.problem(stop, "Nothing was changed.")
+                return
+        _rework(agent, name, sentence, warnings=risks,
+                changed=list(changes), quiet=quiet)
+        if quiet:
+            display.done(f"{name} — changes applied, still held.",
+                         f"/approve {name} when you are ready.")
+
+    if new_name:
+        settled = agent.rename(name, new_name)
+        if settled and not sentence:
+            _redraw(agent, settled, ["name"] + list(changes))
+    elif not sentence and changes and not quiet:
+        # Changes that cost no model call: a re-tune of a step already in the
+        # -c stack rewrote the ini and left the command alone. Nothing has
+        # redrawn the box, so it is redrawn here -- the mirror reads the
+        # override summary off the file, so the new walltime is visible without
+        # a regeneration that had nothing to regenerate.
+        _redraw(agent, name, list(changes))
+
+
+def _redraw(agent, name, changed):
+    """Re-render the gate for a change that never reached the model."""
+    record = agent.registry.get(name)
+    if record and record.get("proposal"):
+        agent.registry.update(name, changed=list(changed))
+        display.gate(record["proposal"], name, blockers=agent._blockers(),
+                     changed=changed,
+                     resources=override.summary(override.read(
+                         override.path_for(name, record.get("workdir") or "."))))
 
 
 def _cmd_check(agent, args):
+    """/check <name> -- what the scheduler says about one run.
+    /check all -- every run, grouped by what it needs from you.
+
+    One command, two scopes. There was briefly a /status as well, whose
+    single-run form was an exact alias for this one and whose all-runs form was
+    the same query in a second layout. /check is the name everything else
+    already uses -- the post-approve confirmation, /list's footer, the README
+    and every test case print it -- so the alias went rather than the original.
+    """
     if not args:
-        display.problem("usage: /check <name>")
+        display.problem("usage: /check <name>",
+                        "/check all groups every run by what it needs.")
         return
-    with ui.Activity("asking GenPipes"):
+    if args[0].lower() == "all" and agent.registry.get("all") is None:
+        with ui.Activity("asking Slurm"):
+            agent.check_all()
+        return
+    if args[0].lower() == "all":
+        display.nothing("There is a run actually named 'all'.",
+                        "Rename it with /modify all, or /check it by name.")
+    with ui.Activity("asking Slurm"):
         agent.check(args[0])
+
+
+def _cmd_monitor(agent, args):
+    """/monitor <name> [seconds] -- watch one run until it stops changing.
+
+    A poll loop rather than anything clever. The interval is generous by
+    default: sacct is cheap but a login node is shared, and a monitor that
+    hammers the scheduler every second is the kind of thing that gets a tool
+    banned from a cluster.
+
+    Ctrl+C stops watching. It does not stop the run, and it says so.
+    """
+    if not args:
+        display.problem("usage: /monitor <name> [seconds between checks]")
+        return
+    name = args[0]
+    try:
+        every = max(10, int(args[1])) if len(args) > 1 else 30
+    except ValueError:
+        every = 30
+    record = agent._need_run(name)
+    if record is None:
+        return
+    print(f"\n  {display.DIM}watching {display.RESET}{display.WHITE}{name}"
+          f"{display.RESET}{display.DIM} every {every}s  ·  Ctrl+C to stop "
+          f"watching (the run keeps going){display.RESET}")
+    last = None
+    try:
+        while True:
+            status = runs_store.resolve(record)
+            signature = (tuple(sorted(status.counts.items())), status.verdict)
+            if signature != last:
+                display.run_status(name, status)
+                agent.registry.remember_check(name, status.counts, status.total,
+                                              status.verdict)
+                agent.registry.remember_reasons(name, status.reasons)
+                last = signature
+            if status.finished or status.source == "unavailable":
+                break
+            time.sleep(every)
+    except KeyboardInterrupt:
+        print(f"\n  {display.DIM}Stopped watching. {name} is still on the "
+              f"scheduler.{display.RESET}\n")
+        return
+    display.done(f"{name} · {last[1] if last else 'finished'}",
+                 f"/jobs {name} for the detail")
+
+
+def _cmd_hold(agent, args):
+    """/hold <name> -- put a submitted run's queued jobs on hold in Slurm.
+
+    The counterpart to /cancel that does not destroy anything. `scontrol hold`
+    stops queued jobs being scheduled while leaving them in the queue, so a run
+    you have doubts about can be stopped from consuming more allocation without
+    losing its place or its dependencies. `/hold <name> release` puts it back.
+
+    Only pending jobs are touched: a running job cannot be held, and asking
+    Slurm to hold one produces an error per job, which is a wall of noise at
+    exactly the moment somebody needs to know whether it worked.
+    """
+    if not args:
+        display.problem("usage: /hold <name> [release]")
+        return
+    name = args[0]
+    release = len(args) > 1 and args[1].lower().startswith("rel")
+    record = agent._need_run(name)
+    if record is None:
+        return
+    jobs = runs_store.jobs_for(record)
+    targets = [j.job_id for j in jobs if j.job_id and j.state == "PENDING"]
+    if not targets:
+        display.nothing(f"Nothing queued in '{name}' to "
+                        f"{'release' if release else 'hold'}.",
+                        f"/check {name} shows where it stands.")
+        return
+    verb = "release" if release else "hold"
+    with ui.Activity(f"{verb}ing"):
+        raw, _ = runs_store._run(f"scontrol {verb} {','.join(targets)}")
+    display.done(f"{len(targets)} queued job(s) {verb}d in {name}.",
+                 f"/hold {name} release" if not release else f"/check {name}")
+    if raw.strip():
+        print(f"  {display.DIM}{raw.strip()}{display.RESET}\n")
+
+
+def _cmd_sort(agent, args):
+    """/sort -- prune what /list shows.
+
+    A registry that has been running for a fortnight has rows in it nobody is
+    acting on any more, and /list stops being read the moment it stops being
+    short. This hides rows; it never deletes them -- the reason to clear a row
+    is almost always that it is old rather than that it is wrong, and /history
+    still has to be able to answer "what did I run in June?".
+    """
+    records = agent.registry.live()
+    if not records:
+        display.nothing("Nothing in /list to sort.")
+        return
+    if args:
+        # Named directly: /sort chipseq-0728 rnaseq-0726
+        hidden = [n for n in args if agent.registry.get(n)]
+        missing = [n for n in args if not agent.registry.get(n)]
+        for name in hidden:
+            agent.registry.hide(name)
+        if hidden:
+            display.done(f"Hidden from /list: {', '.join(hidden)}",
+                         "/history still has them  ·  /sort show to bring them back")
+        for name in missing:
+            display.problem(f"No run named '{name}'.")
+        return
+
+    options = [slots.Option(r["name"], r["name"], _run_note(r)) for r in records]
+    options.append(slots.Option("__track__", "add a run instead",
+                                "/track or /scan adopts one that already exists"))
+    picked = ui.choose("Which rows should /list stop showing?", options,
+                       free_text=False, multi=True,
+                       note="nothing is deleted — /history keeps everything")
+    if not picked:
+        display.nothing("Left alone.")
+        return
+    if "__track__" in picked:
+        display.nothing("Use /scan <path> to find runs on disk, or "
+                        "/track <name> <job_list> for one you already know.")
+        picked = [p for p in picked if p != "__track__"]
+    for name in picked:
+        agent.registry.hide(name)
+    if picked:
+        display.done(f"Hidden from /list: {', '.join(picked)}",
+                     "/history still has them")
+
+
+def _cmd_scan(agent, args):
+    """/scan [path] -- find GenPipes runs already on disk and adopt them.
+
+    Read-only, and it asks before it takes anything. The scan itself is
+    deterministic local code that reads filenames and directory structure --
+    never a FASTQ, a BAM, a VCF, a result table or a readset's contents.
+    """
+    if args:
+        root = " ".join(args)
+    else:
+        try:
+            root = ui.ask("Which directory should I scan?", default=os.getcwd())
+        except (EOFError, KeyboardInterrupt):
+            return
+    if not root:
+        return
+    root = os.path.abspath(os.path.expanduser(root))
+    if not os.path.isdir(root):
+        display.problem(f"'{root}' is not a directory.")
+        return
+    with ui.Activity("scanning"):
+        found = agent.scan(root)
+    if not found:
+        return
+
+    options = []
+    for entry in found:
+        what = " ".join(x for x in (entry.get("pipeline") or "unknown",
+                                    entry.get("protocol") or "") if x)
+        options.append(slots.Option(entry["name"], entry["name"],
+                                    f"{what}   {display._tilde(entry['workdir'])}"))
+    picked = ui.choose("Which of these should I add?", options, free_text=False,
+                       multi=True, note="nothing on disk is changed either way")
+    if not picked:
+        display.nothing("Nothing added.")
+        return
+    agent.scan(root, chosen=picked)
+
+
+def _cmd_readset(agent, args):
+    """/readset [directory] -- build a readset file from what is on disk.
+
+    Filenames only. The pairing is done on `_R1`/`_R2` and the sample names are
+    derived from the stems -- nothing here opens a FASTQ, which is what makes it
+    safe to point at a directory of somebody else's data.
+
+    `/readset schema [pipeline]` prints the format instead, which is the version
+    of this you can send to a colleague: it is enough to write and review every
+    piece of code that touches a readset, and it contains no sample name, no
+    path and nothing real.
+    """
+    if args and args[0].lower() in ("schema", "spec", "format"):
+        pipeline = args[1] if len(args) > 1 else None
+        print()
+        for line in readset.schema_text(pipeline).splitlines():
+            print(f"  {display.DIM}{line}{display.RESET}" if line.startswith("  ")
+                  else f"  {line}")
+        print()
+        return
+
+    directory = " ".join(args) if args else os.getcwd()
+    directory = os.path.abspath(os.path.expanduser(directory))
+    if not os.path.isdir(directory):
+        display.problem(f"'{directory}' is not a directory.")
+        return
+
+    pipeline = None
+    held = agent.registry.held()
+    if held:
+        pipeline = ((held[-1].get("proposal") or {}).get("slots") or {}).get("pipeline")
+    with ui.Activity("reading filenames"):
+        rows, warnings = readset.from_directory(directory, pipeline=pipeline)
+    if not rows:
+        display.problem(f"No FASTQ files in {display._tilde(directory)}.",
+                        "/readset <directory> to look somewhere else.")
+        return
+
+    print()
+    print(f"  {display.DIM}▌{display.RESET} {display.BOLD}{len(rows)} readset(s)"
+          f"{display.RESET}  {display.DIM}·  "
+          f"{len({r['Sample'] for r in rows})} sample(s)  ·  from filenames "
+          f"only{display.RESET}")
+    print()
+    for line in readset.render(rows, pipeline).splitlines()[:12]:
+        print(f"  {display.DIM}{line}{display.RESET}")
+    if len(rows) > 11:
+        print(f"  {display.GREY}… {len(rows) - 11} more{display.RESET}")
+    print()
+    for warning in warnings:
+        print(f"  {display.AMBER}▌{display.RESET} {display.DIM}{warning}"
+              f"{display.RESET}")
+    if warnings:
+        print()
+
+    try:
+        path = ui.ask("Write it where? (blank to not write)",
+                      default=os.path.join(directory, "readset.tsv"))
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not path:
+        display.nothing("Not written.")
+        return
+    try:
+        readset.write(path, rows, pipeline)
+    except FileExistsError:
+        display.problem(f"'{path}' already exists.",
+                        "A readset file is hand-corrected after it is generated "
+                        "— overwriting one destroys those edits.")
+        return
+    except OSError as e:
+        display.problem(f"Could not write it: {e.strerror or e}")
+        return
+    display.done(f"Wrote {display._tilde(path)}",
+                 "Check the Sample column before using it — lanes of one sample "
+                 "must share a name.")
+
+
+def _cmd_verbose(agent, args):
+    """/verbose -- show the agent's working, including what already scrolled by.
+
+    The transcript folds away the commands, the machine output and the
+    connective prose by default, the way a chain of thought is folded away. This
+    unfolds it, and replays what has already happened -- a fold you can only
+    open going forward is not much of a fold.
+    """
+    wanted = True
+    if args and args[0].lower() in ("off", "no", "hide", "quiet"):
+        wanted = False
+    display.set_verbose(wanted)
+    if wanted:
+        display.replay()
+        display.done("Showing the working from here on.", "/verbose off to fold it away again")
+    else:
+        display.done("Folding the working away again.", "/verbose to show it")
 
 
 def _cmd_jobs(agent, args):
@@ -570,14 +1436,14 @@ def _cmd_jobs(agent, args):
         agent.jobs(args[0], only_failed=only_failed)
 
 
-def _cmd_why(agent, args):
-    """/why <name> [question...] -- diagnose a failed run."""
+def _cmd_diagnose(agent, args):
+    """/diagnose <name> [question...] -- diagnose a failed run."""
     if not args:
-        display.problem("usage: /why <name> [question...]")
+        display.problem("usage: /diagnose <name> [question...]")
         return
     name, *rest = args
     with ui.Activity("finding what failed") as act:
-        agent.why(name, question=" ".join(rest) or None, on_step=_narrate(act))
+        agent.diagnose(name, question=" ".join(rest) or None, on_step=_narrate(act))
 
 
 def _cmd_cancel(agent, args):
@@ -626,7 +1492,10 @@ def _cmd_where(agent, args):
     the difference between a run being registered and vanishing. Nothing else in
     the interface shows it.
     """
+    here = preflight.cluster()
     display.where([
+        ("cluster", f"{here}  ({preflight.cluster_ini()})" if here
+                    else "not a recognised Alliance login node"),
         ("launched from", os.getcwd()),
         ("agent workdir", agent.path),
         ("run registry", agent.registry.path),
@@ -652,22 +1521,34 @@ def _cmd_help(agent, args):
 # agent. They are listed anyway so they show up in the menu and in /help like
 # everything else.
 COMMAND_SPECS = [
-    ("new",     "",                   "start a fresh conversation",              "talking",  None),
-    ("approve", "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve),
-    ("reject",  "<name> [why...]",    "send it back with feedback instead",      "deciding", _cmd_reject),
-    ("list",    "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list),
-    ("check",   "<name>",             "how a whole run is doing",                "watching", _cmd_check),
-    ("jobs",    "<name> [failed]",    "the individual jobs inside a run",        "watching", _cmd_jobs),
-    ("history", "",                   "every run recorded, live or gone",        "watching", _cmd_history),
-    ("why",     "<name> [question]",  "diagnose a failed run",                   "fixing",   _cmd_why),
-    ("cancel",  "<name>",             "scancel a run's remaining jobs",          "fixing",   _cmd_cancel),
-    ("track",   "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track),
-    ("where",   "",                   "which directories this is using",         "setup",    _cmd_where),
-    ("user",    "[name]",             "show or change what it calls you",        "setup",    _cmd_user),
-    ("model",   "[provider [model]]", "show or switch the model behind this",    "setup",    _cmd_model),
-    ("key",     "",                   "add or rotate an API key",                "setup",    _cmd_key),
-    ("help",    "",                   "this list",                               "setup",    _cmd_help),
-    ("exit",    "",                   "leave",                                   "setup",   None),
+    ("new",      "",                   "start a fresh conversation",              "talking",  None),
+    ("verbose",  "[off]",              "show or fold away the agent's working",   "talking",  _cmd_verbose),
+    ("approve",  "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve),
+    ("modify",   "<name> [change]",    "rewrite a held run and ask again",        "deciding", _cmd_modify),
+    ("reject",   "<name> [why...]",    "abandon a held run; nothing submitted",   "deciding", _cmd_reject),
+    ("list",     "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list),
+    ("check",    "<name>|all",         "how a run is doing; all groups them",     "watching", _cmd_check),
+    ("monitor",  "<name> [seconds]",   "watch one run until it stops changing",   "watching", _cmd_monitor),
+    ("jobs",     "<name> [failed]",    "the individual jobs inside a run",        "watching", _cmd_jobs),
+    ("history",  "",                   "every run recorded, live or gone",        "watching", _cmd_history),
+    # One verb, not two. /why and /diagnose were the same function under two
+    # names, and the only thing the pair achieved was making people wonder which
+    # to reach for -- the two answers differed by model variance, never by
+    # design. /check already gives the quick why, in its root cause block, for
+    # free and with no model call. This is the one that reads the logs.
+    ("diagnose", "<name> [question]",  "read the logs and explain a failure",     "fixing",   _cmd_diagnose),
+    ("hold",     "<name> [release]",   "stop a run's queued jobs being scheduled", "fixing",  _cmd_hold),
+    ("cancel",   "<name>",             "scancel a run's remaining jobs",          "fixing",   _cmd_cancel),
+    ("sort",     "[names...]",         "hide rows from /list; history keeps them", "fixing",  _cmd_sort),
+    ("scan",     "[path]",             "find GenPipes runs already on disk",      "fixing",   _cmd_scan),
+    ("track",    "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track),
+    ("readset",  "[dir|schema]",       "build a readset file from filenames",     "setup",    _cmd_readset),
+    ("where",    "",                   "which directories this is using",         "setup",    _cmd_where),
+    ("user",     "[name]",             "show or change what it calls you",        "setup",    _cmd_user),
+    ("model",    "[provider [model]]", "show or switch the model behind this",    "setup",    _cmd_model),
+    ("key",      "",                   "add or rotate an API key",                "setup",    _cmd_key),
+    ("help",     "",                   "this list",                               "setup",    _cmd_help),
+    ("exit",     "",                   "leave",                                   "setup",   None),
 ]
 
 COMMANDS = {name: fn for name, _, _, _, fn in COMMAND_SPECS if fn}
@@ -729,29 +1610,73 @@ def _conversation_id():
     return f"chat-{datetime.datetime.now():%m%d-%H%M%S}"
 
 
-def _turn(agent, thread, text):
-    """One exchange: the user's line in, the agent's work out.
+def _at_the_gate(agent, thread, line):
+    """Handle a line typed while this conversation is parked at the gate.
 
-    A conversation parked at the gate is the one case that cannot take a turn.
-    LangGraph would start a fresh superstep and discard the pending interrupt,
-    losing an approval that is still outstanding -- so the run is named instead,
-    along with the two commands that resolve it. The agent refuses this as well
-    (see GenpipeA1.run); saying it here is what makes the refusal legible.
+    Returns True when the line was dealt with here. Order matters and is the
+    whole safety property of this function:
+
+      1. An approval-shaped line is REFUSED, with the command that would work.
+         Zero model calls. Approval is typed, never inferred -- no prose may
+         ever cause a submission, and a helpful assistant that reads "looks
+         good" as consent is the exact failure this gate exists to prevent.
+      2. Anything else routes to the /modify path, stating the interpretation
+         first so a misreading is visible while it is still free.
+      3. Two held runs and bare prose is ambiguous. Ask; do not guess.
+
+    What it must never do is call agent.run(). A held conversation cannot take a
+    normal turn: LangGraph starts a fresh superstep and DISCARDS the pending
+    interrupt, destroying an approval that is still outstanding. That failure is
+    silent -- it looks exactly like it worked.
     """
     waiting = agent.registry.held_for_thread(thread)
-    if waiting:
+    if not waiting:
+        return False
+    name = waiting["name"]
+
+    if modify.is_approval_shaped(line):
         display.problem(
-            f"'{waiting['name']}' is still waiting for your decision.",
-            f"/approve {waiting['name']}  ·  /reject {waiting['name']} <what to "
-            f"change>  ·  /new to start a separate conversation")
+            "Approval has to be typed as a command.",
+            f"/approve {name}   ·   nothing has reached the scheduler")
+        return True
+
+    held = agent.registry.held()
+    if len(held) > 1:
+        names = ", ".join(r["name"] for r in held)
+        display.problem(
+            "There is more than one run waiting, so I will not guess which "
+            "this is about.",
+            f"/modify <name> {line}   ·   held: {names}")
+        return True
+
+    display.reading_as(name, line)
+    _modify_direct(agent, name, line)
+    return True
+
+
+def _turn(agent, thread, text, raw=None, label="thinking"):
+    """One exchange: the user's line in, the agent's work out.
+
+    A conversation parked at the gate does not take a normal turn -- see
+    _at_the_gate for what happens instead and why it must not reach agent.run().
+
+    Ctrl+C interrupts the AGENT, not the session. It abandons this answer and
+    returns to the prompt with the conversation intact, which is what people
+    expect from every other assistant with a spinner in it: stopping a reply is
+    not the same as leaving. Nothing that was on its way to the scheduler can
+    survive it, because nothing reaches the scheduler without /approve.
+    """
+    if _at_the_gate(agent, thread, raw if raw is not None else text):
         return
-    print()
     try:
-        with ui.Activity("thinking") as act:
+        with ui.Activity(label) as act:
             agent.on_ask = _asker(act)
             agent.run(text, thread_id=thread, on_step=_narrate(act))
     except KeyboardInterrupt:
-        display.problem("Stopped.", "Nothing has reached the scheduler.")
+        print()
+        display.nothing("Stopped.",
+                        "Nothing reached the scheduler. The conversation is "
+                        "still here — say something else, or /new to start over.")
     except Exception as e:
         display.problem(f"{type(e).__name__}: {e}")
     finally:
@@ -763,8 +1688,8 @@ def _turn(agent, thread, text):
 # waiting for one, and everything else applies only to a run that has actually
 # been submitted. Offering the wrong set is how you end up typing /check on a run
 # that has not run.
-_DECIDE = ("approve", "reject")
-_WATCH = ("check", "jobs", "why", "cancel")
+_DECIDE = ("approve", "reject", "modify")
+_WATCH = ("check", "jobs", "diagnose", "cancel", "monitor", "hold")
 
 
 def _run_names(agent, command):
@@ -798,6 +1723,85 @@ def _run_note(record):
                     if slots.get(k)) or (record.get("proposal") or {}).get("command", "")
     check = record.get("last_check") or {}
     return f"{what}  {check.get('verdict', '')}".strip()
+
+
+def _preparing(agent, state, line):
+    """Decide whether this line is the beginning of a run, and say so once.
+
+    Returns (state, extra) -- the carried preparation and an extra context block
+    for the model, or None. `state` is a prep.Preparation that persists across
+    turns: forgetting what was already settled is the single most damaging thing
+    this flow could do, because being asked twice for a readset you already
+    named is what makes people go back to writing the command by hand.
+
+    Three outcomes:
+
+      already preparing   Stay in it. Learn whatever this line settled and say
+                          nothing more -- the label is already on screen.
+      ambiguous           One short clarification, asked before a model call is
+                          spent either way. Not a guess in either direction:
+                          guessing "question" wastes their time, guessing "run"
+                          starts spending it.
+      a run               Enter it, and tell the model what the scientific
+                          description was understood to mean so it does not ask
+                          again for something already said in other words.
+    """
+    intent = prep.intent(line)
+    found = prep.goal(line)
+
+    if state.active:
+        if found:
+            state.learn(pipeline=found.pipeline, protocol=found.protocol,
+                        described=found.described)
+        return state, None
+
+    if intent == prep.QUESTION:
+        return state, None
+
+    if intent == prep.AMBIGUOUS:
+        answer = ui.choose(
+            prep.CLARIFY,
+            [slots.Option("talk", "help me choose the analysis"),
+             slots.Option("run", "prepare the run")],
+            free_text=False)
+        if answer != "run":
+            return state, None
+
+    state.active = True
+    if found:
+        state.learn(pipeline=found.pipeline, protocol=found.protocol,
+                    described=found.described)
+
+    print(f"  {display.GREEN}●{display.RESET} {display.BOLD}Preparing run…"
+          f"{display.RESET}")
+    summary = prep.summary(state)
+    if summary:
+        print(f"    {display.DIM}{summary}{display.RESET}")
+    print()
+
+    if not found:
+        return state, None
+
+    # What the description was taken to mean, stated to the model as settled.
+    # The pipeline is inferred readily -- it is visible in the gate box and a
+    # wrong one costs one correction. A protocol is passed on ONLY where the
+    # mapping is unambiguous, because a wrong protocol produces a run that
+    # completes successfully and answers a different question.
+    lines = [f"The user is asking for a run, not an explanation. They described "
+             f"the goal as: {found.described}."]
+    lines.append(f"That is the {found.pipeline} pipeline. Do not ask them to "
+                 f"choose a pipeline; they have described one.")
+    if found.protocol:
+        lines.append(f"The protocol that means is -t {found.protocol}. Do not "
+                     f"ask them to choose a protocol either.")
+    else:
+        lines.append("The protocol is NOT determined by what they said. Ask "
+                     "for it -- do not guess, it decides which callers run and "
+                     "what the numbers at the end mean.")
+    lines.append("Do not ask about the step range or the cluster config: every "
+                 "step is the default, and the cluster ini for this machine is "
+                 "not a decision. Ask only for documents the protocol requires.")
+    return state, "\n".join(lines)
 
 
 def _briefed(line, already_sent):
@@ -838,7 +1842,7 @@ def _repl(agent):
     guessed at.
 
     One conversation can produce any number of runs. Each is named at the gate
-    and lives on under that name -- /list, /check and /why are about runs, and
+    and lives on under that name -- /list, /check and /diagnose are about runs, and
     outlive the conversation that started them.
 
     The prompt is created once and kept, so history survives across turns.
@@ -846,6 +1850,7 @@ def _repl(agent):
     prompt = ui.Prompt(MENU, arguments=lambda cmd: _run_names(agent, cmd))
     thread = _conversation_id()
     context = None              # the last directory brief sent on this thread
+    preparation = prep.Preparation()
 
     while True:
         try:
@@ -853,10 +1858,22 @@ def _repl(agent):
         except EOFError:
             break
         except KeyboardInterrupt:
+            # Ctrl+C at an idle prompt clears the line and stays. Leaving is
+            # Ctrl+D or /exit, and it has to be a different key from the one
+            # that means "stop what you are doing" -- a single keystroke that
+            # sometimes clears a line and sometimes ends the session is the
+            # thing that made people afraid to press it.
             continue
 
         if not line:
             continue
+
+        # Drawn here, the moment it is read, rather than when the message
+        # streams back through the transcript. Two reasons: the input box has
+        # just erased itself, so this is the only copy; and anything printed
+        # about the line -- the "Preparing run…" heading in particular -- has to
+        # come after it, which it cannot if the echo waits for the graph.
+        display.echo(line)
 
         if line.startswith("/"):
             parts = line[1:].split()
@@ -868,6 +1885,7 @@ def _repl(agent):
             if cmd == "new":
                 thread = _conversation_id()
                 context = None
+                preparation = prep.Preparation()
                 display.fresh(agent.pending())
                 continue
             handler = COMMANDS.get(cmd)
@@ -877,17 +1895,50 @@ def _repl(agent):
                 continue
             try:
                 handler(agent, args)
+            except KeyboardInterrupt:
+                # A command interrupted mid-flight -- a panel escaped, a monitor
+                # stopped -- returns to the prompt. Without this it propagates
+                # out of _repl and ends the session, which is how Ctrl+C came to
+                # mean two different things depending on when you pressed it.
+                print()
+                display.nothing("Stopped.")
             except Exception as e:
                 print(f"  {display.RED}{type(e).__name__}: {e}{display.RESET}\n")
             continue
+
+        try:
+            # A conversation parked at the gate is not preparing anything: the
+            # run is already built and this line is a decision about it. Asking
+            # "would you like help choosing the analysis, or should I prepare
+            # the run?" in front of a HOLD box would be absurd, and the brief
+            # would be a wasted directory listing.
+            if agent.registry.held_for_thread(thread):
+                extra = None
+                _turn(agent, thread, line, raw=line)
+                continue
+            preparation, extra = _preparing(agent, preparation, line)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            continue
+        except Exception as e:
+            display.problem(f"{type(e).__name__}: {e}")
+            extra = None
 
         try:
             text, context = _briefed(line, context)
         except Exception as e:
             display.problem(f"{type(e).__name__}: {e}")
             text = line
+        if extra:
+            text = f"{text}\n\n{intake.CONTEXT_MARK}\n{extra}\n"
 
-        _turn(agent, thread, text)
+        _turn(agent, thread, text, raw=line,
+              label="preparing the run" if preparation.active else "thinking")
+        # A run reaching the gate is the end of preparing it. Leaving the state
+        # set would make the next question in the same conversation arrive under
+        # a "Preparing run…" heading that no longer means anything.
+        if agent.registry.held_for_thread(thread):
+            preparation = prep.Preparation()
 
 
 def main(argv=None):
@@ -916,6 +1967,9 @@ def main(argv=None):
     # not in front of a blank terminal. It shows whatever model is already
     # configured; on a first launch there isn't one yet, and ready() below
     # states it once the key prompt has settled the question.
+    # The CLI draws the person's own turns itself -- see _repl -- so the
+    # transcript must not draw them a second time.
+    display.ECHOED = True
     display.banner(source=os.environ.get("GENPIPE_LLM_SOURCE"),
                    model=os.environ.get("GENPIPE_LLM_MODEL"))
     # Who we are talking to. Asked before the key prompt because it is the

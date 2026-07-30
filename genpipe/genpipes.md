@@ -1,4 +1,12 @@
-# GenPipes on Rorqual (v6.1.1, DRAC)
+# GenPipes on the Digital Alliance (v6.1.1)
+
+Written against Rorqual and Narval. They differ in exactly one place that
+matters — the cluster ini, which carries the partitions, the walltimes and the
+resource macros — so everywhere this document says "the cluster ini" it means
+`common_ini/<cluster>.ini` for the machine you are actually logged into. Get it
+from `hostname` rather than from memory: `rorqual*` takes `rorqual.ini`,
+`narval*` takes `narval.ini`. Using the wrong one generates and submits, and
+then every job is rejected for a partition that does not exist there.
 
 This is the basis: what is true for every GenPipes run, and what `--help` cannot
 tell you. Everything pipeline-specific — flags, protocol values, step numbers,
@@ -46,8 +54,9 @@ Four environment variables matter, normally set in `~/.bash_profile`:
 | `RAP_ID` | the Alliance allocation jobs are billed to, e.g. `rrg-bourqueg-ad` |
 | `JOB_MAIL` | address for job notifications |
 
-`RAP_ID` and `JOB_MAIL` are not GenPipes settings. `common_ini/rorqual.ini`
-interpolates them straight into every generated `sbatch` line:
+`RAP_ID` and `JOB_MAIL` are not GenPipes settings. The cluster ini
+(`common_ini/rorqual.ini`, `common_ini/narval.ini`) interpolates them straight
+into every generated `sbatch` line:
 
 ```ini
 cluster_other_arg = --mail-type=END,FAIL --mail-user=$JOB_MAIL -A $RAP_ID
@@ -94,7 +103,7 @@ genpipes <pipeline> [-t <protocol>] \
 `-t` selects a protocol; pipelines with only one do not take it. `-r` is
 required everywhere. `-d` and `-p` are mutually exclusive — never both. `-s`
 takes `1-5`, `3,6,7` or `2,4-8`, with the last number from `--help`. `-j`
-defaults to `slurm` on Rorqual. `-g` names the generation artifact; always use
+defaults to `slurm` on every Alliance cluster. `-g` names the generation artifact; always use
 it, never the deprecated `> cmd.sh` redirect.
 
 ## 5. The `-c` stack
@@ -118,10 +127,29 @@ applied left to right, later winning. Each layer answers a different question:
    protocol: it sets `experiment_type=exome` and touches both germline and
    somatic sections, so it stacks *with* the feature ini when the reads are
    capture rather than whole-genome.
-4. **cluster ini** — `common_ini/rorqual.ini` here. Carries partitions,
-   walltimes and the `RAP_ID`/`JOB_MAIL` line.
-5. **genome ini** — only for a non-default genome, at
-   `$MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/<Species>.<assembly>.ini`.
+4. **cluster ini** — `common_ini/<cluster>.ini`, matching the machine you are
+   on: `rorqual.ini` on Rorqual, `narval.ini` on Narval. Carries partitions,
+   walltimes, the resource macros and the `RAP_ID`/`JOB_MAIL` line. Check
+   `hostname`; do not assume.
+5. **genome ini** — only for a non-default genome. **Find it by looking, not by
+   deriving it from the species name.** The directory is
+   `$MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/`, and it holds
+   SEVERAL inis: an unversioned `<Species>.<assembly>.ini` and one per Ensembl
+   release, e.g. `Mus_musculus.GRCm38.Ensembl83.ini`. The unversioned one is not
+   reliably the one whose indexes exist.
+
+   ```bash
+   ls $MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/*.ini
+   ls $MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/genome/star_index/
+   ```
+
+   Pick the versioned ini whose release has a `star_index/` built, at an
+   `sjdbOverhang` matching read length minus one (101 bp reads want
+   `sjdbOverhang99`). This matters because the naming rule is right for human
+   and wrong elsewhere: `Mus_musculus.GRCm38.ini` pins Ensembl 102, while the
+   only STAR index built for GRCm38 on this install is Ensembl 83. That run
+   generates cleanly, submits cleanly, and dies at `star_align` with no index —
+   the worst shape of failure, because everything before it looked right.
 6. **your own overrides** — last word.
 
 A private override ini is just a file with the sections you want to change,
@@ -301,6 +329,12 @@ Reporting rules:
   "likely".
 - Never propose a resource value that cannot be computed from what was observed
   and traced to a config section. Quote the section and its current value.
+- Resubmit the **full original `-s` range**, never one narrowed to the failure.
+  GenPipes skips steps whose output is up to date, so the full range costs
+  nothing extra; everything downstream of a failure was `CANCELLED` and has no
+  output to skip against. Narrowing is how a run ends up silently half finished.
+- Put a resource fix in a private override ini **appended last to `-c`**. One
+  that is not last is overruled, which looks exactly like a fix that did nothing.
 
 Worked example. Job 15985499 ended `TIMEOUT`, killed at 3:00:06 against a
 3:00:00 limit at 99.2% CPU efficiency — working when killed. `log_report` puts
@@ -318,6 +352,21 @@ ceiling and a `.o` that stops mid-sentence, so raise `cluster_mem` for that
 section, sized from the observed `MaxRSS`. Generation failure: no `job_output`
 at all and an explicit "REQUIRED parameter ... is not defined" on stderr.
 
+## 13. Data you must not open
+
+Everything here is done from **structure** — filenames, directory layout, column
+headers, the readset/design formats, `--help`, the scheduler. None of it needs a
+single read. So never `cat`, `head`, `zcat` or `grep` the contents of `*.fastq*`,
+`*.bam`, `*.cram`, `*.sam`, `*.vcf*`, `*.bed`, `*.bw` or a count matrix.
+
+Names, sizes and presence are fair game and are usually the whole answer: `ls`
+says how many files, the readset says how they group, `sacct` says what happened
+to them. Readset, design and pairs files are the exception — they are the
+specification, not the data — but read their shape, not their contents.
+
+If a question truly cannot be answered without opening a data file, say so and
+let the person decide. Opening it quietly is not an option.
+
 ## Hard rules
 
 - Prefix every call with `module load mugqic/genpipes/6.1.1 &&` in the same
@@ -329,3 +378,5 @@ at all and an explicit "REQUIRED parameter ... is not defined" on stderr.
 - Never supply both `-d` and `-p`.
 - Never take a step number from this document. There are none here by design.
 - Never submit twice.
+- Never read the contents of a FASTQ, BAM, CRAM, VCF or result file. Names,
+  sizes and structure are enough — see section 13.

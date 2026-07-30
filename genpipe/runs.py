@@ -72,6 +72,11 @@ ACTIVE_STATES = {"RUNNING", "PENDING", "CONFIGURING", "COMPLETING",
 HELD = "held"
 SUBMITTED = "submitted"
 GONE = "gone"
+# A held run the user gave up on. Terminal, and the whole reason it exists: with
+# only held/submitted, a run you have mentally dropped keeps appearing in the
+# startup pending list and in /list forever, because there was no way to say no.
+# Nothing was submitted; the record and the reason stay in /history.
+ABANDONED = "abandoned"
 
 # GenPipes version whose `tools log_report` we call. Same pin as genpipes.md.
 GENPIPES_MODULE = "mugqic/genpipes/6.1.1"
@@ -168,7 +173,9 @@ class Registry:
         current = {}
         for r in records:
             current[r["name"]] = r          # last record per name wins
-        return [r for r in current.values() if r["status"] != GONE]
+        return [r for r in current.values()
+                if r["status"] not in (GONE, ABANDONED)
+                and not r.get("hidden")]
 
     def held(self):
         """Runs paused at the gate, waiting for a decision."""
@@ -194,7 +201,7 @@ class Registry:
         """`wanted` if it's free, else the first `wanted-2`, `wanted-3`, ... that is.
 
         A name has to identify exactly one run, because it is what /approve,
-        /check and /why are given. One conversation routinely produces several
+        /check and /diagnose are given. One conversation routinely produces several
         runs of the same pipeline, so the obvious derived name collides on the
         second one; this is what keeps them apart without asking anybody.
         """
@@ -265,6 +272,103 @@ class Registry:
                                    workdir=os.path.dirname(os.path.dirname(job_list)),
                                    source="manual")
 
+    def adopt(self, name, found):
+        """Register a run that /scan discovered on disk.
+
+        Same destination as track(), with two differences worth keeping. The
+        pipeline and protocol read off the job-list filename are stored as a
+        proposal, so /list can say what a discovered run is without a scheduler
+        call. And every job list under the same run directory is kept as
+        `attempts`: re-running a pipeline in one place is several submissions of
+        one logical run, and the newest is the one worth checking.
+        """
+        record = self.mark_submitted(
+            name, found["job_list"], workdir=found["workdir"],
+            proposal={"command": "", "slots": {"pipeline": found.get("pipeline"),
+                                               "protocol": found.get("protocol")}},
+            source="scan")
+        return self.update(name, attempts=found.get("attempts") or [found["job_list"]],
+                           discovered_at=_now())
+
+    def abandon(self, name, reason=None):
+        """Retire a held run. Nothing submitted, nothing regenerated.
+
+        The terminal end of /reject. It leaves held(), so it stops appearing in
+        /list and in the startup pending line -- which is the entire point, and
+        is achieved by the status change alone rather than by a deletion. The
+        record and the reason stay in /history, because "why did I not run
+        that?" is a question people ask months later.
+
+        Refused on a submitted run: there the name is tied to a job list and
+        real jobs, and abandoning it would hide a live thing.
+        """
+        record = self.get(name)
+        if record is None:
+            return None
+        if record["status"] != HELD:
+            return record
+        fields = {"status": ABANDONED, "abandoned_at": _now()}
+        if reason:
+            fields["abandoned_because"] = reason
+        record = self.update(name, **fields)
+        if reason:
+            self.add_note(name, f"abandoned: {reason}")
+        return self.get(name)
+
+    def rename(self, name, wanted):
+        """Give a held run a different name. Returns the name it ended up with.
+
+        A rename changes no flags and needs no regeneration -- it is a registry
+        write and nothing else, which is what makes it the one row at the gate
+        that costs no model call.
+
+        Only a held run may be renamed. After submission the name is the handle
+        for a job list and for jobs already on the scheduler, and moving it
+        would strand them.
+
+        Every record for the old name is rewritten, not just the current one.
+        The store is append-only and get() takes the last match, so leaving the
+        older records behind would leave a run findable under a name it no
+        longer has -- a ghost that /approve could reach and /list could not.
+        """
+        record = self.get(name)
+        if record is None or record["status"] != HELD:
+            return None
+        settled = self.unique_name(wanted)
+        if settled == name:
+            return name
+        records = self.load()
+        for r in records:
+            if r["name"] == str(name):
+                r["name"] = settled
+                r["renamed_from"] = str(name)
+        self.save(records)
+        return settled
+
+    def hide(self, name, hidden=True):
+        """Drop a run out of /list without losing it.
+
+        What /sort's discard does. Deliberately not a deletion: a registry that
+        can forget is a registry you cannot trust to answer "what did I run in
+        June?", and the reason to clear a row is nearly always that it is old
+        rather than that it is wrong.
+        """
+        return self.update(name, hidden=bool(hidden))
+
+    def remember_reasons(self, name, reasons):
+        """Persist the pending reasons observed while the run was still queued.
+
+        The one exception to "never cache scheduler state". Job states are
+        permanent in sacct and must always be re-read; pending REASONS are
+        perishable -- sacct never records them at all, and squeue drops a job
+        the moment it leaves the queue. So once a run dies, "these 28 were
+        waiting on a dependency that could never be satisfied" is unrecoverable
+        unless it was written down while it was still true.
+        """
+        if not reasons:
+            return self.get(name)
+        return self.update(name, last_reasons={"at": _now(), "reasons": reasons})
+
     def update(self, name, **fields):
         """Merge fields into the last record for a name. Returns it, or None."""
         records = self.load()
@@ -290,7 +394,7 @@ class Registry:
             "at": _now(), "counts": counts, "total": total, "verdict": verdict})
 
     def add_note(self, name, text):
-        """Attach a finding to a run -- what /why concluded, in one line.
+        """Attach a finding to a run -- what /diagnose concluded, in one line.
 
         This is what makes the registry compound in value: six weeks later
         /history can say `patient-42 . failed . OOM in picard_mark_duplicates`
@@ -360,6 +464,7 @@ def _normalise(record):
     record.setdefault("workdir", None)
     record.setdefault("proposal", None)
     record.setdefault("gone", False)
+    record.setdefault("hidden", False)
     if "status" not in record:
         record["status"] = GONE if record["gone"] else SUBMITTED
     # Keep the two representations agreeing, whichever way the record arrived.
@@ -381,7 +486,7 @@ class Job:
     """
 
     __slots__ = ("job_id", "name", "step", "log", "state", "elapsed",
-                 "maxrss", "exit_code")
+                 "maxrss", "exit_code", "start", "timelimit", "reason")
 
     def __init__(self, job_id=None, name="", log=None):
         self.job_id = job_id
@@ -395,6 +500,9 @@ class Job:
         self.elapsed = None
         self.maxrss = None
         self.exit_code = None
+        self.start = None
+        self.timelimit = None
+        self.reason = None
 
     @property
     def failed(self):
@@ -489,17 +597,25 @@ def find_job_list(workdir, since, output_dir=None, script=None):
 def parse_job_list(path):
     """Read a GenPipes job_list file into Job objects.
 
-    Deliberately tolerant about the column layout. GenPipes writes this file for
-    its own `log_report` to read back, the format has moved between versions,
-    and it is not a documented interface -- so rather than hardcode a column
-    order that a version bump can invalidate, each field is identified by what
-    it looks like:
+    The manifest is a stable four-column, tab-separated, POSITIONAL format, and
+    GenPipes' own `get_report` hardcodes those positions:
 
-        the job id    the field that is all digits (or 12345_7 for an array task)
-        the log       the field that looks like a path to a .o/.out/.log file
-        the name      the longest field that is neither of those
+        job_id <TAB> job_name <TAB> dependencies <TAB> output_file_relpath
 
-    The consequence is that a format change costs us a field, not the feature.
+    Column 3 is a colon-joined list of the job ids this one waits on, empty for
+    a job with no dependencies. That column is why the old "identify each field
+    by what it looks like" heuristic had to go: for a fan-in job -- a multiqc
+    that waits on thirteen upstream jobs -- the dependency string is 129
+    characters and beats the real name at "longest field that is neither the id
+    nor the log". Two of the 46 jobs on the first real manifest this was checked
+    against parsed as a colon-joined id list instead of a name, which also
+    corrupts Job.step, and therefore what triage() groups by and what /diagnose is
+    told broke.
+
+    So: positions when the line has exactly four fields, which is every line
+    GenPipes writes. The old heuristic stays for any other shape, because a
+    format change should cost a field rather than the feature -- it just no
+    longer gets to overrule a manifest that is telling us plainly.
     """
     jobs = []
     if not path or not os.path.exists(path):
@@ -509,8 +625,16 @@ def parse_job_list(path):
             line = line.rstrip("\n")
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
-            fields = line.split("\t") if "\t" in line else line.split()
-            fields = [x.strip() for x in fields if x.strip()]
+            if "\t" in line:
+                fields = [x.strip() for x in line.split("\t")]
+                if len(fields) == 4:
+                    job_id, name, _deps, log = fields
+                    jobs.append(Job(job_id=job_id or None, name=name,
+                                    log=log or None))
+                    continue
+                fields = [x for x in fields if x]
+            else:
+                fields = [x for x in line.split() if x]
             if not fields:
                 continue
 
@@ -522,6 +646,157 @@ def parse_job_list(path):
             name = max(rest, key=len) if rest else (job_id or "?")
             jobs.append(Job(job_id=job_id, name=name, log=log))
     return jobs
+
+
+# ===========================================================================
+#  Discovery: finding runs that already exist on disk. What /scan is.
+#
+#  Read-only, deterministic, and metadata-only. It looks at job-list filenames,
+#  generated command-file names, config traces and directory names -- never at a
+#  FASTQ, a BAM, a VCF, a result table or the contents of a readset. The agent
+#  does not need to read anybody's data in order to recognise a run, and this is
+#  the module where that could most easily have stopped being true.
+# ===========================================================================
+
+# GenPipes names a job list `<Pipeline>.<protocol>.job_list.<TIMESTAMP>`, where
+# the pipeline is CamelCase and the protocol is the -t value verbatim. That
+# filename is the single most informative artifact a finished run leaves, and it
+# is a name rather than a payload -- which is exactly why it is what we read.
+_JOB_LIST = re.compile(
+    r"^(?P<pipeline>[A-Za-z0-9]+)"
+    r"(?:\.(?P<protocol>[A-Za-z0-9_]+))?"
+    r"\.job_list\.(?P<stamp>[0-9T.\-]+)$")
+
+# CamelCase pipeline name -> the flag value you would type. Derived rather than
+# hardcoded where it can be (DnaSeq -> dnaseq), with the two-word ones that do
+# not lower-case cleanly spelled out.
+_PIPELINE_FROM_FILE = {
+    "dnaseq": "dnaseq",
+    "rnaseq": "rnaseq",
+    "rnaseqlight": "rnaseq_light",
+    "rnaseqdenovoassembly": "rnaseq_denovo_assembly",
+    "chipseq": "chipseq",
+    "methylseq": "methylseq",
+    "covseq": "covseq",
+    "nanoporecovseq": "nanopore_covseq",
+    "ampliconseq": "ampliconseq",
+    "longreaddnaseq": "longread_dnaseq",
+}
+
+# How deep to walk. A GenPipes run puts its job list at <run>/job_output/, so
+# three levels below the directory you named is already generous; walking a
+# whole project space on Lustre is minutes of IO for a listing nobody asked to
+# wait for.
+SCAN_DEPTH = 4
+
+
+def discover(root, depth=SCAN_DEPTH, limit=200):
+    """Every GenPipes run under `root`, as candidate registry records.
+
+    One entry per RUN DIRECTORY, not per job list. Re-running the same pipeline
+    in the same place is a second submission attempt of one logical run, and
+    listing it twice would put two rows in /list that mean the same thing --
+    so the attempts are collected together and the newest is the one that gets
+    checked, with the rest kept as history.
+
+    Returns [{name, pipeline, protocol, workdir, job_list, attempts, at}], newest
+    first. `pipeline` and `protocol` are None rather than guessed when the
+    filename does not say -- an unknown shown as unknown is worth more than a
+    plausible invention, because the thing on the other end of the guess is a
+    cluster.
+    """
+    root = os.path.abspath(os.path.expanduser(root or "."))
+    if not os.path.isdir(root):
+        return []
+
+    by_dir = {}
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    for here, dirnames, filenames in os.walk(root):
+        if here.count(os.sep) - base_depth >= depth:
+            dirnames[:] = []
+        # Nothing in these can be a run, and raw_reads/ in particular is where
+        # the data lives -- descending into it would be both slow and exactly
+        # the thing this command promises not to do.
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".")
+                       and d not in ("raw_reads", "trim", "alignment", "metrics",
+                                     "report", "tracks", "variants", "peak_call",
+                                     "methylation", "kallisto")]
+        if os.path.basename(here) != "job_output":
+            continue
+        run_dir = os.path.dirname(here)
+        for fn in filenames:
+            m = _JOB_LIST.match(fn)
+            if not m:
+                continue
+            path = os.path.join(here, fn)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            entry = by_dir.setdefault(run_dir, {"attempts": [], "workdir": run_dir})
+            entry["attempts"].append({
+                "job_list": path,
+                "pipeline": _pipeline_of(m.group("pipeline")),
+                "protocol": m.group("protocol"),
+                "at": mtime,
+            })
+        if len(by_dir) >= limit:
+            break
+
+    found = []
+    for run_dir, entry in by_dir.items():
+        attempts = sorted(entry["attempts"], key=lambda a: a["at"], reverse=True)
+        newest = attempts[0]
+        found.append({
+            "name": suggest_scan_name(run_dir, newest["pipeline"],
+                                      newest["protocol"], newest["at"]),
+            "pipeline": newest["pipeline"],
+            "protocol": newest["protocol"],
+            "workdir": run_dir,
+            "job_list": newest["job_list"],
+            "attempts": [a["job_list"] for a in attempts],
+            "at": newest["at"],
+        })
+    return sorted(found, key=lambda f: f["at"], reverse=True)
+
+
+def _pipeline_of(word):
+    """`DnaSeq` -> `dnaseq`, or None when the name is not one we recognise."""
+    if not word:
+        return None
+    return _PIPELINE_FROM_FILE.get(word.lower())
+
+
+def suggest_scan_name(run_dir, pipeline, protocol, when=None):
+    """A proposed run id for a discovered run.
+
+    Built from the directory it lives in plus what the job list says it was,
+    because the directory name is what the person who made it chose to call it
+    and is therefore the part they will recognise. The date keeps repeat runs of
+    the same thing in the same place apart.
+    """
+    stem = re.sub(r"[^a-z0-9]+", "-", os.path.basename(run_dir).lower()).strip("-")
+    parts = [p for p in (stem, protocol or pipeline) if p]
+    slug = "-".join(dict.fromkeys("-".join(parts).split("-")))[:40].strip("-")
+    day = datetime.datetime.fromtimestamp(when or 0) if when else datetime.datetime.now()
+    return f"{slug or 'run'}-{day:%m%d}"
+
+
+def already_known(registry, found):
+    """The existing record this discovered run duplicates, or None.
+
+    Matched on the job list first and the run directory second. Both matter: the
+    same run adopted twice under two names would put two rows in /list that
+    cannot be told apart, and a /scan that silently re-added everything it found
+    would make the command unusable the second time you ran it.
+    """
+    for record in registry.load():
+        if record.get("job_list") and record["job_list"] == found["job_list"]:
+            return record
+        if record.get("workdir") and os.path.abspath(record["workdir"]) == found["workdir"]:
+            return record
+    return None
 
 
 def _run(cmd, env=None):
@@ -554,7 +829,7 @@ def query_states(job_ids):
         chunk = ids[i:i + _SACCT_CHUNK]
         raw, code = _run(
             "sacct --noheader --parsable2 "
-            "--format=JobID,JobName,State,Elapsed,MaxRSS,ExitCode "
+            "--format=JobID,JobName,State,Elapsed,MaxRSS,ExitCode,Start,Timelimit "
             f"-j {','.join(chunk)}")
         if code != 0:
             continue
@@ -567,13 +842,73 @@ def query_states(job_ids):
                 continue
             # "CANCELLED by 12345" -> "CANCELLED"; the who is not our business.
             state = parts[2].strip().split()[0] if parts[2].strip() else None
+
+            def field(i):
+                return parts[i].strip() if len(parts) > i and parts[i].strip() else None
+
             states[job_id] = {
                 "state": state,
-                "elapsed": parts[3].strip() if len(parts) > 3 else None,
-                "maxrss": parts[4].strip() if len(parts) > 4 else None,
-                "exit_code": parts[5].strip() if len(parts) > 5 else None,
+                "elapsed": field(3),
+                "maxrss": field(4),
+                "exit_code": field(5),
+                "start": field(6),
+                "timelimit": field(7),
             }
     return states
+
+
+def query_reasons(job_ids):
+    """Ask the live queue why each still-queued job is still queued.
+
+    Returns {job_id: (state, reason)} for the jobs squeue still knows about --
+    which is only the pending and running ones. Everything else has left the
+    queue and is simply absent, which is not an error and not a gap.
+
+    This is the half sacct cannot answer. `sacct --format=Reason` returns None
+    for every job on this cluster, verified across a whole 46-job run including
+    all 43 that were cancelled. So a pending job's reason exists in exactly one
+    place and stops existing the moment the job leaves the queue, and the one
+    reason that matters -- DependencyNeverSatisfied, a job that will never run
+    while sacct still calls it PENDING -- is unrecoverable after the fact.
+
+    Empty dict when there is nothing to ask about, and the caller must not make
+    the call at all in that case: on a finished run squeue has nothing to say
+    and the interface should say so rather than imply it was consulted.
+    """
+    reasons = {}
+    ids = [j for j in job_ids if j]
+    if not ids:
+        return reasons
+    for i in range(0, len(ids), _SACCT_CHUNK):
+        chunk = ids[i:i + _SACCT_CHUNK]
+        raw, code = _run("squeue --noheader -o '%i|%T|%r' "
+                         f"--jobs={','.join(chunk)}")
+        if code != 0:
+            continue
+        for line in raw.splitlines():
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            reasons[parts[0].strip()] = (parts[1].strip(), parts[2].strip())
+    return reasons
+
+
+def scheduler_reachable():
+    """Is there a scheduler to ask at all?
+
+    Asked only when a state query came back empty, because empty has two
+    meanings that must not be reported the same way:
+
+        sacct is not there            -> we know nothing, and must say so
+        sacct does not know these ids -> the ids are UNKNOWN, which is a fact
+
+    Reporting the second as the first tells somebody their cluster is
+    unreachable when it is fine; reporting the first as the second invents
+    fifteen UNKNOWN jobs out of a missing binary. `--version` is the cheapest
+    question sacct answers and it needs no ids.
+    """
+    _, code = _run("sacct --version")
+    return code == 0
 
 
 def jobs_for(record, with_states=True):
@@ -584,11 +919,19 @@ def jobs_for(record, with_states=True):
         for j in jobs:
             info = states.get(j.job_id or "")
             if info:
-                j.state = info["state"]
-                j.elapsed = info["elapsed"]
-                j.maxrss = info["maxrss"]
-                j.exit_code = info["exit_code"]
+                _attach(j, info)
     return jobs
+
+
+def _attach(job, info):
+    """Copy one sacct row onto a Job. One place, so resolve() and jobs_for()
+    cannot end up disagreeing about which fields were carried across."""
+    job.state = info.get("state")
+    job.elapsed = info.get("elapsed")
+    job.maxrss = info.get("maxrss")
+    job.exit_code = info.get("exit_code")
+    job.start = info.get("start")
+    job.timelimit = info.get("timelimit")
 
 
 def counts(jobs):
@@ -614,6 +957,314 @@ def verdict(tally):
     if tally.get("UNKNOWN"):
         return "state unknown"
     return "complete"
+
+
+# ===========================================================================
+#  resolve(): what a run is ACTUALLY doing, asked of the scheduler.
+#
+#  The thing this replaces, and why
+#  --------------------------------
+#  check() used to report a run's status from `genpipes tools log_report`. That
+#  command never contacts Slurm. It infers state from files on disk, and on a
+#  dead run it reports the run as alive. Measured on a real 46-job run that died
+#  at 10:12 on 2026-07-27:
+#
+#      source        COMPLETED  RUNNING  PENDING  TIMEOUT  CANCELLED
+#      log_report            1        2       43        -          -
+#      sacct (truth)         1        -        -        2         43
+#
+#  Two mechanisms, both structural. A job with no .o file on disk is hardcoded
+#  PENDING; a job whose .o has a PROLOGUE line and no EPILOGUE reads RUNNING
+#  forever. The second is the dangerous one -- "2 RUNNING" is the affirmative
+#  signal that says a pipeline is alive.
+#
+#  No amount of better file-reading fixes it. Every artifact GenPipes leaves is
+#  written BY THE JOB ITSELF: the prologue needs the job to have started, the
+#  epilogue needs the shell to exit normally (a SIGKILL bypasses a bash EXIT
+#  trap), the .done file needs exit status 0. So "never started" and "died
+#  violently" -- the two states that define a dead run -- are exactly the two
+#  the filesystem is structurally incapable of recording. The record is
+#  monotonic and success-only. On that run: 46 submitted, 3 ever started, 1
+#  succeeded. The filesystem knew about 3.
+#
+#  log_report is not lying. Its vocabulary is about artifacts, not about Slurm:
+#  PENDING means "no .o file yet", RUNNING means "prologue, no epilogue". The
+#  defect was reading filesystem words as scheduler words.
+# ===========================================================================
+
+# What sacct says when a job is over, one way or another. Anything outside this
+# and ACTIVE_STATES is treated as still-in-flight rather than assumed finished.
+_TERMINAL = (BAD_STATES | {"COMPLETED", "SPECIAL_EXIT", "REVOKED"})
+
+# The one squeue reason that means a job will never run, no matter how long you
+# wait -- while sacct goes on calling it PENDING.
+DOOMED_REASON = "DependencyNeverSatisfied"
+
+# How close to its wall-clock limit a running job has to be before it is worth
+# saying so. A job at 90% is the early warning for the exact thing that killed
+# the run above: 00:10:01 elapsed against a 00:10:00 limit.
+AT_RISK = 0.90
+
+
+def _seconds(text):
+    """Slurm's D-HH:MM:SS / HH:MM:SS / MM:SS as seconds, or None.
+
+    None for UNLIMITED, Partition_Limit, INVALID and anything else non-numeric.
+    A limit we cannot read is not a limit of zero, and a monitor that divides by
+    it would report every job as over its budget.
+    """
+    text = (text or "").strip()
+    if not text or not re.match(r"^[\d\-:.]+$", text):
+        return None
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = text.split(":")
+    if not all(p.replace(".", "").isdigit() for p in parts if p):
+        return None
+    try:
+        nums = [float(p or 0) for p in parts]
+    except ValueError:
+        return None
+    while len(nums) < 3:
+        nums.insert(0, 0)
+    h, m, s = nums[-3:]
+    return days * 86400 + h * 3600 + m * 60 + s
+
+
+class RunStatus:
+    """What resolve() found. Plain data: no rendering, no model, no opinions
+    beyond the ones stated in the fields."""
+
+    __slots__ = ("jobs", "counts", "total", "resolved", "unknown", "finished",
+                 "verdict", "reasons", "at_risk", "root_cause", "source", "at",
+                 "done_files", "doomed")
+
+    def __init__(self, **kw):
+        for slot in self.__slots__:
+            setattr(self, slot, kw.get(slot))
+
+    @property
+    def done(self):
+        return self.counts.get("COMPLETED", 0) if self.counts else 0
+
+    @property
+    def percent(self):
+        return (100.0 * self.done / self.total) if self.total else 0.0
+
+    def __repr__(self):
+        return f"<RunStatus {self.verdict} {self.resolved}/{self.total}>"
+
+
+def _root_cause(jobs):
+    """The earliest job that broke on its own, or None.
+
+    Cancelled jobs are never a root cause: in a GenPipes DAG one failure cancels
+    everything downstream of it, so the cancellations are the casualties. The
+    earliest independent failure is the one worth naming, and ordering by start
+    time is what distinguishes the cause from the jobs that died after it.
+    """
+    broke = [j for j in jobs if j.state in BROKE_STATES]
+    if not broke:
+        return None
+    def when(job):
+        stamp = (job.start or "").strip()
+        return stamp if re.match(r"^\d{4}-\d\d-\d\d", stamp) else "9999"
+    first = min(broke, key=when)
+    same = [j for j in broke if j.step == first.step and j.state == first.state]
+    return {
+        "step": first.step,
+        "state": first.state,
+        "count": len(same),
+        "job": first.name,
+        "elapsed": first.elapsed,
+        "timelimit": first.timelimit,
+        "maxrss": first.maxrss,
+        # The failing jobs themselves, not just how many there were. `/check`
+        # used to say "2 job(s) timeout" and stop, which is the count without
+        # the evidence: the two jobs are a tumour and its matched normal, they
+        # ran for different lengths, and which one is which is the first thing
+        # anybody wants. It was reachable by then typing /jobs, and a fact that
+        # needs a second command to see is a fact most people never see.
+        "jobs": [{"name": j.name, "elapsed": j.elapsed, "maxrss": j.maxrss}
+                 for j in sorted(same, key=lambda j: j.name or "")],
+        "cancelled_after": sum(1 for j in jobs if j.state == "CANCELLED"),
+    }
+
+
+def resolve(record, states=None, reasons=None):
+    """Everything known about a run's jobs, from the scheduler, right now.
+
+    The order is the argument:
+
+      1. the manifest is the DENOMINATOR. Every job ever submitted, with its id.
+         Never drop one, never invent one.
+      2. sacct is the SPINE. One batched query over all of them, authoritative
+         and permanent -- PurgeJobAfter is NONE on Rorqual, so the accounting
+         database never forgets and there is nothing here worth caching.
+      3. squeue ANNOTATES, and only the jobs sacct still reports as non-terminal.
+         Skipped entirely when there are none, because a finished run has nothing
+         in the queue and pretending otherwise would fake a source.
+      4. the verdict comes from job states. Never from artifacts on disk.
+
+    `states` and `reasons` let /check all hand in the results of one batched
+    query for many runs instead of paying a round-trip per run.
+
+    Two rules the callers depend on:
+
+      UNKNOWN never renders as healthy. An id sacct does not know is counted as
+      UNKNOWN, and a run with any UNKNOWN is not finished, whatever else it says.
+
+      A scheduler we could not reach is not a run with no jobs. source becomes
+      "unavailable", every state stays None, and nothing is inferred from the
+      filesystem to fill the hole.
+    """
+    jobs = parse_job_list(record.get("job_list"))
+    total = len(jobs)
+    ids = [j.job_id for j in jobs if j.job_id]
+
+    if states is None:
+        states = query_states(ids) if ids else {}
+    # An empty answer is ambiguous, so it is the one case worth a second call:
+    # no sacct at all means we know nothing, while an sacct that simply does not
+    # recognise these ids means they are UNKNOWN -- a real finding about the run
+    # rather than a failure to look. See scheduler_reachable().
+    reachable = (not ids) or bool(states) or scheduler_reachable()
+
+    for j in jobs:
+        info = states.get(j.job_id or "")
+        if info:
+            _attach(j, info)
+
+    unknown = sum(1 for j in jobs if not j.state)
+    tally = counts(jobs)
+
+    live_ids = [j.job_id for j in jobs
+                if j.job_id and j.state and j.state not in _TERMINAL]
+    if reasons is None:
+        reasons = query_reasons(live_ids) if live_ids else {}
+    for j in jobs:
+        got = reasons.get(j.job_id or "")
+        if got:
+            j.reason = got[1]
+
+    reason_tally = {}
+    for j in jobs:
+        if j.reason and j.reason not in ("None", ""):
+            reason_tally[j.reason] = reason_tally.get(j.reason, 0) + 1
+    doomed = reason_tally.get(DOOMED_REASON, 0)
+
+    at_risk = []
+    for j in jobs:
+        if j.state != "RUNNING":
+            continue
+        spent, limit = _seconds(j.elapsed), _seconds(j.timelimit)
+        if spent and limit and spent >= AT_RISK * limit:
+            at_risk.append(j)
+
+    if not reachable:
+        source = "unavailable"
+    elif live_ids and reasons:
+        source = "sacct + squeue"
+    else:
+        source = "sacct"
+
+    active = sum(n for s, n in tally.items() if s in ACTIVE_STATES)
+    finished = reachable and unknown == 0 and active == 0 and total > 0
+
+    # A run whose remaining work is queued behind something that already broke
+    # is over, whatever sacct calls those jobs. This is the precise case the old
+    # path got wrong while the run was still nominally alive.
+    if doomed:
+        finished = True
+
+    if not reachable:
+        phrase = "scheduler unreachable"
+    elif not total:
+        phrase = "no jobs"
+    elif doomed:
+        phrase = f"dead — {doomed} waiting on a dependency that will never come"
+    else:
+        phrase = verdict(tally)
+        if finished and any(s in BROKE_STATES for s in tally):
+            phrase = "failed, nothing still running"
+        elif finished and tally.get("CANCELLED"):
+            phrase = "cancelled"
+        elif finished and unknown == 0:
+            phrase = "complete"
+        elif active:
+            phrase = f"running, {active} active"
+
+    return RunStatus(
+        jobs=jobs,
+        counts=tally,
+        total=total,
+        resolved=total - unknown,
+        unknown=unknown,
+        finished=finished,
+        verdict=phrase,
+        reasons=reason_tally,
+        at_risk=at_risk,
+        root_cause=_root_cause(jobs),
+        source=source,
+        at=datetime.datetime.now().strftime("%H:%M"),
+        done_files=_done_count(record),
+        doomed=doomed,
+    )
+
+
+def _done_count(record):
+    """How many .done files the run has left behind.
+
+    Counted separately and never folded into the state tally: it answers only
+    "what would a re-run skip", which is a different question from "what did the
+    scheduler do", and conflating the two is the whole mistake this module is
+    correcting.
+    """
+    workdir = record.get("workdir")
+    if not workdir:
+        return None
+    try:
+        return len(glob.glob(os.path.join(workdir, "job_output", "**", "*.done"),
+                             recursive=True))
+    except OSError:
+        return None
+
+
+def resolve_all(records):
+    """resolve() over many runs at the cost of one scheduler round-trip.
+
+    Job ids are globally unique, so one flat {id: state} map over every live
+    run's manifest can be attributed back by id -- which is what makes /check
+    all cost the same whether you have two runs or twenty. Looping resolve()
+    per run would be N sacct calls and N squeue calls, and on a login node that
+    is the difference between a listing and a wait.
+
+    Returns [(record, RunStatus or None)] in the order given; None for a run
+    with no job list to resolve, which the caller renders as unavailable rather
+    than as empty.
+    """
+    manifests = {}
+    for r in records:
+        manifests[r["name"]] = parse_job_list(r.get("job_list"))
+
+    every_id = [j.job_id for jobs in manifests.values() for j in jobs if j.job_id]
+    states = query_states(every_id) if every_id else {}
+
+    live = [jid for jid, info in states.items()
+            if info.get("state") and info["state"] not in _TERMINAL]
+    reasons = query_reasons(live) if live else {}
+
+    out = []
+    for r in records:
+        if r.get("status") == HELD or not r.get("job_list"):
+            out.append((r, None))
+            continue
+        out.append((r, resolve(r, states=states, reasons=reasons)))
+    return out
 
 
 def resolve_log(job, record):

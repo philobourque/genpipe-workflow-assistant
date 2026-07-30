@@ -101,7 +101,7 @@ cp /cvmfs/soft.mugqic/CentOS6/testdata/rnaseq_light/readset.rnaseq.txt .
 | 5 | `/list` | the run reads `submitted` with a job count |
 | 6 | `/jobs <name>` | 17 jobs, states from `sacct`, changing between polls |
 | 7 | `how is my run doing?` | a `SCHEDULER` block (`sacct` or `log_report`), then a plain-English answer derived from what came back — not a guess |
-| 8 | wait, then `/check <name>` | `log_report` agrees with what `/jobs` said; every job reaches `COMPLETED` |
+| 8 | wait, then `/check <name>` | every job reaches `COMPLETED`; the footer names `sacct` and reads `N/N jobs resolved` |
 
 **Pass criteria.** Step 1 produced no code. Step 2 reached the gate in a single
 turn without being asked to submit separately. Step 7's answer is traceable to
@@ -162,21 +162,23 @@ call is present.
 
 ---
 
-## 3. Rejection and rework
+## 3. Modification, rework and abandonment
 
-**What it proves.** The other half of the gate. Approval is the boring half;
-rejection is the one that has to feed a correction back into a live conversation
-and produce a *different* command with the *same* name.
+**What it proves.** The other three quarters of the gate. Approval is the boring
+part; the rest is feeding a correction back into a live conversation and getting
+a *different* command under the *same* name — and, when the answer is no,
+actually being able to say so.
 
 **Machinery under test.** the `submission_gate` node's rejection branch,
 `GenpipeA1.resume(approved=False)`, `runs.Registry.held_for_thread` (one pending
-decision keeps one name), `gate.generation_command` searching **backwards**
-so the box shows the revision and not the original.
+decision keeps one name), `gate.generation_command` searching **backwards** so
+the box shows the revision and not the original, `modify.is_approval_shaped`
+(prose never approves), and `runs.Registry.abandon`.
 
 **Setup**
 
 ```bash
-mkdir -p ~/scratch/sc3-reject && cd ~/scratch/sc3-reject
+mkdir -p ~/scratch/sc3-modify && cd ~/scratch/sc3-modify
 cp /cvmfs/soft.mugqic/CentOS6/testdata/rnaseq_light/readset.rnaseq.txt .
 ~/genpipe-workflow-assistant/start_agent.sh
 ```
@@ -186,15 +188,22 @@ cp /cvmfs/soft.mugqic/CentOS6/testdata/rnaseq_light/readset.rnaseq.txt .
 | # | you type | expected |
 |---|---|---|
 | 1 | `run rnaseq_light steps 1-5 on my readset with cit.ini last` | **HOLD**, steps `1-5`, 17 jobs |
-| 2 | `/reject <name> only run steps 1-3, I don't need kallisto yet` | it regenerates and comes **back to the gate** |
+| 2 | `/modify <name> only run steps 1-3, I don't need kallisto yet` | it regenerates and comes **back to the gate**, under the same name |
 | 3 | — | the new box says steps `1-3` and ~7 jobs. The **same run name** as step 1 — a second name for one pending decision would leave a phantom in `/list` that can never be approved |
 | 4 | `/list` | exactly one held run, not two |
-| 5 | `/reject <name> actually stop, I'll come back to this` | still held, still awaiting a decision, nothing submitted |
-| 6 | `/exit`, relaunch from the same directory | the startup line reports the run still held **by name** — the decision survived the process |
-| 7 | `/approve <name>` | approving from a **different process** works: this is the gate's central promise |
+| 5 | `looks good, go ahead` | **refused.** The `/approve <name>` line is printed and nothing reaches the scheduler. Approval is typed, never inferred — this is the failure the gate exists to prevent, arriving as helpfulness |
+| 6 | `actually make it steps 1-2` | read as a change: it states its interpretation, then regenerates. Prose routes to `/modify`, never to `/approve` |
+| 7 | `/modify <name>` | the multi-select panel opens: the rows this proposal has, `name` first. `esc` leaves it held and unchanged |
+| 8 | `/exit`, relaunch from the same directory | the startup line reports the run still held **by name** — the decision survived the process |
+| 9 | `/approve <name>` | approving from a **different process** works: this is the gate's central promise |
+| 10 | `run rnaseq_light steps 1-5 on my readset` again, then `/reject <name> wrong readset` | **abandoned.** Nothing submitted, the reason recorded |
+| 11 | `/list` | the abandoned run is gone from it |
+| 12 | `/history` | it is still there, marked `abandoned`, with the reason |
+| 13 | `/exit`, relaunch | the startup pending line does **not** mention it. This is why the status exists: before it, a run you had mentally dropped asked to be decided forever |
 
-**Pass criteria.** One name throughout. The command in the box changed at step 3.
-Step 7 submitted the revised command, not the original.
+**Pass criteria.** One name throughout steps 1–9. The command in the box changed
+at step 3. Step 5 submitted nothing. Step 9 submitted the revised command, not
+the original. Step 13's startup screen is quiet.
 
 **Cost.** ~5 core-minutes.
 
@@ -206,7 +215,7 @@ Step 7 submitted the revised command, not the original.
 the product that matters most and the half a happy path never touches.
 
 **Machinery under test.** `runs.triage` (which jobs failed, from `sacct`, plus
-their logs from disk), `GenpipeA1.why` on its own thread — Biomni's `AgentState`
+their logs from disk), `GenpipeA1.diagnose` on its own thread — Biomni's `AgentState`
 has no message reducer, so diagnosing on the run's own thread would erase the
 conversation that built it — and `display.triage`.
 
@@ -230,8 +239,8 @@ EOF
 | 2 | — | check the box: `tiny.ini` after `cit.ini`, or the override does nothing |
 | 3 | `/approve <name>` | submits |
 | 4 | wait ~5 min, `/jobs <name> failed` | the kallisto jobs are `TIMEOUT`; the count-matrix jobs downstream are **cancelled, not failed** |
-| 5 | `/check <name>` | the verdict names trouble rather than reporting progress |
-| 6 | `/why <name>` | the facts first (which step, how many jobs, the log path, the tail of the log), **then** the model's explanation |
+| 5 | `/check <name>` | the verdict names trouble rather than reporting progress, and the root-cause block names the step that broke — not the ones cancelled behind it |
+| 6 | `/diagnose <name>` | the facts first (which step, how many jobs, the log path, the tail of the log), **then** the model's explanation |
 | 7 | — | it names `kallisto` and the walltime. It must **not** invent a memory problem, and must not propose a resource value it cannot trace to a config line |
 | 8 | `why did that happen?` (plain English) | the same conclusion, reached in conversation |
 

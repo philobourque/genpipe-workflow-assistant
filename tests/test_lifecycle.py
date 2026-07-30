@@ -113,7 +113,17 @@ def main():
             reg = runs_store.Registry(store)
             held = reg.held()
             r.equal("one run is held on disk", len(held), 1)
-            r.equal("under its name", held[0]["name"], "life-1")
+            # A run's name is minted at the gate from what the run turned out
+            # to be, not from the conversation it happened on -- one conversation
+            # produces many runs, so the thread cannot be the run's identity.
+            # This test used to assert name == thread_id and then look the record
+            # up under "life-1", which returned None and failed with a TypeError
+            # three sections later.
+            run_name = held[0]["name"]
+            r.contains("named after what it is, not the conversation",
+                       run_name, "rnaseq")
+            r.equal("and it is this conversation's held run",
+                    reg.held_for_thread("life-1")["name"], run_name)
             r.equal("with the command awaiting approval",
                     held[0]["proposal"]["command"], "bash cmd.sh")
             r.equal("and the directory it will submit from",
@@ -129,12 +139,12 @@ def main():
             reborn = fresh_agent(work, [solution("Submission complete.")])
             r.equal("the new process sees the pending decision",
                     len(reborn.pending()), 1)
-            status = reborn.resume("life-1", approved=True)
+            status = reborn.resume(run_name, approved=True)
             r.equal("and can act on it", status["status"], "done")
 
             r.section("approval submitted, and the run was registered")
             reg = runs_store.Registry(store)
-            rec = reg.get("life-1")
+            rec = reg.get(run_name)
             r.equal("promoted to submitted", rec["status"], runs_store.SUBMITTED)
             r.truthy("a job list was linked", rec["job_list"])
             r.truthy("which exists on disk", os.path.exists(rec["job_list"] or ""))
@@ -149,27 +159,33 @@ def main():
 
             # ============================================================== #
             r.section("check(): the aggregate view, and it caches")
-            raw = agent.check("life-1")
-            r.truthy("log_report returned something", raw)
-            cached = runs_store.Registry(store).get("life-1")["last_check"]
+            status = agent.check(run_name)
+            r.truthy("the scheduler answered", status)
+            r.equal("about every job in the manifest",
+                    status.resolved, status.total)
+            cached = runs_store.Registry(store).get(run_name)["last_check"]
             r.truthy("the result was cached for /list", cached)
+            # The wording changed with the source. check() used to report
+            # GenPipes' log_report, which reads files on disk and cannot see a
+            # job that never started or one that was killed; it now reports
+            # sacct, and says whether anything is still running.
             r.contains("with a verdict naming the trouble",
-                       cached["verdict"], "need attention")
+                       cached["verdict"], "failed")
 
             r.section("jobs(): the per-job view")
-            listed = agent.jobs("life-1")
+            listed = agent.jobs(run_name)
             r.equal("all of them", len(listed), 15)
-            failed_only = agent.jobs("life-1", only_failed=True)
+            failed_only = agent.jobs(run_name, only_failed=True)
             r.truthy("filtering to failures returns fewer",
                      0 < len(failed_only) < 15)
             r.truthy("and only failures", all(j.failed for j in failed_only))
 
             # ============================================================== #
-            r.section("why(): facts first, then the model")
+            r.section("diagnose(): facts first, then the model")
             agent.llm = ScriptedLLM([solution(
                 "picard_mark_duplicates ran out of Java heap. Raise "
                 "java_other_options -Xmx in the ini and rerun step 3.")])
-            status = agent.why("life-1")
+            status = agent.diagnose(run_name)
             r.equal("it reached a conclusion", status["status"], "done")
             r.contains("naming the failing step", status["final"],
                        "picard_mark_duplicates")
@@ -186,7 +202,7 @@ def main():
                     "ran out of Java heap" not in joined)
 
             r.section("...and the finding is recorded against the run")
-            notes = runs_store.Registry(store).get("life-1").get("notes") or []
+            notes = runs_store.Registry(store).get(run_name).get("notes") or []
             r.truthy("a note was kept", notes)
             r.contains("summarising the cause", str(notes), "heap")
             r.check("without the <solution> markup leaking into it",
@@ -194,7 +210,7 @@ def main():
 
             # ============================================================== #
             r.section("cancel(): nothing to do on a run that already finished")
-            r.equal("no jobs targeted", agent.cancel("life-1"), 0)
+            r.equal("no jobs targeted", agent.cancel(run_name), 0)
 
             # ============================================================== #
             r.section("rejection sends feedback back, and the retry is what submits")
@@ -208,9 +224,10 @@ def main():
                            solution("Submitted.")])
             status = agent2.run("run rnaseq stringtie", thread_id="life-2")
             r.equal("held first", status["status"], "paused")
+            second = runs_store.Registry(store).held_for_thread("life-2")["name"]
             r.equal("at steps 1-5", status["proposal"]["slots"]["steps"], "1-5")
 
-            status = agent2.resume("life-2", approved=False,
+            status = agent2.resume(second, approved=False,
                                    feedback="use steps 6-12 instead")
             r.contains("the model was told why",
                        "\n".join(agent2.llm.seen), "use steps 6-12 instead")
@@ -221,16 +238,16 @@ def main():
                     status["proposal"]["slots"]["steps"], "6-12")
             r.equal("the held record was updated, not duplicated",
                     len([x for x in runs_store.Registry(store).all()
-                         if x["name"] == "life-2"]), 1)
+                         if x["name"] == second]), 1)
 
             # ============================================================== #
             r.section("a rejected run that is never approved submits nothing")
             before = set(os.listdir(os.path.join(work, "job_output")))
-            agent2.resume("life-2", approved=False, feedback="stop, forget it")
+            agent2.resume(second, approved=False, feedback="stop, forget it")
             after = set(os.listdir(os.path.join(work, "job_output")))
             r.equal("no new job list appeared", before, after)
             r.equal("and it is still awaiting a decision, not submitted",
-                    runs_store.Registry(store).get("life-2")["status"],
+                    runs_store.Registry(store).get(second)["status"],
                     runs_store.HELD)
 
             # ============================================================== #
@@ -238,17 +255,17 @@ def main():
             r.equal("check on an unknown run returns nothing",
                     agent.check("no-such-run"), None)
             r.equal("jobs on a held run returns nothing",
-                    agent.jobs("life-2"), [])
-            r.equal("why on a run with no failures returns nothing",
-                    agent.why("no-such-run"), None)
+                    agent.jobs(second), [])
+            r.equal("diagnose on a run with no failures returns nothing",
+                    agent.diagnose("no-such-run"), None)
 
             r.section("a purged job list retires the run without deleting it")
             os.remove(rec["job_list"])
             reg = runs_store.Registry(store)
             r.check("gone from /list",
-                    "life-1" not in [x["name"] for x in reg.live()])
+                    run_name not in [x["name"] for x in reg.live()])
             r.contains("still in /history",
-                       str([x["name"] for x in reg.all()]), "life-1")
+                       str([x["name"] for x in reg.all()]), run_name)
 
         return r.finish()
     finally:
