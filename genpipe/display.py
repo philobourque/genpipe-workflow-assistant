@@ -45,6 +45,7 @@ The gate is the one thing that is never folded. It is not the agent thinking;
 it is the agent stopping.
 """
 
+import datetime
 import getpass
 import os
 import random
@@ -53,6 +54,7 @@ import shutil
 import textwrap
 
 from . import mirror
+from . import modify
 
 # ---------------------------------------------------------------------------
 # ANSI escape codes. \033[<n>m sets an attribute; \033[0m clears everything.
@@ -190,7 +192,13 @@ def _right_column(w):
                  f"commands.{RESET}")
     lines.append(f"{GREY}Press {RESET}{GREEN}Tab{RESET}{GREY} to "
                  f"autocomplete.{RESET}")
-    lines += _wrap("/help brings the full list back at any time.", w)
+    # Hand-styled for the same reason as the two rows above: _wrap counts escape
+    # sequences as characters, so a command name coloured inside it either
+    # clips or breaks the wrap. It stays green because every other command on
+    # this screen is green, and the one that tells you where the rest of them
+    # live is the last one that should look like prose.
+    lines.append(f"{GREEN}/help{RESET}{GREY} brings the full list back at any "
+                 f"time.{RESET}")
     lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
     lines.append(f"{BOLD}Once it's running{RESET}")
     lines += _wrap("You can monitor it, cancel it, or diagnose a failure:", w)
@@ -914,86 +922,275 @@ def mirror_lines(m, active=None, pending=(), changed=(), indent="      "):
     return out
 
 
-# Where the label column starts in the /modify panel: two spaces, the cursor
-# arrow, a space, the checkbox, then three. Wider than the gate's gutter because
-# the panel has two markers to fit where the gate has one.
-_PANEL_GUTTER = 8
+# The panel's gutter: two spaces, the cursor arrow, a space, the state dot, a
+# space. Six, where the old checkbox panel needed eight -- selecting and editing
+# used to be separate acts and needed separate markers, and now that a row is
+# opened rather than ticked there is one marker for where you are and one for
+# what the row has become.
+_PANEL_GUTTER = 6
+
+# Where an open row's choices hang: under the VALUE of the row they belong to,
+# not under its label. A choice is a candidate value, so it is drawn in the
+# column values live in, and the eye reads straight down from `gembs` to the
+# thing that would replace it.
+_CHOICE_INDENT = _PANEL_GUTTER + _MIRROR_LABEL + _MIRROR_FLAG
 
 
-def modify_panel(m, options, extras=(), changed=(), required=()):
-    """The /modify chooser: the command itself, with a box beside what can move.
+def _panel_height():
+    """How many lines the panel's rows may use before the terminal scrolls.
+
+    Scrolling is not a cosmetic failure here. ui.choose repaints by moving the
+    cursor up its own line count; if the block was taller than the window, the
+    terminal has scrolled underneath it and every subsequent repaint lands in
+    the wrong place, painting over the transcript. So the rows are budgeted
+    against the real window, and what does not fit is elided deliberately
+    rather than lost accidentally.
+
+    The reserve covers what choose() draws around the rows -- the question, two
+    blank lines, the note and the hint -- plus a couple of lines of headroom so
+    the panel is not flush against the top of the screen.
+    """
+    try:
+        rows = shutil.get_terminal_size((80, 24)).lines
+    except Exception:
+        rows = 24
+    return max(8, rows - 9)
+
+
+def _elide(lines, focus, room):
+    """Drop the lines furthest from `focus` until the rest fit in `room`.
+
+    The invocation stays -- it is what the whole panel is about -- and so does a
+    window around wherever the cursor is, so an open row and its choices are
+    always whole. What went is stated rather than silently missing: a panel that
+    quietly shows eight of twelve rows is a panel that lies about the command.
+    """
+    if len(lines) <= room or room < 4:
+        return lines
+    keep_top = 2                      # the invocation and the blank under it
+    body = lines[keep_top:]
+    focus = max(0, focus - keep_top)
+    budget = room - keep_top - 1      # -1 for the line that says what is hidden
+    start = max(0, min(focus - budget // 2, len(body) - budget))
+    shown = body[start:start + budget]
+    hidden = len(body) - len(shown)
+    note = f"{' ' * _PANEL_GUTTER}{DIM}···   {hidden} more{RESET}"
+    return lines[:keep_top] + shown + [note]
+
+
+def modify_panel(entries_of, changes=None, notes=None, required=None,
+                 typed=lambda: "", open_of=lambda: None, details=lambda: True):
+    """The /modify chooser: the command, with the row being changed open in it.
 
     Returns a draw function for ui.choose, not lines, because the panel is
     repainted on every keystroke and only ui.choose knows where the cursor is.
+    `entries_of` is a callable for the same reason the panel's row list is one --
+    the list changes while the panel is open, as rows unfold and collapse.
 
     THE MIRROR IS THE LIST. The obvious build -- a mirror printed above a
     separate menu of row names -- was tried on paper and is worse than either
     half alone: every changeable row appears twice, three lines apart, and the
     person has to hold the mapping between the two columns in their head while
     the thing they are trying to read is a command. Here there is one list. A
-    line you can change has a box; a line you cannot -- `-g cmd.sh`, `-j slurm`
-    -- has none and is simply shown, because "what else is in this command" is a
-    question the panel should answer without being asked.
+    line you cannot change -- `-g cmd.sh`, `-j slurm` -- is simply shown,
+    because "what else is in this command" is a question the panel should
+    answer without being asked.
 
-        options   the row keys the cursor moves through, in ui.choose's order.
-                  Every one that names a mirror line gets that line's box.
-        extras    trailing rows with no line of their own, as (value, label,
-                  description) -- 'something else…' and nothing else so far.
-        changed   rows a previous round already moved. Green, and they stay
-                  green while the next set is being picked, so a second pass
-                  through /modify can see what the first one did.
+    AND THE CHOICES ARE IN IT TOO. They used to be a second screen printed
+    underneath, which meant the command was redrawn inside it, the answer landed
+    twelve lines away from where the question was asked, and both blocks sat on
+    a 24-line terminal at once. Opening the row in place costs (choices - 1)
+    lines and gives them back on collapse.
+
+        changes   row -> its new value. Drawn `old  →  new` in green, which is
+                  the same green the gate uses for a row that moved, so the two
+                  screens agree about what colour means.
+        notes     row -> (colour, text), for a change worth a word of warning.
+                  Amber does not block; red does. See modify.step_risk for why
+                  a skipped dependency is amber and not a refusal.
         required  rows an earlier answer has made mandatory, as {row: why}.
-                  Drawn red with the reason beside them whether or not they are
-                  selected, because "you have to answer this" is a fact about
-                  the row, not a state somebody put it in.
+                  Red with the reason beside them, because "you have to answer
+                  this" is a fact about the row, not a state somebody put it in.
     """
-    lines = list(m.lines) if m else []
-    index = {row: i for i, row in enumerate(options)}
-    required = dict(required or {})
-    pad = " " * (_PANEL_GUTTER + _MIRROR_LABEL + _MIRROR_FLAG)
+    changes = changes if callable(changes) else (lambda c=changes: dict(c or {}))
+    notes = notes if callable(notes) else (lambda n=notes: dict(n or {}))
+    required = required if callable(required) else (lambda r=required: dict(r or {}))
+    pad = " " * _CHOICE_INDENT
 
     def draw(cursor, picked):
-        active = options[cursor] if 0 <= cursor < len(options) else None
-        pending = {options[i] for i in picked if 0 <= i < len(options)}
-        out = []
+        entries = list(entries_of())
+        now, warn, must = changes(), notes(), required()
+        opened, narrowing, showing = open_of(), typed(), details()
+        out, focus = [], 0
+        # One description column for the open row's choices, measured from the
+        # widest of them and capped, exactly as option_lines does it: labels of
+        # different lengths put every description at a different column, and a
+        # list of options then reads as prose with the labels buried in it.
+        widest = max((len(e.label) for e in entries
+                      if e.kind == modify.CHOICE), default=0)
+        choicew = min(widest + 3, 26)
 
-        for line in lines:
-            slot = index.get(line.row)
-            tint, strong = _mirror_state(line.row, active, pending, changed)
-            if line.row in required:
+        for entry in entries:
+            here = entry.pick is not None and entry.pick == cursor
+            if here:
+                focus = len(out)
+
+            if entry.kind == modify.CHOICE:
+                mark = f"{GREEN}❯{RESET}" if here else " "
+                label = (f"{BOLD}{WHITE}{entry.label}{RESET}" if here
+                         else entry.label)
+                num = f"{DIM}{entry.pick + 1:>2}{RESET}"
+                line = f"{pad[:-4]}{mark} {num}  {label}"
+                if entry.description and showing:
+                    line += (f"{' ' * max(1, choicew - len(entry.label))}"
+                             f"{DIM}{entry.description}{RESET}")
+                out.append(line)
+                continue
+
+            if entry.kind == modify.EXTRA:
+                mark = f"{GREEN}❯{RESET}" if here else " "
+                label = f"{BOLD}{WHITE}{entry.label}{RESET}" if here else entry.label
+                out.append("")
+                out.append(f"  {mark}   {label}   {DIM}{entry.description}{RESET}")
+                continue
+
+            line = entry.line
+            row = entry.row
+            moved = row in now
+            open_here = row is not None and row == opened
+
+            # Three states and a default, each with a colour AND a marker, for
+            # the reason _mirror_state gives: colour alone is the first thing a
+            # theme, a screenshot or a colour-blind reader flattens.
+            if open_here:
                 tint, strong = RED, f"{RED}{BOLD}"
-            if slot is None:
-                gutter = " " * _PANEL_GUTTER
+            elif moved:
+                tint, strong = GREEN, f"{GREEN}{BOLD}"
+            elif row in must:
+                tint, strong = RED, f"{RED}{BOLD}"
+            elif here:
+                tint, strong = "", f"{BOLD}{WHITE}"
             else:
-                arrow = f"{GREEN}❯{RESET}" if slot == cursor else " "
-                box = (f"{RED}◉{RESET}" if slot in picked
-                       else f"{RED}◯{RESET}" if line.row in required
-                       else f"{DIM}◯{RESET}")
-                gutter = f"  {arrow} {box}   "
+                tint, strong = DIM, ""
+
+            dot = (f"{RED}●{RESET}" if open_here
+                   else f"{GREEN}●{RESET}" if moved
+                   else f"{RED}●{RESET}" if row in must else " ")
+            arrow = f"{GREEN}❯{RESET}" if here else " "
+            # The open row keeps its marker even though the cursor has moved
+            # down into its choices and it is no longer selectable. It is the
+            # row being answered; losing its dot at the moment it matters most
+            # is how the eye loses track of what the choices belong to.
+            gutter = (f"  {arrow} {dot} "
+                      if entry.pick is not None or dot != " "
+                      else " " * _PANEL_GUTTER)
+
             if line.head:
                 out.append(f"{gutter}{strong or f'{BOLD}{WHITE}'}"
                            f"{line.value}{RESET}")
                 out.append("")
                 continue
+
             body, more = _mirror_body(line, tint, strong)
-            if line.row in required:
-                body = f"{body}  {RED}required — {required[line.row]}{RESET}"
+            if open_here:
+                # The row becomes the question while its choices are showing:
+                # the old value, an arrow, and a live caret. Without the caret
+                # the row reads as a label rather than as something typing
+                # narrows, which is the whole reason filtering is on this line
+                # and not on a prompt somewhere below the list.
+                body = (f"{tint}{line.label:<{_MIRROR_LABEL}}{RESET}"
+                        f"{tint}{line.flag:<{_MIRROR_FLAG}}{RESET}"
+                        f"{DIM}{line.value or 'not set'}{RESET}"
+                        f"{DIM}  →  {RESET}"
+                        f"{BOLD}{WHITE}{narrowing}{RESET}{GREEN}█{RESET}")
+                more = []
+            elif moved:
+                body = (f"{tint}{line.label:<{_MIRROR_LABEL}}{RESET}"
+                        f"{tint}{line.flag:<{_MIRROR_FLAG}}{RESET}"
+                        f"{DIM}{line.value or '—'}{RESET}"
+                        f"{DIM}  →  {RESET}{GREEN}{BOLD}{now[row]}{RESET}")
+                more = []
+            elif row in must:
+                body = (f"{RED}{line.label:<{_MIRROR_LABEL}}{RESET}"
+                        f"{RED}{line.flag:<{_MIRROR_FLAG}}{RESET}"
+                        f"{DIM}{line.value or 'not set'}{RESET}"
+                        f"{DIM}  →  {RESET}{RED}?{RESET}"
+                        f"   {RED}{must[row]}{RESET}")
+                more = []
             out.append(f"{gutter}{body}")
             out.extend(f"{pad}{extra}" for extra in more)
 
-        for value, label, note in extras:
-            slot = index.get(value)
-            if slot is None:
-                continue
-            arrow = f"{GREEN}❯{RESET}" if slot == cursor else " "
-            box = f"{RED}◉{RESET}" if slot in picked else f"{DIM}◯{RESET}"
-            tint = (RED if slot in picked else
-                    f"{BOLD}{WHITE}" if slot == cursor else "")
-            out.append(f"  {arrow} {box}   {tint}{label}{RESET}"
-                       f"   {DIM}{note}{RESET}")
-        return out
+            if warn.get(row):
+                colour, text = warn[row]
+                for bit in str(text).splitlines():
+                    out.append(f"{pad}{colour}{bit}{RESET}")
+
+        return _elide(out, focus, _panel_height())
 
     return draw
+
+
+def _action(verb, consequence):
+    """One line of the gate's action block, on the mirror's own column grid.
+
+    The verb sits where a mirror line's label and flag sit, and the consequence
+    starts where its VALUE starts -- so the three things you can do read as the
+    last three rows of the same table rather than as a paragraph stacked beneath
+    one. The two columns already happened to be 17 wide in both places; this
+    makes that deliberate, by measuring from the mirror's own constants.
+    """
+    return (f"      {WHITE}{verb:<{_MIRROR_LABEL + _MIRROR_FLAG}}{RESET}"
+            f"{DIM}{consequence}{RESET}")
+
+
+def fill_header(m, row, changes, current, step="", note=""):
+    """The command, collapsed to what matters while ONE row is being answered.
+
+    The panel that picks the rows draws the whole mirror, and then the filling
+    used to happen somewhere else entirely -- a stack of prompts scrolling down
+    the terminal, each one asking about a command that was no longer on screen.
+    By the seventh question somebody was editing a thing they could not see, and
+    the answers they had already given were three screens up.
+
+    So the mirror comes along. Not all of it: the full mirror plus a protocol
+    list plus the prompt is past twenty-four rows, and once the terminal scrolls
+    the repaint arithmetic that redraws this on every keystroke is wrong. What
+    survives the collapse is exactly what is still being decided:
+
+        the invocation      always. It is what the command IS, and every
+                            remaining answer is read against it.
+        rows already given  as `old → new`, in green. This is the running
+                            record of the pass, and it is the thing the old
+                            flow made people scroll to find.
+        the row being asked  in red, showing what it says now, so the question
+                            and the value it replaces are on screen together.
+
+    Everything else is dropped rather than dimmed. A row nobody has touched and
+    is not being asked about is not context here, it is nine lines between the
+    question and the answer.
+    """
+    out = []
+    if m and m.head:
+        out.append(f"      {BOLD}{WHITE}{m.head}{RESET}")
+        out.append("")
+
+    for done, (was, now) in changes.items():
+        was = was if was not in (None, "") else "—"
+        out.append(f"    {GREEN}●{RESET} {GREEN}{done:<{_MIRROR_LABEL}}{RESET}"
+                   f"{DIM}{_tilde(str(was))}{RESET}  {DIM}→{RESET}  "
+                   f"{GREEN}{BOLD}{_tilde(str(now))}{RESET}")
+
+    shown = current if current not in (None, "") else "not set"
+    out.append(f"    {RED}●{RESET} {RED}{row:<{_MIRROR_LABEL}}{RESET}"
+               f"{DIM}{_tilde(str(shown))}{RESET}  {DIM}→{RESET}  "
+               f"{RED}?{RESET}")
+    if note:
+        out.append(f"      {' ' * _MIRROR_LABEL}{GREY}{note}{RESET}")
+    out.append("")
+    if step:
+        out.append(f"    {DIM}{step}{RESET}")
+        out.append("")
+    return out
 
 
 def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
@@ -1003,13 +1200,31 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     The three commands are printed here on purpose. The moment you are asked to
     make a decision is the worst moment to be recalling an API.
 
-    Each one carries its consequence on a line beneath it, and that is the whole
-    change from the version that printed bare command names. This is the single
-    point in the product where consequences matter, and "approve" and "reject"
-    are not self-explanatory when one of them spends an allocation and cannot be
-    undone and the other quietly abandons a run. The consequence goes on its own
-    line rather than in a trailing column, because a trailing column breaks
-    alignment the moment a run name is long.
+    Each one carries its consequence beside it. This is the single point in the
+    product where consequences matter, and "approve" and "reject" are not
+    self-explanatory when one of them spends an allocation and cannot be undone
+    and the other quietly abandons a run.
+
+    WHAT THE ACTION LINES DO NOT SAY. Not the run name, and not the argument
+    list. Both used to be here -- `/approve mouse-rna-0803`, `/modify <name>
+    <what to change>` -- which put the name on this screen four times and grew
+    the instructions to eight lines under a six-line command. Neither is missing
+    now, they have moved to where they are actually needed:
+
+        the name        the prompt completes it. Type /approve and the name of
+                        the held run appears after the caret in grey; tab takes
+                        it (ui._Editor.ghost). A name you never have to type is
+                        better than a name printed three times, and the mirror
+                        still shows it once, on its own row, because /modify
+                        points at rows.
+
+        the arguments   ui._Editor._arghint already prints `/modify <name>
+                        [change]` the moment you type the verb, which is the
+                        moment you want it and not before. The box says what a
+                        verb DOES; the prompt says what it TAKES.
+
+    What is left is one line per verb, in the mirror's columns -- see _action().
+    The consequence is the only text, so it is the only thing to read.
 
     `blockers` are environment findings that would make this submission fail no
     matter how good the command is. When there are any, the approve line is
@@ -1065,19 +1280,72 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
             print(f"      {DIM}{'fix':<17}{RESET}{WHITE}{finding.fix}{RESET}")
         print()
     else:
-        print(f"      {DIM}{'approve':<17}{RESET}/approve {WHITE}{thread_id}{RESET}")
-        print(f"      {'':<17}{DIM}submits to Slurm \u2014 cannot be undone{RESET}")
+        print(_action("/approve", "submits to Slurm \u2014 cannot be undone"))
 
-    print(f"      {DIM}{'modify':<17}{RESET}/modify {WHITE}{thread_id}{RESET} "
-          f"{DIM}<what to change>{RESET}")
-    print(f"      {'':<17}{DIM}rewrites the command, asks you again{RESET}")
-    print(f"      {'':<17}{DIM}omit the change to pick from what's there{RESET}")
-    print(f"      {DIM}{'reject':<17}{RESET}/reject {WHITE}{thread_id}{RESET} "
-          f"{DIM}[why]{RESET}")
-    print(f"      {'':<17}{DIM}abandons this run; nothing is submitted{RESET}")
+    print(_action("/modify", "rewrites the command and asks you again"))
+    print(_action("/reject", "abandons this run; nothing is submitted"))
+    print(f"      {'':<{_MIRROR_LABEL + _MIRROR_FLAG}}{DIM}tab completes the name{RESET}")
     print()
     print(f"  {DIM}Nothing has reached the scheduler.{RESET}")
     print("\n")
+
+
+# What each status lets you do, and what that costs. Held is the gate's own
+# list; the others are what remains once a name is tied to a job list.
+_VERBS = {
+    "held": [("/approve", "submits to Slurm — cannot be undone"),
+             ("/modify", "rewrites the command and asks you again"),
+             ("/reject", "abandons this run; nothing is submitted")],
+    "submitted": [("/check", "how it is doing on the scheduler"),
+                  ("/modify", "copies it into a new run; this one is untouched"),
+                  ("/diagnose", "read the logs and explain a failure")],
+    "abandoned": [("/modify", "copies it into a new run to try again")],
+    "gone": [("/modify", "copies it into a new run"),
+             ("/history", "what is recorded about it")],
+}
+
+
+def run_view(proposal, name, status, resources="", blockers=()):
+    """/view -- what a run IS, drawn for any status rather than only at the gate.
+
+    The same mirror the gate draws, deliberately. A second layout for the same
+    command would be a second thing to learn and a second place for the two to
+    disagree, and the mirror's whole argument is that people know a GenPipes
+    command by its shape.
+
+    What differs is the frame and the verbs. There is no red HOLD banner --
+    nothing is being asked here, and a box that shouts at somebody who typed a
+    read-only command teaches them to ignore the shout. The verbs come from the
+    status, because offering /approve on a run that went to Slurm an hour ago
+    is offering something that cannot happen.
+    """
+    _flush_fold()
+    print()
+    print(f"  {DIM}▌{RESET} {BOLD}{name}{RESET}  {DIM}·{RESET}  {DIM}{status}"
+          f"{RESET}")
+    print()
+    print(f"      {BOLD}{WHITE}{proposal.get('command', '?')}{RESET}")
+    m = (mirror.read(proposal.get("generated"), name=name, resources=resources)
+         or mirror.from_slots(proposal, name=name, resources=resources))
+    drawn = mirror_lines(m)
+    if drawn:
+        print()
+        for line in drawn:
+            print(line)
+    print()
+    for finding in blockers or ():
+        print(f"      {RED}{'cannot submit':<17}{RESET}"
+              f"{finding.variable} {finding.problem}")
+        print(f"      {DIM}{'fix':<17}{RESET}{WHITE}{finding.fix}{RESET}")
+    if blockers:
+        print()
+    for verb, consequence in _VERBS.get(status, ()):
+        if verb == "/approve" and blockers:
+            continue
+        print(_action(verb, consequence))
+    print(f"      {'':<{_MIRROR_LABEL + _MIRROR_FLAG}}{DIM}tab completes the "
+          f"name{RESET}")
+    print()
 
 
 def ready(source=None, model=None, fake=None):
@@ -1728,8 +1996,34 @@ def _labelled(gutter, label, text, style="", wrap=True):
         print(f"{gutter}   {DIM}{shown:<18}{RESET}{style}{line}{RESET}")
 
 
-def pending(records):
-    """Held runs, surfaced at startup -- in one line, however many there are.
+def _names(records, limit=3):
+    """First few names, then a count. The rest is what /list is for."""
+    shown = ", ".join(r["name"] for r in records[:limit])
+    if len(records) > limit:
+        shown += f", +{len(records) - limit} more"
+    return shown
+
+
+def _ago(stamp):
+    """'3 days ago' from a stored timestamp, or '' if it cannot be read."""
+    try:
+        then = datetime.datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return ""
+    seconds = (datetime.datetime.now() - then).total_seconds()
+    if seconds < 0:
+        return ""
+    if seconds < 3600:
+        return "earlier"
+    if seconds < 86400:
+        hours = int(seconds // 3600)
+        return f"{hours} hour{'s' if hours > 1 else ''} ago"
+    days = int(seconds // 86400)
+    return f"{days} day{'s' if days > 1 else ''} ago"
+
+
+def pending(records, since=None, seen=""):
+    """What is waiting on you, surfaced at startup.
 
     This exists because of the tool's worst failure mode: the gate pauses a run,
     the terminal closes, and the only record of a decision you still owe was the
@@ -1740,17 +2034,46 @@ def pending(records):
     fortnight of experiments into the largest thing on a fresh screen, and pushed
     the one line that matters -- the prompt -- to the bottom of the scrollback.
     Names first three, count for the rest, /list for the commands.
+
+    `since` is Registry.unseen() -- runs whose OUTCOME nobody has looked at.
+    Not a diff against the last launch: everything the registry knows offline is
+    something the person did themselves, so "2 submitted since you were last
+    here" is a list of things they already watched happen. What is actually
+    unseen is how those runs turned out.
+
+    OFFLINE, ON PURPOSE. Finding out that a run finished overnight costs a
+    `module load` and an sacct per run, which is seconds of dead time before the
+    first prompt. So the live answer is one keystroke away rather than in the
+    startup path, and what is printed here is careful never to claim otherwise:
+    a cached failure says "when last checked", and a run still going says only
+    that nobody has asked.
     """
-    if not records:
+    since = since or {}
+    failed = list(since.get("failed", ()))
+    waiting = list(since.get("unfinished", ()))
+    if not records and not failed and not waiting:
         return
-    n = len(records)
-    names = ", ".join(r["name"] for r in records[:3])
-    if n > 3:
-        names += f", +{n - 3} more"
+
     print()
-    print(f"  {AMBER}▌{RESET} {AMBER}{n} run{'s' if n > 1 else ''} held{RESET}"
-          f"{DIM}, waiting on you:{RESET} {WHITE}{names}{RESET}"
-          f"   {DIM}/list{RESET}")
+    if records:
+        n = len(records)
+        print(f"  {AMBER}▌{RESET} {AMBER}{n} run{'s' if n > 1 else ''} held"
+              f"{RESET}{DIM}, waiting on you:{RESET} "
+              f"{WHITE}{_names(records)}{RESET}   {DIM}/list{RESET}")
+    if failed:
+        # Never presented as live truth -- it is what a check saw, and the run
+        # may well have been fixed or cancelled since.
+        n = len(failed)
+        print(f"  {RED}▌{RESET} {RED}{n} had failing jobs{RESET}"
+              f"{DIM} when last checked:{RESET} "
+              f"{WHITE}{_names(failed)}{RESET}   {DIM}/check{RESET}")
+    if waiting:
+        when = _ago(seen)
+        n = len(waiting)
+        tail = f"  {DIM}·{RESET}  {DIM}last here {when}{RESET}" if when else ""
+        print(f"  {DIM}▌{RESET} {DIM}{n} run{'s' if n > 1 else ''} nobody has "
+              f"checked:{RESET} {GREY}{_names(waiting)}{RESET}   "
+              f"{DIM}/check all{RESET}{tail}")
     print()
 
 
@@ -1928,6 +2251,51 @@ def overrides(name, rows, path):
     print(f"  {DIM}▌{RESET}   {DIM}{_tilde(path)}{RESET}")
     print(f"  {DIM}▌{RESET}   {DIM}goes last on -c, so it wins over every "
           f"GenPipes ini{RESET}")
+    print()
+
+
+def no_step_list(pipeline, protocol):
+    """Why the step panel is offering nothing, and how to get the list.
+
+    There is no step table in this repo and there must never be one --
+    genpipes.md says so outright, because the numbered list for every protocol
+    is version-exact and a copy here would be wrong on the next release. So
+    when `--help` cannot be reached, the honest thing is an empty panel plus
+    this, rather than a guess.
+
+    The command is printed in full because it is the answer: run it, read the
+    names, come back. Somebody who cannot see a list will otherwise invent one,
+    and a section name GenPipes does not recognise is not an error -- it is
+    ignored, and the run fails a second time in exactly the same way.
+    """
+    where = f"genpipes {pipeline or '<pipeline>'}"
+    if protocol:
+        where += f" -t {protocol}"
+    print()
+    print(f"  {AMBER}▌{RESET} {BOLD}no step list to offer{RESET}  {DIM}·{RESET}"
+          f"  {DIM}--help could not be read{RESET}")
+    print(f"  {AMBER}▌{RESET}")
+    print(f"  {AMBER}▌{RESET}   {GREY}the names are version-exact, so they are "
+          f"never kept in this tool{RESET}")
+    print(f"  {AMBER}▌{RESET}   {WHITE}{where} --help{RESET}")
+    print(f"  {AMBER}▌{RESET}   {GREY}a name it does not recognise is ignored "
+          f"silently, not refused{RESET}")
+    print()
+
+
+def forking_from(name, status):
+    """Said before a /modify on a run that is not held, so the fork is expected.
+
+    Somebody typing `/modify pouletrun` on a finished run is asking to change
+    that run, and what they are about to get is a different one. Saying so
+    first turns a surprise into an answer -- and it is the honest framing
+    anyway: the original is not being edited, it is being copied from.
+    """
+    print()
+    print(f"  {DIM}▌{RESET} {BOLD}{name}{RESET}  {DIM}·{RESET}  "
+          f"{DIM}{status}, so this makes a new run{RESET}")
+    print(f"  {DIM}▌{RESET}   {GREY}its name is tied to a job list and cannot "
+          f"be rewritten{RESET}")
     print()
 
 

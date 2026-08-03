@@ -29,6 +29,7 @@ import tempfile
 from harness import Report
 
 from genpipe import modify
+from genpipe import override
 from genpipe import runs
 
 
@@ -237,6 +238,194 @@ def main():
         registry.mark_submitted("gone-live", os.path.join(tmp, "jl"))
         r.equal("a submitted run refuses to be renamed",
                 registry.rename("gone-live", "anything"), None)
+
+    # ------------------------------------------------------------------ #
+    # The override ini is named after the run, and override.py's docstring
+    # promises that is what stops "two runs tuned differently" sharing one file.
+    # Nothing enforced it when the NAME moved, in either of the two ways a name
+    # can move.
+    r.section("a run's override ini survives its name moving")
+
+    tuned = {
+        "command": "bash cmd.sh",
+        "generated": ("genpipes chipseq -t chipseq -s 1-5 -c chipseq.base.ini "
+                      "rorqual.ini /work/pouletrun.override.ini -g cmd.sh"),
+        "slots": {"pipeline": "chipseq", "protocol": "chipseq", "steps": "1-5",
+                  "design": None, "pairs": None, "readset": None,
+                  "inis": ["chipseq.base.ini", "rorqual.ini",
+                           "pouletrun.override.ini"], "output_dir": None},
+    }
+    r.equal("the ini on the -c stack is found by reading, not deriving",
+            modify.stacked_override(tuned), "/work/pouletrun.override.ini")
+    r.equal("a command with no override of ours reports none",
+            modify.stacked_override(PROPOSAL), "")
+    # A GenPipes ini that merely happens to be last is not one of ours.
+    r.equal("and a plain ini last in the stack is not mistaken for one",
+            modify.stacked_override(
+                {"generated": "genpipes chipseq -c a.ini rorqual.ini"}), "")
+
+    # The fork. Its -c starts as a verbatim copy of the parent's, so appending
+    # its own ini would leave BOTH -- and the parent's file would go on tuning a
+    # run that is supposed to have been given its own copy.
+    forked = modify._deltas(tuned, {"resources": "/work/chickenrun.override.ini"})
+    r.check("a fork is told to REPLACE its parent's ini, not append beside it",
+            any("replace /work/pouletrun.override.ini" in d for d in forked),
+            forked)
+    r.check("and told the old one must not appear at all",
+            any("must not appear at all" in d for d in forked), forked)
+    r.check("the new one still has to go last, or the cluster ini wins",
+            any("very END of the -c stack" in d for d in forked), forked)
+
+    # Re-tuning the same run is still an append: there is nothing to displace.
+    same = modify._deltas(tuned, {"resources": "/work/pouletrun.override.ini"})
+    r.check("re-tuning one's own ini stays an append",
+            any(d.startswith("append ") for d in same), same)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # THE RENAME. The file stays where it was written and path_for reads the
+        # command to find it. Moving it instead would mean editing a command the
+        # model produced -- locally, which modify.py exists to never do, or by
+        # regenerating, which would put a model call behind the one change at
+        # the gate that costs nothing.
+        live = os.path.join(tmp, "pouletrun.override.ini")
+        override.write(live, {"gatk_sam_to_fastq": {"cluster_walltime":
+                                                    "35:00:00"}}, run="pouletrun")
+        renamed = dict(tuned)
+        renamed["generated"] = tuned["generated"].replace(
+            "/work/pouletrun.override.ini", live)
+        r.equal("after a rename, path_for still finds the live file",
+                override.path_for("chickenrun", tmp, renamed), live)
+        r.truthy("so the tuning is still visible at the gate",
+                 override.summary(override.read(
+                     override.path_for("chickenrun", tmp, renamed))))
+        # Without the proposal it would go looking under the new name, find
+        # nothing, and the next /modify would write a SECOND ini beside the live
+        # one -- two files, one of them in force, neither obviously the real one.
+        r.check("the name alone would have pointed at nothing",
+                not os.path.exists(override.path_for("chickenrun", tmp)))
+
+        # A run that has never been tuned still gets a path to create.
+        r.equal("an untuned run derives its path from its name",
+                override.path_for("freshrun", tmp, PROPOSAL),
+                os.path.join(tmp, "freshrun.override.ini"))
+
+        # THE FORK gets its own copy, so re-tuning one cannot re-tune the other.
+        mine = os.path.join(tmp, "chickenrun.override.ini")
+        r.truthy("a fork copies its parent's ini", override.copy(live, mine))
+        r.equal("with the same contents",
+                override.read(mine), override.read(live))
+        override.write(mine, {"gatk_sam_to_fastq": {"cluster_walltime":
+                                                    "70:00:00"}}, run="chickenrun")
+        r.equal("and re-tuning the fork leaves the parent alone",
+                override.read(live)["gatk_sam_to_fastq"]["cluster_walltime"],
+                "35:00:00")
+        r.check("copying from a run with no ini is a no-op",
+                not override.copy(os.path.join(tmp, "nothing.ini"), mine))
+
+        # The deletion message. write() returns '' both for "deleted it" and for
+        # "there was never one", and the screen used to announce a removal on
+        # the strength of that empty string alone -- claiming a file had gone
+        # when none had ever existed.
+        r.check("removed() reports a file that actually went",
+                override.removed(mine))
+        r.check("and refuses to claim one that was never there",
+                not override.removed(os.path.join(tmp, "never.override.ini")))
+
+    # ------------------------------------------------------------------ #
+    # The rule stays -- the name is typed as a CLI argument, built into
+    # `{name}.override.ini`, and embedded in a fork's thread id, so a space or a
+    # slash breaks a real thing. What changed is that a refusal now hands back
+    # the corrected name instead of restating the rule and walking away.
+    r.section("an illegal run name is corrected, not just refused")
+
+    r.check("a plain name is fine", modify.valid_name("pouletrun"))
+    r.check("digits may lead", modify.valid_name("2run"))
+    r.check("dots, dashes and underscores are allowed",
+            modify.valid_name("run-2.a_b"))
+    r.check("a slash is not", not modify.valid_name("test_/modify"))
+    r.check("nor is a space", not modify.valid_name("my run"))
+    r.check("nor is a leading dot", not modify.valid_name(".hidden"))
+
+    # The real answer somebody typed at this prompt. It would have tried to
+    # write `test_/modify_steps.override.ini` -- a directory that is not there.
+    r.equal("the typed name comes back recognisable",
+            modify.sanitize("test_/modify_steps"), "test_modify_steps")
+    r.equal("a space becomes an underscore", modify.sanitize("my run 2"),
+            "my_run_2")
+    r.equal("runs of substituted characters collapse",
+            modify.sanitize("a///b"), "a_b")
+    r.equal("leading punctuation is dropped, not underscored",
+            modify.sanitize("--help"), "help")
+    r.equal("and a name with nothing legal in it gives nothing back",
+            modify.sanitize("..."), "")
+
+    bad = modify.check("name", "test_/modify_steps", None)
+    r.check("the verdict refuses", not bad)
+    r.contains("and says why the rule exists, not just what it is",
+               bad.message, "used as a filename")
+    r.equal("offering the corrected name as the thing to pick",
+            [o.value for o in bad.options], ["test_modify_steps"])
+
+    hopeless = modify.check("name", "...", None)
+    r.equal("a name with no correction offers none", hopeless.options, [])
+    r.check("a legal name passes with nothing to offer",
+            modify.check("name", "pouletrun", None))
+
+    # ------------------------------------------------------------------ #
+    # The commonest thing anybody wants from a finished run is to run it again
+    # with one thing different -- a second readset, another database, a
+    # re-sequenced sample. /modify used to refuse outright on anything not
+    # held, so the answer was to retype the command by hand.
+    r.section("a finished run can be copied, never rewritten")
+
+    base = ("genpipes dnaseq -t somatic_fastpass -s 1-5 -r readset_a.tsv "
+            "-c dnaseq.base.ini rorqual.ini -g cmd.sh")
+    done = {"command": "bash cmd.sh", "generated": base,
+            "slots": {"pipeline": "dnaseq", "protocol": "somatic_fastpass",
+                      "steps": "1-5", "readset": "readset_a.tsv", "design": None,
+                      "pairs": None, "inis": ["dnaseq.base.ini", "rorqual.ini"],
+                      "output_dir": None}}
+
+    prose = modify.fork_prose(done, "use readset_b.tsv instead")
+    r.contains("the base command travels with the request", prose, base)
+    r.contains("along with what should differ", prose, "readset_b.tsv")
+    r.contains("and nothing else may move", prose, "nothing else changed")
+    r.contains("and it must stop at the gate", prose, "Stop at the gate")
+
+    # A thread that has never seen the original will invent the flags nobody
+    # mentioned, which is the whole reason the command is quoted rather than
+    # described.
+    r.check("every flag of the original is carried, not summarised",
+            all(flag in prose for flag in ("-t", "-s", "-r", "-c", "-g")))
+
+    # Nothing to copy from is a real answer and has to be said, not guessed at.
+    scanned = {"command": "", "slots": {"pipeline": "dnaseq",
+                                        "protocol": "somatic_fastpass"}}
+    r.equal("a run found on disk has no command to fork",
+            modify.fork_prose(scanned, "use readset_b.tsv"), "")
+    r.equal("and neither does an empty request",
+            modify.fork_prose(done, "   "), "")
+
+    # The row-driven fork says the same thing in deltas rather than prose.
+    picked = modify.fork_sentence(done, {"readset": "readset_b.tsv"})
+    r.contains("the guided fork also quotes the base", picked, base)
+    r.contains("and names both sides of the change", picked,
+               "change -r from readset_a.tsv to readset_b.tsv")
+
+    # ------------------------------------------------------------------ #
+    r.section("rows are filled in dependency order, not tick order")
+
+    # The reordering is the point -- the legal step range comes from the
+    # protocol's --help, so asking "which steps?" first asks about a protocol
+    # that is at that moment still being changed.
+    r.equal("the pipeline settles before anything read against it",
+            modify.fill_order(["steps", "name", "protocol", "pipeline"]),
+            ["pipeline", "protocol", "steps", "name"])
+    r.equal("name goes last: it is the row that changes no flag",
+            modify.fill_order(["name", "output"]), ["output", "name"])
+    r.equal("an order that already agrees is left alone",
+            modify.fill_order(["pipeline", "protocol"]),
+            ["pipeline", "protocol"])
 
     # ------------------------------------------------------------------ #
     r.section("/sort hides rows without losing them")

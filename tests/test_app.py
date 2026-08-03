@@ -429,7 +429,12 @@ def main():
         # Read the name off the second box rather than predicting the suffix:
         # what is being asserted is that the two differ, not what the second is
         # called, and the model's exact command is not this suite's business.
-        found = re.findall(r"/approve (\S+)", app.emitted()[mark:])
+        #
+        # Read from the mirror's `name` row, not from the /approve line. The
+        # gate stopped spelling the run name beside its verbs once the prompt
+        # learned to complete it -- see display.gate -- so the name now appears
+        # exactly once on that screen, which is the row this matches.
+        found = re.findall(r"name\s+(\S+)\s+not a flag", app.emitted()[mark:])
         second = found[-1] if found else None
         r.truthy("the second gate names a run", second)
         r.check("and it is not the first run's name", second != name,

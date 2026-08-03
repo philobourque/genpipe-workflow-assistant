@@ -107,6 +107,10 @@ class Registry:
     def __init__(self, workdir):
         self.workdir = workdir
         self.path = os.path.join(workdir, "runs.jsonl")
+        # When this user last had the app open. Its own file rather than a
+        # record in runs.jsonl, because it is not a run and the store's whole
+        # contract is "every line is a run, last one for a name wins".
+        self.seen_path = os.path.join(workdir, "last_seen")
 
     # -- storage ---------------------------------------------------------- #
 
@@ -139,6 +143,66 @@ class Registry:
             for r in records:
                 f.write(json.dumps(r) + "\n")
         os.replace(tmp, self.path)
+
+    def seen_at(self):
+        """When the app was last open, or '' the first time. Never raises.
+
+        A missing or unreadable file means "no previous session", which is the
+        right answer and is also what the very first launch genuinely is. This
+        is decoration on a startup line -- it must never be the reason the app
+        fails to start.
+        """
+        try:
+            with open(self.seen_path) as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+
+    def mark_seen(self):
+        """Record that this session happened. Best effort, like seen_at()."""
+        try:
+            with open(self.seen_path, "w") as handle:
+                handle.write(_now())
+        except OSError:
+            pass
+
+    def unseen(self):
+        """What you do not yet know the answer to, as {what: [records]}.
+
+        NOT "what changed since a timestamp", which is what this was first
+        written as and which turned out to report the wrong thing. Everything
+        the registry records offline is something the person DID -- they held
+        it, they submitted it -- so a list of runs submitted since the last
+        launch is a list of things they already watched happen. It is a diff,
+        and it is not news.
+
+        What is genuinely unseen is an OUTCOME. A run submitted on Friday and
+        left overnight has a result nobody has looked at, and that is knowable
+        offline in exactly two forms:
+
+            failed      a previous /check saw failing jobs and cached the
+                        verdict. Stale by definition -- the caller says so --
+                        but it is the single thing most likely to have been
+                        closed and forgotten.
+            unfinished  submitted, and either never checked or last checked
+                        while still running. The answer needs the scheduler,
+                        so what this earns is a prompt to go and ask, not a
+                        claim about how it went.
+
+        Asking Slurm here instead would cost a `module load` plus an sacct per
+        run before the first prompt appears. A slow startup is worse than a
+        line that says less.
+        """
+        out = {"failed": [], "unfinished": []}
+        for record in self.live():
+            if record["status"] != SUBMITTED:
+                continue
+            seen = (record.get("last_check") or {}).get("verdict", "")
+            if NEEDS_ATTENTION in seen:
+                out["failed"].append(record)
+            elif seen != COMPLETE:
+                out["unfinished"].append(record)
+        return out
 
     # -- reads ------------------------------------------------------------ #
 
@@ -950,13 +1014,13 @@ def verdict(tally):
         return "no jobs"
     bad = sum(n for s, n in tally.items() if s in BAD_STATES)
     if bad:
-        return f"{bad} need attention"
+        return f"{bad} {NEEDS_ATTENTION}"
     active = sum(n for s, n in tally.items() if s in ACTIVE_STATES)
     if active:
         return f"{active} running"
     if tally.get("UNKNOWN"):
         return "state unknown"
-    return "complete"
+    return COMPLETE
 
 
 # ===========================================================================
@@ -999,6 +1063,17 @@ _TERMINAL = (BAD_STATES | {"COMPLETED", "SPECIAL_EXIT", "REVOKED"})
 # The one squeue reason that means a job will never run, no matter how long you
 # wait -- while sacct goes on calling it PENDING.
 DOOMED_REASON = "DependencyNeverSatisfied"
+
+# The phrase verdict() uses for a run with failed jobs, named rather than
+# spelled twice: Registry.since() looks for it in a CACHED verdict to decide
+# what to raise at startup, and a literal in two files is one edit away from
+# a startup line that silently stops mentioning failures.
+NEEDS_ATTENTION = "need attention"
+
+# The verdict for a run with nothing left to watch. Named for the same reason:
+# Registry.unseen() uses it to decide which runs still have an answer nobody
+# has looked at.
+COMPLETE = "complete"
 
 # How close to its wall-clock limit a running job has to be before it is worth
 # saying so. A job at 90% is the early warning for the exact thing that killed

@@ -580,7 +580,7 @@ def _cmd_reject(agent, args):
     agent.abandon(name, " ".join(rest) or None)
 
 
-def _rework(agent, name, feedback, warnings=(), changed=(), quiet=False):
+def _rework(agent, name, feedback, warnings=(), changed=()):
     """Send a run back to the model with feedback and return to the gate.
 
     The single seam every /modify path funnels through -- direct, guided, and
@@ -597,8 +597,7 @@ def _rework(agent, name, feedback, warnings=(), changed=(), quiet=False):
     worse than no green at all.
     """
     agent._gate_note = {"warnings": list(warnings or ()),
-                        "changed": list(changed or ()),
-                        "quiet": bool(quiet)}
+                        "changed": list(changed or ())}
     with ui.Activity("modifying") as act:
         status = agent.resume(name, approved=False, feedback=feedback,
                               on_step=_narrate(act))
@@ -637,10 +636,23 @@ def _step_risks(agent, name, change):
 
 
 def _cmd_modify(agent, args):
-    """/modify <name> [what to change] -- rewrite a held run's command.
+    """/modify <name> [what to change] -- rewrite a run's command.
 
     With a change, it is one model call and back to the gate. Without one, it
     opens the guided flow: pick the rows, fill them in, review, apply.
+
+    A RUN THAT IS NOT HELD IS FORKED, NEVER REWRITTEN. This used to refuse
+    outright -- "only a run waiting at the gate can be modified" -- which made
+    the commonest thing anybody wants to do with a finished run impossible:
+    run it again against a different readset, a second database, a re-sequenced
+    sample. The command is right there on the record and the fork machinery
+    already existed; all that stood in the way was this check.
+
+    Rewriting one in place stays forbidden, and for the reason abandon() and
+    rename() give: after submission the name is tied to a job list and to jobs
+    that may still be on the scheduler, and moving it strands them. So the
+    original is never touched. What comes back is a second run, held at its own
+    gate, which is what somebody asking for this actually wanted anyway.
     """
     if not args:
         held = agent.registry.held()
@@ -655,17 +667,163 @@ def _cmd_modify(agent, args):
     if record is None:
         display.problem(f"No run named '{name}'.", "/list shows what there is.")
         return
+
     if record["status"] != runs_store.HELD:
-        display.problem(f"'{name}' is not held — it is {record['status']}.",
-                        "Only a run waiting at the gate can be modified.")
+        # A run discovered by /scan or registered by /track has a pipeline and a
+        # protocol read off a job-list filename and no command at all. There is
+        # nothing to fork FROM, and saying so is better than producing a variant
+        # of a command this tool never saw.
+        if not (record.get("proposal") or {}).get("generated"):
+            display.problem(
+                f"'{name}' has no generation command on record.",
+                "It was found on disk rather than built here, so there is "
+                "nothing to copy. Describe the run you want instead.")
+            return
+        _modify_past(agent, name, record, " ".join(rest))
         return
+
     if rest:
         _modify_direct(agent, name, " ".join(rest))
         return
     _modify_guided(agent, name, record)
 
 
-def _modify_guided(agent, name, record):
+def _modify_past(agent, name, record, change=""):
+    """/modify on a run that has already been submitted. Always a fork.
+
+    Prose goes straight through -- there is one question left, what to call the
+    result, and the panel that would ask it has nothing else to offer. Without
+    prose it opens the same guided flow a held run gets, with the ending
+    restricted: applying to the original is not on the table.
+    """
+    proposal = record.get("proposal") or {}
+    display.forking_from(name, record["status"])
+    if not change:
+        _modify_guided(agent, name, record, fork_only=True)
+        return
+
+    wanted = agent.registry.unique_name(name)
+    try:
+        wanted = ui.ask("What should the new run be called?", default=wanted)
+    except (EOFError, KeyboardInterrupt):
+        return
+    verdict = modify.check("name", str(wanted or ""), proposal,
+                           registry=agent.registry)
+    if not verdict:
+        display.problem(verdict.message, f"'{name}' is unchanged.")
+        return
+
+    request = modify.fork_prose(proposal, change)
+    new_name = agent.registry.unique_name(str(wanted).strip())
+    agent._gate_note = {"warnings": [], "changed": []}
+    thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
+    with ui.Activity("building the variant") as act:
+        agent.run(request, thread, on_step=_narrate(act), name=new_name)
+    display.forked(name, new_name)
+
+
+def _run_panel(agent, name, proposal, m, offered, candidates, changes,
+               required):
+    """The in-place panel. Returns (outcome, row) and mutates `changes`.
+
+        ("done",   None)   review what has been changed
+        ("else",   None)   describe it instead, in prose
+        ("ask",    row)    that row has no vocabulary; it needs a typed answer,
+                           which is still a screen of its own -- see _ask_row
+        ("cancel", None)   escape with nothing open
+
+    Enter OPENS a row rather than ticking it, and picking a choice collapses it
+    again, green, in place. That is the whole difference from the panel this
+    replaces, and everything else here follows from it: there is no confirm
+    keystroke left over, hence the DONE row; the cursor must not wander while a
+    row is open, hence panel_entries' selectability rule; and typing narrows the
+    open row rather than jumping between rows, hence on_text.
+    """
+    state = {"open": None, "typed": "", "out": None, "row": None}
+
+    def choices():
+        if not state["open"]:
+            return ()
+        return modify.options_for(state["open"], proposal, candidates,
+                                  pending=changes)
+
+    def entries():
+        return modify.panel_entries(m, offered, state["open"], choices(),
+                                    state["typed"], changes)
+
+    def options():
+        return [slots.Option(e.value, e.label, e.description)
+                for e in modify.selectable(entries())]
+
+    def question():
+        if state["open"]:
+            return modify.question_for(state["open"], proposal, pending=changes)
+        return "What should change?"
+
+    def on_enter(value):
+        kind = value[0]
+        if kind == modify.CHOICE:
+            row, picked = value[1], value[2]
+            verdict = modify.check(row, picked, proposal, registry=agent.registry,
+                                   name=name, pending=changes)
+            if not verdict:
+                # A tier-1 refusal leaves the row open with what was typed
+                # still there. Closing it would throw away the narrowing and
+                # make the person start the row again to read the reason.
+                return True
+            changes[row] = picked
+            required.pop(row, None)
+            state.update(open=None, typed="")
+            return modify.cursor_of(entries(), row)
+        if kind == modify.ROW:
+            row = value[1]
+            if not modify.options_for(row, proposal, candidates, pending=changes):
+                # No vocabulary -- a step range is a range and a path is a path.
+                # Stage 3 unfolds these into a caret on the row; until then the
+                # panel steps aside for the typed prompt that already works.
+                state.update(out="ask", row=row)
+                return False
+            state.update(open=row, typed="")
+            return 0
+        state.update(out="done" if value[1] == modify.DONE else "else")
+        return False
+
+    def on_escape():
+        if state["open"]:
+            state.update(open=None, typed="")
+            return True
+        return False
+
+    def on_text(key):
+        if not state["open"]:
+            return False
+        if key in ("\x7f", "\x08"):
+            state["typed"] = state["typed"][:-1]
+        else:
+            state["typed"] += key
+        return True
+
+    draw = display.modify_panel(entries, changes=lambda: changes,
+                                required=lambda: required,
+                                typed=lambda: state["typed"],
+                                open_of=lambda: state["open"],
+                                details=ui.details_on)
+    def keys():
+        if state["open"]:
+            return "↑↓ · 1-9 to pick · type to narrow · esc closes the row"
+        return ("↑↓ · enter opens a row · esc leaves this run alone, "
+                "changes and all")
+
+    picked = ui.choose(question, options, free_text=False, draw=draw,
+                       cursor=modify.cursor_of(entries(), "name"),
+                       on_enter=on_enter, on_escape=on_escape, on_text=on_text,
+                       note=keys)
+    if state["out"]:
+        return state["out"], state["row"]
+    return ("cancel", None) if picked is None else ("done", None)
+
+
+def _modify_guided(agent, name, record, fork_only=False):
     """The guided /modify: multi-select the rows, fill each, review, apply.
 
     One model call for the whole set, however many rows changed -- composed into
@@ -673,6 +831,11 @@ def _modify_guided(agent, name, record):
     never rebuilt here, even for a change as trivial as a flag swap: that would
     diverge the model's view of the conversation from what is queued, and its
     next turn would reason about a command it did not write.
+
+    `fork_only` is for a run that has already been submitted -- see
+    _modify_past. Everything about picking and filling the rows is identical;
+    what changes is that the ending cannot offer to apply the changes to the
+    original, because its name belongs to a job list now.
     """
     proposal = record.get("proposal") or {}
     directory = record.get("workdir") or os.getcwd()
@@ -697,7 +860,7 @@ def _modify_guided(agent, name, record):
         # already tuned rewrites it without changing the command -- which is
         # exactly the case a summary read once would show stale.
         tuned = override.summary(
-            override.read(override.path_for(name, directory)))
+            override.read(override.path_for(name, directory, proposal)))
         rows = modify.rows_for(proposal, name, resources=tuned)
         m = (mirror.read(proposal.get("generated"), name=name, resources=tuned)
              or mirror.from_slots(proposal, name=name, resources=tuned)).ensure(
@@ -706,34 +869,15 @@ def _modify_guided(agent, name, record):
         # They agree today; they would not the moment a command carried a flag
         # in an order the table does not know, and an arrow key that skips a
         # line is the kind of wrongness nobody reports and everybody distrusts.
-        offered = {row for row, _ in rows}
-        order = [line.row for line in m.lines if line.row in offered]
-        options = [slots.Option(row, row, "") for row in order]
-        options.append(slots.Option("__else__", "something else…",
-                                    "describe it instead"))
-        extras = [("__else__", "something else…", "describe it instead")]
-        picked = ui.choose("What should change?", options, free_text=False,
-                           multi=True,
-                           # Open on `name`, not on the invocation the mirror
-                           # draws above it. The pipeline is the most
-                           # destructive row on the panel and it is drawn first
-                           # because it is the command; the cursor starts on the
-                           # row where nothing happens, which is what the offer
-                           # order in modify.ROWS is arranged around.
-                           cursor=max(order.index("name"), 0)
-                           if "name" in order else 0,
-                           # No green here. Green is the gate's word for "this
-                           # moved since you last read it", and re-entering
-                           # /modify starts that reading over -- carrying the
-                           # last round's colour in would make the panel argue
-                           # with the box it just came from.
-                           draw=display.modify_panel(m, order + ["__else__"],
-                                                     extras,
-                                                     required=required))
-        if not picked:
+        offered = [line.row for line in m.lines
+                   if line.row in {row for row, _ in rows}]
+
+        outcome, row = _run_panel(agent, name, proposal, m, offered,
+                                  candidates, changes, required)
+        if outcome == "cancel":
             display.nothing("Left alone.", f"'{name}' is still held.")
             return
-        if "__else__" in picked:
+        if outcome == "else":
             try:
                 text = ui.ask("What should change?")
             except (EOFError, KeyboardInterrupt):
@@ -741,16 +885,17 @@ def _modify_guided(agent, name, record):
             if text:
                 _modify_direct(agent, name, text)
             return
+        if outcome == "ask":
+            # A row with no vocabulary. Answered on its own screen for now, and
+            # the answer comes straight back into the panel -- so the loop
+            # continues rather than falling through to the review.
+            filled = _fill_rows(agent, name, proposal, [row], directory,
+                                candidates, changes, mirror_of=m)
+            if filled is None:
+                return
+            changes = filled
+            continue
 
-        # `changes` carries across passes. "Change something else" means add to
-        # what is already there, not start again -- discarding three answered
-        # fields because somebody wanted to touch a fourth is a flow people stop
-        # using the fourth option of.
-        filled = _fill_rows(agent, name, proposal, picked, directory,
-                            candidates, changes)
-        if filled is None:
-            return
-        changes = filled
         if not changes:
             display.nothing("Nothing changed.", f"'{name}' is still held.")
             return
@@ -759,27 +904,17 @@ def _modify_guided(agent, name, record):
                    new) for row, new in changes.items()]
         notes = modify.cross_check(proposal, changes)
         display.change_plan(deltas, notes)
-        ending = ui.choose(
-            "What should happen to these changes?",
-            [slots.Option("launch", "back to launch",
-                          "apply them and show the submission gate"),
-             slots.Option("hold", "hold for later",
-                          "apply them; decide another time"),
-             slots.Option("fork", "hold as a new launch",
-                          "keep this run as it is and make a second one"),
-             slots.Option("again", "change something else",
-                          "back to the command")],
-            free_text=False,
-            note="nothing is submitted by any of these")
+        ending, fork_name = _ask_ending(agent, name, changes,
+                                        fork_only=fork_only)
         if ending == "again":
             required = {row: why for row, why
                         in modify.required_after(proposal, changes).items()
                         if not changes.get(row)}
             continue
         if ending == "fork":
-            _fork_run(agent, name, record, proposal, changes)
+            _fork_run(agent, name, record, proposal, changes, wanted=fork_name)
             return
-        if ending in ("launch", "hold"):
+        if ending == "apply":
             break
         # esc, or a headless caller that answered nothing. Silence is not
         # consent for a change set somebody spent four prompts assembling, but
@@ -787,13 +922,154 @@ def _modify_guided(agent, name, record):
         display.nothing("Left alone.", f"'{name}' is still held.")
         return
 
-    _apply_changes(agent, name, proposal, changes, quiet=(ending == "hold"))
+    _apply_changes(agent, name, proposal, changes)
+
+
+def _ask_ending(agent, name, changes, fork_only=False):
+    """What to do with a finished change set. Returns (ending, fork name).
+
+    THREE ROWS, NOT FOUR. There used to be a "hold for later" between "back to
+    launch" and the fork, and the two of them applied the same changes, left the
+    run in the same `held` status, and submitted nothing. The only difference
+    was whether the gate was redrawn afterwards -- a rendering preference,
+    offered as a decision, on the screen whose entire job is to make decisions
+    legible. (The batch case it was reaching for is real: somebody editing six
+    runs does not want six boxes. That wants a flow of its own, not a menu row
+    whose sole effect is suppressing a repaint.)
+
+    The names changed with the count. "back to launch" launched nothing -- it
+    applied and redrew the gate -- and "change something else" was four words
+    for "keep editing". Every label here now begins with a verb that is what
+    happens.
+
+    ESC IS THE FOURTH OUTCOME AND IT DISCARDS. That is why it is in the note
+    rather than left to the generic "esc cancels": a person who has answered
+    four prompts reads "cancels" as "close this menu", and the changes are gone.
+    It is deliberately not a row -- an outcome that throws work away should take
+    a key you have to mean, not one you can arrow onto.
+
+    THE FORK'S NAME IS ON ITS ROW. Picking the fork used to be followed by a
+    bare "what should the new run be called?", so the one fact that decides the
+    answer -- whether the name is free -- arrived after the fork was already
+    chosen, and unique_name() appended a `-2` nobody was shown. Now it is a
+    Field: the proposed name is visible while the choice is still open, and the
+    collision is stated before Enter.
+    """
+    # The name the fork should propose. A `name` row already answered in this
+    # pass is what somebody has said they want this run called, so the fork
+    # takes it; otherwise the first free variant of the current name, which is
+    # what unique_name would have picked silently anyway.
+    proposed = changes.get("name") or agent.registry.unique_name(name)
+
+    def collision(text):
+        """What to say about the typed name, recomputed on every keystroke."""
+        if not text:
+            return "a name is needed to keep both runs"
+        verdict = modify.check("name", text, None, registry=agent.registry)
+        if not verdict:
+            return verdict.message
+        settled = agent.registry.unique_name(text)
+        if settled != text:
+            return f"{text} already exists — enter saves this as {settled}"
+        return ""
+
+    def usable(text):
+        """Whether Enter may leave with this name. A collision is not a
+        refusal -- it is answered by suffixing, and the note says so."""
+        return bool(text) and bool(modify.check("name", text, None,
+                                                registry=agent.registry))
+
+    field = ui.Field("fork", proposed, note=collision, ok=usable,
+                     hint="type to rename · enter confirms · esc discards")
+
+    # A submitted run cannot be the target of its own edit, so the row that
+    # would offer it is not drawn at all. Greying it out and explaining would
+    # be worse: this panel's job is to make the remaining choice obvious, and
+    # the remaining choice here is genuinely just the name.
+    rows = []
+    if not fork_only:
+        rows.append(slots.Option("apply", f"apply to {name}",
+                                 "back to the gate, still held"))
+    rows.append(slots.Option("fork", "save as a new run",
+                             f"{name} stays exactly as it is"))
+    rows.append(slots.Option("again", "keep editing", "back to the command"))
+
+    # With the apply row gone the fork is row 0, so the cursor opens on the
+    # field -- which is right when the name is the only thing left to decide,
+    # and would be wrong on the held panel where applying is the common answer.
+    ending = ui.choose(
+        "What should happen to these changes?", rows,
+        free_text=False, field=field,
+        note="nothing is submitted by any of these  ·  esc discards them")
+    return ending, field.text
+
+
+def _ask_row(m, row, proposal, name, changes, options, question, step="",
+             note="", problem=""):
+    """Ask for one row's value with the command still on screen above it.
+
+    The mirror does not leave. Every answer in this flow is an answer ABOUT a
+    command, and the old arrangement -- panel, then a stack of bare prompts
+    scrolling down the terminal -- took the command away at exactly the moment
+    the questions about it started. Seven prompts in, somebody was editing a
+    thing they could not see, and the six answers they had already given were
+    three screens up.
+
+    What is drawn above the question is the collapsed mirror -- see
+    display.fill_header -- which is the invocation, the answers so far, and the
+    row being asked. Not the whole thing: the full mirror plus a protocol list
+    plus the prompt runs past twenty-four rows, and once the terminal scrolls,
+    the cursor arithmetic that repaints a panel on every keystroke is wrong.
+
+    A row with options gets them; a row without gets a Field, which is the same
+    editable value the fork's name sits in. Free text used to mean dropping out
+    of the panel entirely into ui.ask, and dropping out is what took the mirror
+    with it.
+    """
+    # `changes` is row -> new value; the header wants old and new together, and
+    # `name` is the one row whose "old" is the run's name rather than a slot.
+    so_far = {r: ((name if r == "name" else modify.current(proposal, r)), v)
+              for r, v in changes.items()}
+    current = name if row == "name" else modify.current(proposal, row)
+    if row == "name":
+        note = note or "the command does not change; this is only what you call it"
+
+    def header():
+        out = display.fill_header(m, row, so_far, current, step=step, note=note)
+        if problem:
+            out.append(f"    {display.RED}▌{display.RESET} {problem}")
+            out.append("")
+        return out
+
+    if options:
+        rows = list(options) + [ui._FreeRow("Something else…")]
+
+        def draw(cursor, picked_rows):
+            return header() + ui.option_lines(rows, cursor, picked_rows)
+
+        return ui.choose(question, options, free_text=True, draw=draw)
+
+    # No vocabulary for this row -- a step range is a range and a path is a
+    # path, and inventing options for either would be inventing. One row, whose
+    # value is the answer.
+    field = ui.Field("value", "", hint="enter confirms · esc leaves it alone")
+    rows = [slots.Option("value", row, "")]
+
+    def draw(cursor, picked_rows):
+        return header() + ui.option_lines(rows, cursor, picked_rows,
+                                          field=field, numbered=False)
+
+    picked = ui.choose(question, rows, free_text=False, field=field, draw=draw)
+    return field.text if picked else None
 
 
 def _fill_rows(agent, name, proposal, picked, directory, candidates,
-               changes=None):
+               changes=None, mirror_of=None):
     """Ask for each selected row's new value, validating inline, then chase
     whatever those answers have just made mandatory.
+
+    `mirror_of` is the Mirror the picking panel drew, handed down so the same
+    command stays on screen while its rows are answered -- see _ask_row.
 
     Inline is the point. Making somebody fill three fields and then telling them
     the first was wrong is the worst version of a form, and a tier-1 failure --
@@ -821,24 +1097,28 @@ def _fill_rows(agent, name, proposal, picked, directory, candidates,
     asked = set(changes)
     round_note = ""
 
+    # Said once, and only when the order actually differs from the order the
+    # boxes were ticked in. Somebody who selected top to bottom and is then
+    # asked bottom-up has been given no reason for it, and the reason is a good
+    # one -- so a line that explains it costs less than the doubt it removes.
+    # Silent when the two agree, because then there is nothing to explain.
+    if len(queue) > 1 and queue != list(picked):
+        first = queue[0]
+        print()
+        print(f"  {display.DIM}▌ asked in dependency order, not the order you "
+              f"ticked them{display.RESET}")
+        print(f"  {display.DIM}▌ {first} comes first because the rest are read "
+              f"against it{display.RESET}")
+
     while queue:
         total = len(queue)
         for i, row in enumerate(queue, 1):
             asked.add(row)
-            print()
-            head = (f"{display.RED}▌ required · {i} of {total} — {row}"
-                    if round_note else
-                    f"{display.DIM}▌ {total} change{'s' if total > 1 else ''} · "
-                    f"{i} of {total} — {row}")
-            print(f"  {head}{display.RESET}")
-            if round_note:
-                print(f"  {display.RED}▌{display.RESET} "
-                      f"{display.GREY}{round_note.get(row, '')}{display.RESET}")
-            if row == "name":
-                print(f"  {display.DIM}▌ the command does not change; this is "
-                      f"only what you call it{display.RESET}")
 
             if row == modify.RESOURCES:
+                print()
+                print(f"  {display.DIM}▌ {i} of {total} — resources"
+                      f"{display.RESET}")
                 # Not a value somebody types. It is a file this tool writes, and
                 # the flow that writes it asks a different set of questions --
                 # which step, which keys, what values -- so it gets its own
@@ -853,11 +1133,17 @@ def _fill_rows(agent, name, proposal, picked, directory, candidates,
 
             options = modify.options_for(row, proposal, candidates,
                                          pending=changes)
+            problem = ""
             while True:
                 question = modify.question_for(row, proposal, pending=changes)
                 try:
-                    value = (ui.choose(question, options, free_text=True)
-                             if options else ui.ask(question))
+                    value = _ask_row(mirror_of, row, proposal, name, changes,
+                                     options, question,
+                                     step=(f"required · {i} of {total}"
+                                           if round_note
+                                           else f"{i} of {total}"),
+                                     note=(round_note or {}).get(row, ""),
+                                     problem=problem)
                 except (EOFError, KeyboardInterrupt):
                     return None
                 if value is None or not str(value).strip():
@@ -871,7 +1157,12 @@ def _fill_rows(agent, name, proposal, picked, directory, candidates,
                               f"{display.DIM}{verdict.note}{display.RESET}")
                     changes[row] = str(value).strip()
                     break
-                print(f"  {display.RED}▌{display.RESET} {verdict.message}")
+                # Carried into the next draw rather than printed here. A message
+                # printed above a panel that is about to repaint over itself is
+                # either scrolled away or overwritten, which is how somebody
+                # retypes the same wrong answer twice -- see the transcript
+                # where 'dfedf' was entered, refused, and entered again.
+                problem = verdict.message
                 if verdict.options:
                     options = verdict.options
 
@@ -916,7 +1207,7 @@ def _fill_resources(agent, name, proposal, directory):
     prompts are shapes, not recommendations.
     """
     values = (proposal or {}).get("slots") or {}
-    path = override.path_for(name, directory)
+    path = override.path_for(name, directory, proposal)
     sections = override.read(path)
 
     # An override /diagnose already worked out from the logs. Offered, never
@@ -925,21 +1216,54 @@ def _fill_resources(agent, name, proposal, directory):
     # offer is the whole point of parsing it -- the alternative was reading a
     # fenced ini block off the screen and retyping it, which is where a step
     # name gets misspelled and the override silently does nothing.
+    # Two genuinely different situations reach this flow, and they deserve
+    # different first questions.
+    #
+    #   AFTER A FAILURE  /diagnose has read the logs and computed a value from
+    #                    what it saw. That is the strongest answer anyone here
+    #                    has, and it should be the thing on offer -- not a
+    #                    yes/no gate in front of a form that then asks the same
+    #                    questions from scratch.
+    #   BEFORE A LAUNCH  there is no evidence, so no value may be proposed at
+    #                    all (genpipes.md, and its worked example is a timeout
+    #                    whose obvious walltime fix was the wrong one). The
+    #                    only honest offer is "which step, which knob".
     proposed = (agent.registry.get(name) or {}).get("proposed_override") or {}
     proposed = {s: k for s, k in proposed.items() if s not in sections}
     if proposed:
         display.overrides(name, override.describe(proposed), path)
-        take = ui.choose("Use what /diagnose worked out?",
-                         [slots.Option("yes", "yes", "start from these"),
-                          slots.Option("no", "no", "set them myself")],
-                         free_text=False,
-                         note="nothing is written until you are done")
-        if take == "yes":
+        take = ui.choose(
+            "What should this run use?",
+            [slots.Option("take", "what /diagnose worked out",
+                          "computed from the logs of the failed run"),
+             slots.Option("edit", "those, then change them",
+                          "start from them and tune further"),
+             slots.Option("mine", "set them myself",
+                          "ignore the diagnosis and start empty")],
+            free_text=False,
+            note="nothing is written to disk until you are done")
+        if take is None:
+            return None
+        if take in ("take", "edit"):
             for step, keys in proposed.items():
                 sections = override.merge(sections, step, keys)
+        if take == "take":
+            # Accepted as-is. Asking "which step should be tuned?" after
+            # somebody has just said "use exactly those" is asking them to
+            # re-answer a question they came here having already answered.
+            display.overrides(name, override.describe(sections), path)
+            return override.write(path, sections, run=name)
 
     help_text = agent.step_help(values.get("pipeline"), values.get("protocol"))
     known = modify.steps_from_help(help_text)
+    # When --help cannot be reached the panel has no step list to offer and
+    # degrades to free text. It used to do that SILENTLY, which is how somebody
+    # faced with "its --help name, e.g. gatk_sam_to_fastq" and no list typed
+    # `--help` -- twice -- trying to get the thing the prompt was quoting. A
+    # step name is not something anybody knows by heart, and a prompt that
+    # cannot offer them owes an explanation for why.
+    if not known:
+        display.no_step_list(values.get("pipeline"), values.get("protocol"))
 
     while True:
         step = _ask_step(known, sections)
@@ -960,8 +1284,14 @@ def _fill_resources(agent, name, proposal, directory):
             break
 
     display.overrides(name, override.describe(sections), path)
+    # Whether a file actually went is asked BEFORE writing, because write()
+    # returns '' both for "deleted it" and for "there was never one" -- and this
+    # used to announce a removal on the strength of that empty string alone.
+    # Backing out of the step prompt on a run with no overrides printed
+    # "<run>.override.ini was removed" about a file that had never existed.
+    had_one = os.path.exists(path)
     written = override.write(path, sections, run=name)
-    if not written:
+    if not written and had_one:
         display.nothing("No overrides left.",
                         f"{os.path.basename(path)} was removed.")
     return written
@@ -1041,7 +1371,7 @@ def _ask_settings(step, existing):
     return out
 
 
-def _fork_run(agent, name, record, proposal, changes):
+def _fork_run(agent, name, record, proposal, changes, wanted=None):
     """Apply a change set as a SECOND run, leaving the first one untouched.
 
     The reason this is not a rename: a thread parked at the gate holds exactly
@@ -1055,8 +1385,14 @@ def _fork_run(agent, name, record, proposal, changes):
     and the new run gets its own thread, its own name and its own gate. What it
     does NOT get is the original's history, which is why the request carries the
     base command with it -- see modify.fork_sentence.
+
+    `wanted` normally arrives already answered, off the fork row's own field --
+    see _ask_ending. The prompt below is the fallback for callers that have no
+    panel to have asked in, and the `name` row is popped either way: a rename
+    belongs to the run being forked FROM, and applying it here would rename the
+    original as a side effect of copying it.
     """
-    wanted = changes.pop("name", None)
+    changes.pop("name", None)
     if not wanted:
         try:
             wanted = ui.ask("What should the new run be called?")
@@ -1069,6 +1405,21 @@ def _fork_run(agent, name, record, proposal, changes):
         return
 
     new_name = agent.registry.unique_name(str(wanted).strip())
+
+    # The fork gets its OWN override ini, copied before the sentence is built so
+    # the sentence names the new path. Without this the variant's -c pointed at
+    # its parent's file and re-tuning either one silently re-tuned both -- which
+    # is precisely what naming the file after the run is supposed to prevent.
+    # Only when this fork is not already writing its own: a resources change in
+    # this same pass has already produced a file, and copying over it would
+    # replace what was just tuned with what it was forked from.
+    directory = record.get("workdir") or os.getcwd()
+    if modify.RESOURCES not in changes:
+        parent_ini = override.path_for(name, directory, proposal)
+        own_ini = os.path.join(directory, f"{new_name}.override.ini")
+        if override.copy(parent_ini, own_ini):
+            changes[modify.RESOURCES] = own_ini
+
     request = modify.fork_sentence(proposal, changes)
     if not request:
         display.problem("There is no generation command to copy from.",
@@ -1082,20 +1433,24 @@ def _fork_run(agent, name, record, proposal, changes):
             display.problem(stop, f"Nothing was changed; '{name}' is unchanged.")
             return
 
-    agent._gate_note = {"warnings": risks, "changed": list(changes),
-                        "quiet": False}
+    agent._gate_note = {"warnings": risks, "changed": list(changes)}
     thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
     with ui.Activity("building the variant") as act:
         agent.run(request, thread, on_step=_narrate(act), name=new_name)
     display.forked(name, new_name)
 
 
-def _apply_changes(agent, name, proposal, changes, quiet=False):
+def _apply_changes(agent, name, proposal, changes):
     """Apply a validated change set: at most one model call, then the rename.
 
     The rename goes LAST, after resume() returns, so the gate re-renders once
     and under the new name. Doing it first would draw the box twice -- once
     under each name -- which reads as two runs.
+
+    There is no longer a version of this that applies the changes and does NOT
+    redraw the gate. That was "hold for later", and it left the run in exactly
+    the state this does -- see _ask_ending, which explains why it stopped being
+    offered as a choice.
     """
     new_name = changes.pop("name", None)
     sentence = modify.sentence(proposal, changes)
@@ -1107,17 +1462,13 @@ def _apply_changes(agent, name, proposal, changes, quiet=False):
             if stop:
                 display.problem(stop, "Nothing was changed.")
                 return
-        _rework(agent, name, sentence, warnings=risks,
-                changed=list(changes), quiet=quiet)
-        if quiet:
-            display.done(f"{name} — changes applied, still held.",
-                         f"/approve {name} when you are ready.")
+        _rework(agent, name, sentence, warnings=risks, changed=list(changes))
 
     if new_name:
         settled = agent.rename(name, new_name)
         if settled and not sentence:
             _redraw(agent, settled, ["name"] + list(changes))
-    elif not sentence and changes and not quiet:
+    elif not sentence and changes:
         # Changes that cost no model call: a re-tune of a step already in the
         # -c stack rewrote the ini and left the command alone. Nothing has
         # redrawn the box, so it is redrawn here -- the mirror reads the
@@ -1134,7 +1485,50 @@ def _redraw(agent, name, changed):
         display.gate(record["proposal"], name, blockers=agent._blockers(),
                      changed=changed,
                      resources=override.summary(override.read(
-                         override.path_for(name, record.get("workdir") or "."))))
+                         override.path_for(name, record.get("workdir") or ".",
+                                           record["proposal"]))))
+
+
+def _cmd_view(agent, args):
+    """/view <name> -- the command a run is, and what can still be done to it.
+
+    The gate already draws this. What it did not do was draw it on request: the
+    box appeared when a run reached the gate and then scrolled away, so the
+    command -- the thing every decision is actually about -- was only ever
+    visible in the moment it arrived. /list answers "what runs are there" and
+    /check answers "how is it doing"; neither answers "what IS it", and that is
+    the question somebody has before they approve, modify or reject anything.
+
+    Read-only, and works on any run in any status. The verbs underneath change
+    with the status, because they have to: a submitted run cannot be approved
+    again and its /modify is a fork -- see _cmd_modify.
+    """
+    if not args:
+        held = agent.registry.held()
+        if len(held) == 1:
+            args = [held[0]["name"]]
+        else:
+            display.problem("usage: /view <name>",
+                            "/list shows what there is.")
+            return
+    name = args[0]
+    record = agent.registry.get(name)
+    if record is None:
+        display.problem(f"No run named '{name}'.", "/list shows what there is.")
+        return
+    proposal = record.get("proposal") or {}
+    if not proposal:
+        display.problem(f"'{name}' has no command on record.",
+                        "It was adopted from a job list rather than built "
+                        "here. /check tells you how it is doing.")
+        return
+    workdir = record.get("workdir") or "."
+    display.run_view(
+        proposal, name, record["status"],
+        resources=override.summary(override.read(
+            override.path_for(name, workdir, proposal))),
+        blockers=agent._blockers() if record["status"] == runs_store.HELD
+        else ())
 
 
 def _cmd_check(agent, args):
@@ -1526,6 +1920,7 @@ COMMAND_SPECS = [
     ("approve",  "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve),
     ("modify",   "<name> [change]",    "rewrite a held run and ask again",        "deciding", _cmd_modify),
     ("reject",   "<name> [why...]",    "abandon a held run; nothing submitted",   "deciding", _cmd_reject),
+    ("view",     "<name>",             "the command a run is, and what it takes", "watching", _cmd_view),
     ("list",     "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list),
     ("check",    "<name>|all",         "how a run is doing; all groups them",     "watching", _cmd_check),
     ("monitor",  "<name> [seconds]",   "watch one run until it stops changing",   "watching", _cmd_monitor),
@@ -1688,8 +2083,14 @@ def _turn(agent, thread, text, raw=None, label="thinking"):
 # waiting for one, and everything else applies only to a run that has actually
 # been submitted. Offering the wrong set is how you end up typing /check on a run
 # that has not run.
-_DECIDE = ("approve", "reject", "modify")
+_DECIDE = ("approve", "reject")
 _WATCH = ("check", "jobs", "diagnose", "cancel", "monitor", "hold")
+# Commands that work on a run in ANY state. /modify used to be in _DECIDE and
+# so completed only from held runs, which was right when a run that was not
+# held could not be modified at all. It forks one now -- see _cmd_modify -- and
+# a completion list that still hid every finished run would hide exactly the
+# runs somebody reaches for when they want to run something again.
+_EITHER = ("modify", "view")
 
 
 def _run_names(agent, command):
@@ -1703,6 +2104,15 @@ def _run_names(agent, command):
     try:
         if command in _DECIDE:
             records = agent.registry.held()
+        elif command in _EITHER:
+            # Held first, whatever the registry's order, because a run waiting
+            # on a decision is the one being reached for far more often than a
+            # finished one being copied. The rest follow newest-first below.
+            live = agent.registry.live()
+            records = ([r for r in live if r["status"] == runs_store.HELD]
+                       + list(reversed([r for r in live
+                                        if r["status"] != runs_store.HELD])))
+            return [(r["name"], _run_note(r)) for r in records]
         elif command in _WATCH:
             records = [r for r in agent.registry.live()
                        if r["status"] != runs_store.HELD]
@@ -1998,7 +2408,11 @@ def main(argv=None):
     # A run left parked at the gate in an earlier session is the one thing that
     # must not wait to be asked about: its name lived only in that session's
     # scrollback, and without this the decision is simply lost.
-    display.pending(agent.pending())
+    # Read before it is written, or the session would always report "nothing
+    # since you were last here" -- the mark being set on the way in.
+    _seen = agent.registry.seen_at()
+    display.pending(agent.pending(), since=agent.registry.unseen(), seen=_seen)
+    agent.registry.mark_seen()
     # Environment problems that only surface at submit time, surfaced now --
     # blockers only.
     #

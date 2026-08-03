@@ -260,6 +260,45 @@ class Verdict:
 
 _STEP_RANGE = re.compile(r"^\s*\d+(-\d+)?(\s*,\s*\d+(-\d+)?)*\s*$")
 
+# Letters, digits, dot, dash, underscore, and a first character that is not
+# punctuation. Three separate things depend on this and none of them is
+# cosmetic, which is why the message below says so rather than just stating the
+# rule:
+#
+#   the CLI      the name is typed as an argument -- `/approve pouletrun` --
+#                and args are split on whitespace, so a space makes one run
+#                look like two arguments.
+#   the disk     override.path_for builds `{name}.override.ini` from it. A `/`
+#                is a directory that does not exist, or worse, one that does.
+#   the thread   _fork_run builds `{name}::variant-<stamp>` as a thread id.
+#
+# `test_/modify_steps` -- a real answer somebody typed at this prompt -- would
+# have tried to write into a `test_` directory.
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+NAME_RULE = ("A run name is letters, digits, dot, dash and underscore — it is "
+             "typed as an argument and used as a filename.")
+
+
+def valid_name(text):
+    """Is this usable as a run name? See _NAME for what depends on it."""
+    return bool(_NAME.match((text or "").strip()))
+
+
+def sanitize(text):
+    """The nearest legal run name to `text`, or '' if there is nothing left.
+
+    Every illegal character becomes an underscore rather than being dropped, so
+    the result still looks like what was typed -- `test_/modify_steps` comes
+    back as `test__modify_steps` and is recognisable as the same intent. Runs of
+    underscores collapse, because the substitution creates them and nobody meant
+    them.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", (text or "").strip())
+    cleaned = re.sub(r"_{2,}", "_", cleaned).strip("_")
+    cleaned = re.sub(r"^[^A-Za-z0-9]+", "", cleaned)
+    return cleaned
+
 
 def valid_steps(text):
     """Is this a well-formed GenPipes -s range? Form only, not meaning.
@@ -351,9 +390,16 @@ def check(row, value, proposal, directory=".", registry=None, name=None,
         return Verdict(True)
 
     if row == "name":
-        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", value):
-            return Verdict(False, "A run name is letters, digits, dot, dash "
-                                  "and underscore.")
+        if not valid_name(value):
+            fixed = sanitize(value)
+            # The rule is real and worth keeping -- see sanitize() -- but a bare
+            # restatement of it leaves somebody to work out which character was
+            # the problem and retype the whole name. The corrected version is
+            # offered instead, so a refusal costs one keystroke rather than a
+            # second attempt.
+            return Verdict(False, NAME_RULE,
+                           [slots.Option(fixed, fixed, "the same name, legal")]
+                           if fixed and fixed != value else ())
         if registry is not None:
             record = registry.get(name) if name else None
             if record and record.get("status") != "held":
@@ -644,6 +690,27 @@ def fork_sentence(proposal, changes):
             f"Do not submit it. Stop at the gate.")
 
 
+def fork_prose(proposal, text):
+    """A fork whose change is stated in prose rather than picked from rows.
+
+    `/modify <a finished run> use readset_b.tsv` -- the case the whole reason
+    past runs became modifiable at all. There is no delta list because nobody
+    filled a panel in; there is a base command, which the fork's conversation
+    has never seen, and a sentence.
+
+    The base still travels verbatim, for the same reason it does in
+    fork_sentence(): a thread that has not read the original will invent the
+    seven flags nobody mentioned.
+    """
+    base = " ".join((proposal or {}).get("generated", "").split())
+    if not base or not (text or "").strip():
+        return ""
+    return (f"Generate a variant of this GenPipes run:\n\n    {base}\n\n"
+            f"with this change, and nothing else changed:\n\n"
+            f"  - {text.strip()}\n\n"
+            f"Do not submit it. Stop at the gate.")
+
+
 def _deltas(proposal, substantive):
     """'change -t from stringtie to atacseq' for each row that moved."""
     out = []
@@ -655,6 +722,19 @@ def _deltas(proposal, substantive):
             # anywhere else -- an override ini that lands before the cluster ini
             # is silently overruled by it and the run behaves as though nobody
             # touched anything.
+            #
+            # "Append" is only right when there is nothing to append AFTER. A
+            # fork quotes its parent's command verbatim, so the parent's
+            # override ini is already on that -c line; telling the model to
+            # append the fork's own would leave both, and the parent's file
+            # would go on tuning a run that is supposed to have its own copy.
+            stale = stacked_override(proposal)
+            if stale and os.path.basename(stale) != os.path.basename(str(new)):
+                out.append(f"replace {stale} with {new} at the very END of the "
+                           f"-c stack, leaving every other ini exactly where it "
+                           f"is ({os.path.basename(stale)} belongs to a "
+                           f"different run and must not appear at all)")
+                continue
             out.append(f"append {new} to the very END of the -c stack, after "
                        f"every other ini, and change nothing else about -c "
                        f"(it is a private override ini and has to win)")
@@ -664,6 +744,28 @@ def _deltas(proposal, substantive):
         out.append(f"change {flag} from {old} to {new}" if old
                    else f"add {flag} {new}")
     return out
+
+
+# A private override ini already on a command's `-c` line. Ours are always
+# written as `<run>.override.ini`, and that suffix is what tells one apart from
+# a GenPipes ini that merely happens to be last in the stack.
+_OVERRIDE_INI = re.compile(r"(\S*\.override\.ini)")
+
+
+def stacked_override(proposal):
+    """The override ini this command already carries, or '' if it carries none.
+
+    Lives here rather than in override.py because override.py imports from this
+    module and the dependency only runs one way. It is the same question
+    already_stacked() asks -- "is there one of ours on this -c line" -- with the
+    answer returned instead of compared, which is what a caller needs when the
+    old path has to be named in a sentence rather than merely detected.
+    """
+    values = (proposal or {}).get("slots") or {}
+    haystack = " ".join([str((proposal or {}).get("generated") or "")]
+                        + [str(v) for v in (values.get("inis") or ())])
+    found = _OVERRIDE_INI.search(haystack)
+    return found.group(1) if found else ""
 
 
 def already_stacked(proposal, path):
@@ -682,6 +784,180 @@ def already_stacked(proposal, path):
                         + [str(v) for v in
                            (((proposal or {}).get("slots") or {}).get("inis") or ())])
     return base in haystack
+
+
+# ---------------------------------------------------------------------------
+# The panel, as one flat list.
+#
+# /modify's screen is a command with its rows unfolding in place: put the cursor
+# on `protocol`, press enter, and that row's choices appear underneath it while
+# the rest of the command stays where it was. Picking one collapses the row
+# again, green, with the old value and the new one side by side.
+#
+# WHY FLAT. The obvious model is a tree -- rows, each holding choices -- driven
+# by a cursor that descends into a row and comes back out. That needs a second
+# cursor model inside ui.choose, and choose's keyboard handling is the part of
+# this app it is least safe to have two of. A flat list gets the same screen:
+# an open row's choices are simply MORE ROWS, inserted after their parent, drawn
+# indented. One cursor, one list, one keyboard.
+#
+# It also could not have been done by opening a second panel for the row. See
+# ui.choose: paint() rewrites its own block by moving up its own line count, and
+# that count starts at zero on every call -- so a second panel paints BELOW the
+# first rather than inside it, which is the stacked-screens layout this replaces.
+#
+# Everything here is pure: entries in, entries out, no terminal. The rendering
+# lives in display.modify_panel and the keyboard in ui.choose, which is what
+# lets the layout be tested without a pty.
+# ---------------------------------------------------------------------------
+
+ROW, CHOICE, EXTRA = "row", "choice", "extra"
+
+# The two rows that are not rows. They keep their names here rather than as
+# literals in cli.py because both the flattener and the renderer need to
+# recognise them.
+#
+# DONE exists because Enter now OPENS a row rather than ticking it, so there is
+# no keystroke left over to mean "that is the set". It appears only once
+# something has actually changed: an empty panel has nothing to review, and a
+# row offering to review nothing is a dead end dressed as an action.
+ELSE = "__else__"
+DONE = "__done__"
+
+
+class Entry:
+    """One line of the panel, whichever of the three kinds it is.
+
+        kind    ROW      a line of the command
+                CHOICE   one option belonging to the row above it
+                EXTRA    'describe it instead', and nothing else so far
+        row     the /modify row this belongs to -- for a CHOICE, its parent
+        value   the identity ui.choose hands back for the cursor. A tuple, so a
+                protocol called `name` cannot collide with the `name` row.
+        pick    this entry's index among the SELECTABLE entries, or None for a
+                line that is only being shown. ui.choose's cursor indexes the
+                selectable list and the renderer draws every line, so the two
+                have to agree about which is which -- computed once, here,
+                rather than by two functions that could disagree.
+        line    the mirror Line, for a ROW. The renderer needs its flag and
+                values; nothing else does.
+    """
+
+    __slots__ = ("kind", "row", "value", "label", "description", "pick", "line")
+
+    def __init__(self, kind, row, value, label="", description="", line=None):
+        self.kind = kind
+        self.row = row
+        self.value = value
+        self.label = label
+        self.description = description
+        self.line = line
+        self.pick = None
+
+    def __repr__(self):
+        return f"<Entry {self.kind} {self.row} {self.label}>"
+
+
+def matching(choices, typed):
+    """The choices left once `typed` has narrowed them.
+
+    Substring rather than prefix: somebody typing `fusion` to find
+    `cancer -- variants plus gene-fusion detection` is describing what they
+    want, and a prefix match would answer with nothing. The label is tried
+    first so an exact name still sorts to the front of its own list.
+    """
+    low = (typed or "").strip().lower()
+    if not low:
+        return list(choices)
+    hits = [c for c in choices if low in c.label.lower()]
+    return hits or [c for c in choices
+                    if low in (c.description or "").lower()]
+
+
+def panel_entries(m, offered, open_row=None, choices=(), typed="",
+                  changes=None, extras=True):
+    """The whole panel as one ordered list of Entry.
+
+        m         the Mirror -- the command being changed
+        offered   the rows that may be opened, from rows_for()
+        open_row  the row currently unfolded, or None
+        choices   that row's options, as slots.Option
+        typed     what has been typed to narrow them
+        changes   row -> new value, for rows already answered
+
+    A mirror line whose row is not offered is still drawn -- `-g cmd.sh` is
+    worth seeing and cannot be changed -- it simply gets no `pick`, so the
+    cursor passes over it. The panel is allowed to show more than it will
+    change, never less.
+    """
+    changes = dict(changes or {})
+    offered = set(offered or ())
+    out = []
+
+    for at, line in enumerate(m.lines if m else ()):
+        openable = line.row in offered and not line.head
+        # A line nobody can open still needs a distinct value, because ui.choose
+        # keys on it; its position serves, and is stable across repaints in a
+        # way that id() would not be.
+        out.append(Entry(ROW, line.row,
+                         (ROW, line.row) if openable else (ROW, at, "shown"),
+                         line=line))
+        if line.row and line.row == open_row:
+            for choice in matching(choices, typed):
+                out.append(Entry(CHOICE, line.row,
+                                 (CHOICE, line.row, choice.value),
+                                 label=choice.label,
+                                 description=choice.description))
+
+    if extras:
+        if changes:
+            count = len(changes)
+            out.append(Entry(EXTRA, DONE, (EXTRA, DONE),
+                             label=f"review {count} change"
+                                   f"{'' if count == 1 else 's'}",
+                             description="nothing is submitted by reviewing"))
+        out.append(Entry(EXTRA, ELSE, (EXTRA, ELSE), label="describe it instead",
+                         description="say it in a sentence and I'll fill these in"))
+
+    # Selectable = anything the cursor may rest on. With nothing open that is
+    # every offered row plus the extras; with a row open it is ONLY that row's
+    # choices, which is what makes the digit keys mean what they show -- choice
+    # 3 is the third line under the row, not the third selectable thing on the
+    # screen. It also keeps the cursor from wandering off to another row while
+    # one is mid-answer, leaving a row open nowhere near where you are looking.
+    at = 0
+    for entry in out:
+        if open_row is not None:
+            ok = entry.kind == CHOICE
+        elif entry.kind == ROW:
+            ok = len(entry.value) == 2 and entry.value[1] == entry.row
+        else:
+            ok = True
+        if ok:
+            entry.pick = at
+            at += 1
+    return out
+
+
+def selectable(entries):
+    """The entries ui.choose's cursor indexes, in its order."""
+    return [e for e in entries if e.pick is not None]
+
+
+def cursor_of(entries, row):
+    """Where the cursor should sit to be on `row`, or 0."""
+    for entry in entries:
+        if entry.pick is not None and entry.row == row:
+            return entry.pick
+    return 0
+
+
+def first_choice(entries):
+    """The index of the first choice of the open row, or None if it has none."""
+    for entry in entries:
+        if entry.kind == CHOICE and entry.pick is not None:
+            return entry.pick
+    return None
 
 
 # ---------------------------------------------------------------------------

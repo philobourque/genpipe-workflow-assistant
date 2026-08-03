@@ -33,6 +33,76 @@ def make_job_list(path, rows):
             f.write(f"{jid}\t{name}\t{log}\t{state}\n")
 
 
+def _since_checks(r):
+    """Runs whose OUTCOME nobody has looked at, without asking Slurm.
+
+    Deliberately not a diff against the last launch. Everything the registry
+    knows offline is something the person did themselves -- they held it, they
+    submitted it -- so "2 submitted since you were last here" is a list of
+    things they already watched happen. What is genuinely unseen is how those
+    runs turned out, and asking the scheduler for that would put seconds of
+    `module load` in front of the first prompt.
+    """
+    r.section("what nobody has seen the answer to yet")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = runs.Registry(tmp)
+        r.equal("the first ever launch has no previous session",
+                registry.seen_at(), "")
+        registry.mark_seen()
+        r.truthy("and one is recorded on the way in", registry.seen_at())
+
+        proposal = {"command": "bash cmd.sh", "slots": {"pipeline": "dnaseq"}}
+        registry.hold("waiting", "chat-1", proposal, tmp)
+        # A real job-list file: a submitted run whose list has vanished is
+        # pruned to `gone`, and gone runs are not somebody's problem any more.
+        joblist = os.path.join(tmp, "jl")
+        open(joblist, "w").close()
+        registry.mark_submitted("sent", joblist)
+
+        unseen = registry.unseen()
+        r.equal("a submitted run nobody has checked is worth a prompt",
+                [x["name"] for x in unseen["unfinished"]], ["sent"])
+        # A held run is already on the line above it, and it is not an outcome
+        # -- it is a decision, which is a different thing to be nagged about.
+        r.check("a held run is not one of these",
+                "waiting" not in [x["name"] for x in unseen["unfinished"]])
+
+        # A failure a previous /check cached. Stale by definition, and the
+        # caller says so -- but it is the thing most likely to have been closed
+        # and forgotten, so it is worth raising again.
+        registry.remember_check("sent", {"FAILED": 2}, 5,
+                                runs.verdict({"FAILED": 2}))
+        unseen = registry.unseen()
+        r.equal("a cached failure is raised again",
+                [x["name"] for x in unseen["failed"]], ["sent"])
+        r.equal("and is not double-counted as unchecked",
+                unseen["unfinished"], [])
+
+        # Once it is finished and known finished, there is nothing left to say.
+        registry.remember_check("sent", {"COMPLETED": 5}, 5,
+                                runs.verdict({"COMPLETED": 5}))
+        done = registry.unseen()
+        r.equal("a completed run drops off entirely", done["failed"], [])
+        r.equal("from both lists", done["unfinished"], [])
+
+        # Still running is still unanswered: the verdict is a snapshot, and the
+        # run has moved on since it was taken.
+        registry.remember_check("sent", {"RUNNING": 3}, 5,
+                                runs.verdict({"RUNNING": 3}))
+        r.equal("a run that was still going stays worth checking",
+                [x["name"] for x in registry.unseen()["unfinished"]], ["sent"])
+
+    # A broken or missing mark must never stop the app starting -- this is
+    # decoration on one line, and it is read before anything else happens.
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = runs.Registry(tmp)
+        os.mkdir(registry.seen_path)      # a directory where a file should be
+        r.equal("an unreadable mark reads as no session", registry.seen_at(), "")
+        registry.mark_seen()              # must not raise
+        r.check("and writing one cannot crash the launch", True)
+
+
 def main():
     r = Report("runs and jobs")
     workdir = tempfile.mkdtemp(prefix="genpipe_runs_test_")
@@ -339,6 +409,8 @@ Human time spent on this pipeline: 0:41:02
         r.equal("an empty task still yields a usable name",
                 runs.suggest_name("", when=__import__("datetime").date(2026, 7, 25)),
                 "run-0725")
+
+        _since_checks(r)
 
         return r.finish()
     finally:

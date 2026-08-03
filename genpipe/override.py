@@ -44,6 +44,7 @@ import datetime
 import os
 import re
 
+from . import modify
 from .modify import Verdict
 
 # The keys worth offering, in the order a resource problem is usually met. Each
@@ -84,14 +85,32 @@ _CPU = re.compile(r"^\s*(?:\d+|%\([A-Za-z_]\w*\)s)\s*$")
 _SECTION = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 
-def path_for(name, directory):
+def path_for(name, directory, proposal=None):
     """Where this run's override ini lives.
 
     Named after the run and kept beside it rather than in a shared location, so
     that two runs tuned differently cannot quietly share one file -- and so that
     somebody who finds the file six weeks later can tell what it was for from
     its name alone.
+
+    `proposal` wins when it has one, and that is READ off the `-c` stack rather
+    than derived -- the same rule mirror.py follows. The name is how a file gets
+    CREATED; the command is where it is afterwards, and those stop agreeing the
+    moment the run is renamed. Deriving from the name alone meant that after a
+    rename path_for() named a file that did not exist: the mirror's resources
+    line went blank, the gate stopped showing tuning that was still very much in
+    force, and the next /modify wrote a SECOND ini beside the live one.
+
+    Renaming the FILE instead would have been worse. Its path is written into a
+    command the model produced, so moving it means either editing that command
+    locally -- the one thing modify.py exists to never do -- or paying a
+    regeneration for a rename, which is the one change that costs nothing. So
+    the file stays where it was written, and this reads where that was.
     """
+    already = modify.stacked_override(proposal)
+    if already:
+        return (already if os.path.isabs(already)
+                else os.path.join(directory or ".", os.path.basename(already)))
     return os.path.join(directory or ".", f"{name}.override.ini")
 
 
@@ -191,10 +210,13 @@ def write(path, sections, run=""):
     anybody remembers typing it, and the three facts it carries -- what wrote
     it, for which run, and when -- are exactly what somebody needs before they
     trust or delete it.
+
+    See wrote() for callers that need to distinguish "removed it" from "there
+    was never one". This returns '' for both, which is right for deciding what
+    goes on `-c` and wrong for telling somebody what just happened to a file.
     """
     if not sections:
-        if path and os.path.exists(path):
-            os.remove(path)
+        removed(path)
         return ""
 
     parser = _parser()
@@ -212,6 +234,45 @@ def write(path, sections, run=""):
         handle.write("# Nothing under $GENPIPES_INIS was touched.\n\n")
         parser.write(handle)
     return path
+
+
+def removed(path):
+    """Delete the override ini if it is there. True only if one actually went.
+
+    Split out of write() because the caller announces this on screen, and
+    write() cannot tell the two empty cases apart: it returns '' both when it
+    deleted a file and when there was never a file to delete. The screen printed
+    "pouletrun.override.ini was removed" either way, which is a claim about the
+    filesystem made without looking -- on the one flow whose entire purpose is
+    that a file on disk says what the run will do.
+    """
+    if path and os.path.exists(path):
+        os.remove(path)
+        return True
+    return False
+
+
+def copy(old_path, new_path):
+    """Copy a run's override ini to a second run's name. True if one was copied.
+
+    For the FORK, and only the fork. A fork is a second run that starts life
+    with the first one's tuning, and path_for() names the file after the run
+    precisely so that "two runs tuned differently cannot quietly share one
+    file". Without this the fork's `-c` pointed at its parent's ini, and
+    re-tuning either one silently re-tuned both -- which is the exact thing that
+    docstring promises cannot happen.
+
+    A rename does NOT come through here. See path_for().
+    """
+    if not old_path or not new_path or old_path == new_path:
+        return False
+    if not os.path.exists(old_path):
+        return False
+    with open(old_path) as handle:
+        body = handle.read()
+    with open(new_path, "w") as handle:
+        handle.write(body)
+    return True
 
 
 def summary(sections):

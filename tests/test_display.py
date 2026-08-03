@@ -86,8 +86,18 @@ def main():
     r.contains("the protocol", out, "stringtie")
     r.contains("the steps", out, "1-5")
     r.contains("both config files", out, "rorqual.ini")
-    r.contains("how to approve", out, "/approve patient-42")
-    r.contains("how to reject", out, "/reject patient-42")
+    # The verbs, without the name. The name used to be repeated on each action
+    # line -- `/approve patient-42` -- which put it on this screen four times
+    # and grew the instructions to eight lines under a six-line command. It is
+    # on the mirror's own `name` row once, and the prompt completes it, so the
+    # action block is left saying only what each verb DOES.
+    r.contains("how to approve", out, "/approve")
+    r.contains("how to reject", out, "/reject")
+    r.contains("how to modify", out, "/modify")
+    r.check("without repeating the name on every line",
+            out.count("patient-42") == 1, f"counted {out.count('patient-42')}")
+    r.contains("and says the name is a keystroke away", out,
+               "tab completes the name")
     r.contains("and that nothing has happened yet", out,
                "Nothing has reached the scheduler")
     # The wording moved into mirror._absent when the gate started drawing the
@@ -443,18 +453,144 @@ def main():
 
     proposal = {"command": "bash cmd.sh", "slots": {"protocol": "germline_snv"}}
     clean = drawn(display.gate, proposal, "run-1")
-    r.check("a normal gate offers approve", "/approve run-1" in clean)
+    r.check("a normal gate offers approve", "/approve" in clean)
 
     # The point of the blocked gate: the command that cannot work must not be
     # on screen next to the explanation of why it cannot work.
     stopped = drawn(display.gate, proposal, "run-1", blockers=[block])
     r.check("a blocked gate withholds approve", "/approve" not in stopped)
-    r.check("but still allows reject", "/reject run-1" in stopped)
-    r.check("and still allows modify", "/modify run-1" in stopped)
+    r.check("but still allows reject", "/reject" in stopped)
+    r.check("and still allows modify", "/modify" in stopped)
     r.check("and says what to fix", "RAP_ID" in stopped)
     r.check("and confirms nothing was spent",
             "Nothing has reached the scheduler" in stopped)
 
+
+    # ---------------------------------------------------------------- #
+    # Every answer in /modify is an answer ABOUT a command, and the flow used
+    # to take the command off the screen at exactly the moment the questions
+    # about it started -- a stack of bare prompts scrolling down the terminal.
+    # Seven prompts in, somebody was editing a thing they could not see, and
+    # the six answers they had already given were three screens up.
+    r.section("filling a row keeps the command, and the answers so far, in view")
+
+    from genpipe import mirror
+    m = mirror.read("genpipes dnaseq -t somatic_fastpass -s 1-5 -g cmd.sh",
+                    name="pouletrun")
+
+    first = "\n".join(display.fill_header(m, "protocol", {}, "somatic_fastpass",
+                                          step="1 of 4"))
+    r.contains("the invocation is always there", first, "genpipes dnaseq")
+    r.contains("the row being asked shows what it says now", first,
+               "somatic_fastpass")
+    r.contains("and that it is the one in question", first, "→")
+    r.contains("with the position in the run of questions", first, "1 of 4")
+
+    later = "\n".join(display.fill_header(
+        m, "steps",
+        {"protocol": ("somatic_fastpass", "somatic_ensemble"),
+         "design": ("design.tsv", "cohort.tsv")},
+        "1-5", step="3 of 4"))
+    r.contains("answers already given stay on screen", later,
+               "somatic_ensemble")
+    r.contains("all of them, not just the last", later, "cohort.tsv")
+    r.contains("each as old → new", later, "design.tsv")
+    r.contains("and the current question is still marked", later, "steps")
+
+    # The collapse. The full mirror plus a protocol list plus the prompt runs
+    # past twenty-four rows, and once the terminal scrolls the repaint
+    # arithmetic that redraws this on every keystroke is wrong.
+    r.check("rows nobody is asking about are dropped, not dimmed",
+            "cmd.sh" not in later, later)
+    r.check("so the header stays short enough to repaint",
+            len(display.fill_header(m, "steps", {}, "1-5")) < 8)
+
+    # A row with no value yet has to say so rather than showing a blank, which
+    # reads as "already answered".
+    absent = "\n".join(display.fill_header(m, "pairs", {}, ""))
+    r.contains("an unset row says it is unset", absent, "not set")
+
+    cascade = "\n".join(display.fill_header(
+        m, "config", {"pipeline": ("dnaseq", "chipseq")}, "dnaseq.base.ini",
+        step="required · 1 of 3",
+        note="the -c stack is built on dnaseq.base.ini"))
+    r.contains("a required round says so", cascade, "required")
+    r.contains("and why the row came back", cascade, "-c stack is built on")
+
+    # ---------------------------------------------------------------- #
+    # A step name is not something anybody knows by heart. Faced with "its
+    # --help name, e.g. gatk_sam_to_fastq" and no list, somebody typed `--help`
+    # -- twice -- trying to get the thing the prompt was quoting at them.
+    r.section("an empty step panel says why it is empty")
+
+    why = drawn(display.no_step_list, "dnaseq", "somatic_fastpass")
+    r.contains("it says the list could not be read", why, "--help")
+    r.contains("and gives the exact command that prints it", why,
+               "genpipes dnaseq -t somatic_fastpass --help")
+    # The reason there is no table here, which is the same reason genpipes.md
+    # gives: the numbers and names are version-exact.
+    r.contains("and why the names are not kept in the tool", why,
+               "version-exact")
+    # The failure mode that makes a guess worse than an empty panel.
+    r.contains("and what a wrong guess would do", why, "ignored silently")
+
+    bare = drawn(display.no_step_list, None, None)
+    r.contains("it still gives a usable shape with nothing to go on", bare,
+               "--help")
+
+    # ---------------------------------------------------------------- #
+    # /list answers "what runs are there" and /check answers "how is it doing".
+    # Neither answers "what IS it", which is the question somebody has before
+    # they approve, modify or reject anything -- and the gate's box, the only
+    # place the command was ever drawn, had scrolled away by then.
+    r.section("/view draws any run, and offers only what its status allows")
+
+    viewed = {"command": "bash cmd.sh",
+              "generated": ("genpipes dnaseq -t somatic_fastpass -s 1-5 "
+                            "-r readset_a.tsv -g cmd.sh"),
+              "slots": {"pipeline": "dnaseq", "protocol": "somatic_fastpass",
+                        "steps": "1-5", "readset": "readset_a.tsv"}}
+
+    held = drawn(display.run_view, viewed, "pouletrun", "held")
+    r.contains("the command is drawn as the same mirror the gate uses",
+               held, "protocol     -t  somatic_fastpass")
+    r.contains("under the run's name", held, "pouletrun")
+    r.contains("a held run can be approved", held, "/approve")
+    r.contains("modified", held, "/modify")
+    r.contains("and rejected", held, "/reject")
+    # No red banner: nothing is being ASKED here. A box that shouts at somebody
+    # who typed a read-only command teaches them to ignore the shout.
+    r.check("but nothing is being demanded", "HOLD" not in held)
+
+    sent = drawn(display.run_view, viewed, "pouletrun", "submitted")
+    r.check("a submitted run cannot be approved again",
+            "/approve" not in sent)
+    r.check("nor rejected", "/reject" not in sent)
+    r.contains("it can be checked", sent, "/check")
+    r.contains("and modified", sent, "/modify")
+    # The one line that stops /modify reading as a rewrite of something live.
+    r.contains("which says plainly that it copies", sent,
+               "copies it into a new run")
+    r.contains("leaving the original alone", sent, "this one is untouched")
+
+    dropped = drawn(display.run_view, viewed, "pouletrun", "abandoned")
+    r.contains("an abandoned run can still be copied", dropped, "/modify")
+    r.check("but not checked — there is nothing on the scheduler",
+            "/check" not in dropped)
+
+    # A blocker withholds approve here for the same reason it does at the gate:
+    # an action that cannot work must not sit beside the reason it cannot.
+    block = preflight.check_rap_id("")
+    stopped = drawn(display.run_view, viewed, "pouletrun", "held",
+                    blockers=[block])
+    r.check("a blocked run withholds approve", "/approve" not in stopped)
+    r.contains("and says what to fix", stopped, "RAP_ID")
+    r.contains("while still allowing modify", stopped, "/modify")
+
+    tuned = drawn(display.run_view, viewed, "pouletrun", "held",
+                  resources="gatk_sam_to_fastq  walltime 35:00:00")
+    r.contains("tuning shows as its own row, not as an ini path",
+               tuned, "walltime 35:00:00")
 
     # ---------------------------------------------------------------- #
     r.section("the transcript folds the working away, and keeps it")
@@ -494,8 +630,7 @@ def main():
     # command is seen before it is approved.
     r.contains("shows what the script was built from", box, "genpipes chipseq")
     box = drawn(display.gate, proposal, "chipseq-0728")
-    for verb in ("/approve chipseq-0728", "/modify chipseq-0728",
-                 "/reject chipseq-0728"):
+    for verb in ("/approve", "/modify", "/reject"):
         r.contains(f"offers {verb}", box, verb)
     # The change from a version that printed bare command names: this is the one
     # point in the product where consequences matter.

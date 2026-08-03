@@ -1004,15 +1004,15 @@ class GenpipeA1(A1):
             moved = list(note.get("changed") or ())
             self.registry.update(name, changed=moved)
             status["changed"] = moved
-            # `quiet` is /modify's "hold for later": the change is applied and
-            # the run stays held, but the box is not redrawn. Somebody working
-            # through several runs does not want to be handed a decision every
-            # time they finish editing one, and the held run is findable from
-            # /list and from the startup pending line either way.
-            if not note.get("quiet"):
-                display.gate(proposal, name, blockers=blockers, warnings=risks,
-                             changed=moved,
-                             resources=self._resource_summary(name))
+            # Always drawn. There was a `quiet` flag here for /modify's "hold
+            # for later", which applied a change and suppressed this box -- and
+            # left the run in a state indistinguishable from the one this
+            # produces. See cli._ask_ending for why it stopped being offered:
+            # the batch case it was aimed at wants a flow of its own, not a
+            # menu row whose only effect is skipping a repaint.
+            display.gate(proposal, name, blockers=blockers, warnings=risks,
+                         changed=moved,
+                         resources=self._resource_summary(name))
         return status
 
     def _resource_summary(self, name):
@@ -1025,7 +1025,8 @@ class GenpipeA1(A1):
         the screen whose entire job is to be current.
         """
         record = self.registry.get(name) or {}
-        path = override.path_for(name, record.get("workdir") or os.getcwd())
+        path = override.path_for(name, record.get("workdir") or os.getcwd(),
+                                 record.get("proposal"))
         return override.summary(override.read(path))
 
     def _run_name(self, thread_id, proposal, task, held=_UNSET):

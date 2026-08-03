@@ -169,6 +169,121 @@ MAX_MENU = 10
 _MARK = "❯"
 
 
+class _Line:
+    """An editable line of text and a caret. No terminal, no drawing, no keys.
+
+    Everything that knows how a line of text responds to backspace, Ctrl+W, or
+    an arrow key -- and nothing else. It was written three times before this
+    existed: once in _Editor for the main prompt, once inside ask() for a
+    follow-up question, and a third was about to be written for the field that
+    sits inside a /modify panel row. Three copies of "delete the word to the
+    left of the caret" is three chances for one of them to be subtly wrong, and
+    the one people would notice is always the one they use least.
+
+    The split is drawing, not keys. Each of the three paints somewhere
+    different -- a framed box with a completion menu, a single line after a
+    prompt, an indented field between two other rows -- and there is nothing
+    shared in that. What IS shared is what the text becomes, which is here, and
+    which can be tested by calling methods instead of by driving a pty.
+
+    Methods return True when the text changed and False when only the caret
+    moved. Callers that maintain a completion menu need to tell those apart --
+    a highlighted row survives an arrow key and must reset on a keystroke.
+    """
+
+    __slots__ = ("text", "cur")
+
+    def __init__(self, text=""):
+        self.text = text
+        self.cur = len(text)
+
+    def set(self, text):
+        self.text = text
+        self.cur = len(text)
+        return True
+
+    def insert(self, chunk):
+        self.text = self.text[:self.cur] + chunk + self.text[self.cur:]
+        self.cur += len(chunk)
+        return True
+
+    def backspace(self):
+        if not self.cur:
+            return False
+        self.text = self.text[:self.cur - 1] + self.text[self.cur:]
+        self.cur -= 1
+        return True
+
+    def delete(self):
+        if self.cur >= len(self.text):
+            return False
+        self.text = self.text[:self.cur] + self.text[self.cur + 1:]
+        return True
+
+    def move(self, by):
+        self.cur = max(0, min(len(self.text), self.cur + by))
+        return False
+
+    def home(self):
+        self.cur = 0
+        return False
+
+    def end(self):
+        self.cur = len(self.text)
+        return False
+
+    def kill_left(self):
+        self.text = self.text[self.cur:]
+        self.cur = 0
+        return True
+
+    def kill_right(self):
+        self.text = self.text[:self.cur]
+        return True
+
+    def kill_word(self):
+        left = self.text[:self.cur].rstrip()
+        cut = left.rfind(" ") + 1
+        self.text = self.text[:cut] + self.text[self.cur:]
+        self.cur = cut
+        return True
+
+    def key(self, key):
+        """Apply one key. Returns None if this class does not handle it.
+
+        The dispatch lives here so the three callers cannot disagree about
+        which control code means what -- Ctrl+U clearing to the left in one
+        editor and the whole line in another is the kind of difference nobody
+        reports and everybody works around. Keys that are not editing --
+        Enter, Tab, Escape, Ctrl+C -- are deliberately NOT handled: they mean
+        different things in a prompt, a question and a panel field, and that is
+        each caller's business.
+        """
+        if isinstance(key, tuple) and key and key[0] == "paste":
+            return self.insert(key[1])
+        if key in ("\x7f", "\x08"):
+            return self.backspace()
+        if key == "delete":
+            return self.delete()
+        if key == "left":
+            return self.move(-1)
+        if key == "right":
+            return self.move(1)
+        if key in ("home", "\x01"):
+            return self.home()
+        if key in ("end", "\x05"):
+            return self.end()
+        if key == "\x15":                     # Ctrl+U
+            return self.kill_left()
+        if key == "\x0b":                     # Ctrl+K
+            return self.kill_right()
+        if key == "\x17":                     # Ctrl+W
+            return self.kill_word()
+        if isinstance(key, str) and len(key) == 1 and key.isprintable():
+            return self.insert(key)
+        return None
+
+
 class _Editor:
     def __init__(self, commands, history, initial="", arguments=None):
         self.commands = commands
@@ -177,8 +292,11 @@ class _Editor:
         # names out of the registry, and this module has no business reading it.
         self.arguments = arguments or (lambda name: [])
         self.history = history
-        self.text = initial
-        self.cur = len(initial)   # caret position within self.text
+        # The text and the caret live in a _Line, so this class is left with the
+        # part that is actually its own: the completion menu, the history, and
+        # the framed box. `text` and `cur` stay readable as attributes because
+        # everything from matches() to _input_line() reads them.
+        self.line = _Line(initial)
         self.sel = 0          # highlighted row in the completion menu
         self.scroll = 0       # first visible character, for long lines
         self.hist_at = len(history)
@@ -188,6 +306,14 @@ class _Editor:
         # "  ❯ " occupies four columns; leave one at the far end so a full line
         # never touches the rule's last character.
         self.room = self.span - 5
+
+    @property
+    def text(self):
+        return self.line.text
+
+    @property
+    def cur(self):
+        return self.line.cur
 
     # -- what to complete ---------------------------------------------------
 
@@ -358,54 +484,56 @@ class _Editor:
         self.sel = 0
         self.draw()
 
+    def _after(self, changed):
+        """Repaint, and reset the menu highlight only if the TEXT moved.
+
+        The distinction is why _Line's methods return a bool. An arrow key that
+        merely moves the caret must leave the highlighted completion row alone;
+        a keystroke that changes what has been typed invalidates it, because the
+        menu it was pointing into has just been recomputed underneath it.
+        """
+        if changed:
+            self._changed()
+        else:
+            self.draw()
+
     def set(self, text):
-        self.text = text
-        self.cur = len(text)
+        self.line.set(text)
         self.scroll = 0
         self._changed()
 
     def insert(self, ch):
-        self.text = self.text[:self.cur] + ch + self.text[self.cur:]
-        self.cur += len(ch)
-        self._changed()
+        self._after(self.line.insert(ch))
 
     def backspace(self):
-        if self.cur:
-            self.text = self.text[:self.cur - 1] + self.text[self.cur:]
-            self.cur -= 1
+        # Unconditionally treated as a text change, even at column 0 where it
+        # does nothing. Backspace is how somebody dismisses a completion menu
+        # they did not want, and it has to work on the keystroke after the one
+        # that emptied the line.
+        self.line.backspace()
         self._changed()
 
     def delete(self):
-        self.text = self.text[:self.cur] + self.text[self.cur + 1:]
+        self.line.delete()
         self._changed()
 
     def move(self, by):
-        self.cur = max(0, min(len(self.text), self.cur + by))
-        self.draw()
+        self._after(self.line.move(by))
 
     def home(self):
-        self.cur = 0
-        self.draw()
+        self._after(self.line.home())
 
     def end(self):
-        self.cur = len(self.text)
-        self.draw()
+        self._after(self.line.end())
 
     def kill_left(self):
-        self.text = self.text[self.cur:]
-        self.cur = 0
-        self._changed()
+        self._after(self.line.kill_left())
 
     def kill_right(self):
-        self.text = self.text[:self.cur]
-        self._changed()
+        self._after(self.line.kill_right())
 
     def kill_word(self):
-        left = self.text[:self.cur].rstrip()
-        cut = left.rfind(" ") + 1
-        self.text = self.text[:cut] + self.text[self.cur:]
-        self.cur = cut
-        self._changed()
+        self._after(self.line.kill_word())
 
     def select(self, by):
         m = self.matches() or self.arg_matches() or []
@@ -599,8 +727,160 @@ class Prompt:
 _ELSEWHERE = object()          # sentinel for the free-text row
 
 
+# Whether choice panels show their descriptions. Session state, flipped by `?`
+# inside any panel and remembered for every panel after it.
+#
+# On by default, and that is the whole design. "germline_snv" means nothing the
+# first time and the blurb beside it is the difference between a menu and a
+# guess; by the fiftieth time it is nine lines of text between you and the row
+# you already know you want. Neither audience is wrong, and neither is served by
+# a setting somebody has to find and remember they set -- so it is one key,
+# inside the panel, advertised on the hint line, and it sticks for the session.
+_DETAILS = [True]
+
+
+def details_on():
+    return _DETAILS[0]
+
+
+def option_lines(rows, cursor, picked=(), multi=False, field=None,
+                 details=None, numbered=True):
+    """The rows of a choice panel, as printable lines.
+
+    Returned rather than printed, and module-level rather than closed over
+    choose()'s locals, for the reason mirror_lines() is: the layout is the part
+    worth checking, and it used to be unreachable without a pty. Everything
+    around it -- raw mode, the reader, the repaint arithmetic -- is what makes
+    a terminal work and not what makes a panel readable.
+
+    ONE DESCRIPTION COLUMN, measured from the widest label. They used to start
+    three spaces after each label, which put them at a different column on
+    every row and made a list of options read as prose with the labels buried
+    in it. The mirror earns its legibility by being a table; so does this. The
+    width is capped so one long option cannot push every description off the
+    right-hand edge.
+    """
+    picked = set(picked or ())
+    details = details_on() if details is None else details
+    # With descriptions hidden the column serves only the field, so it collapses
+    # to whatever the labels need. A gutter held open for text that is not being
+    # drawn is the raggedness this column was introduced to remove.
+    labelw = (min(max((len(r.label) for r in rows), default=0) + 3, 26)
+              if details or field is not None else 1)
+    out = []
+    for i, row in enumerate(rows):
+        here = i == cursor
+        mark = f"{display.GREEN}❯{display.RESET}" if here else " "
+        if multi:
+            num = (f"{display.GREEN}◉{display.RESET}" if i in picked
+                   else f"{display.DIM}◯{display.RESET}")
+        elif not numbered:
+            # A panel with one row has nothing to number. "1" beside the only
+            # option implies a second one somewhere and invites looking for it.
+            num = ""
+        else:
+            num = f"{display.DIM}{i + 1:>2}{display.RESET}"
+        if i in picked:
+            label = f"{display.GREEN}{row.label}{display.RESET}"
+        elif here:
+            label = f"{display.BOLD}{display.WHITE}{row.label}{display.RESET}"
+        else:
+            label = row.label
+        pad = " " * max(1, labelw - len(row.label))
+        line = f"  {mark} {num}  {label}" if num else f"  {mark} {label}"
+        # A field replaces its row's description rather than sitting beside it:
+        # the value IS what that row now says, and a description repeating what
+        # the row already announces is the duplication this panel exists to
+        # stop printing.
+        mine = field is not None and row.value == field.row
+        if mine:
+            line += f"{pad}{field.render(here)}"
+            aside = field.note(field.text)
+            if aside and not here:
+                line += f"   {display.DIM}{aside}{display.RESET}"
+        elif row.description and details:
+            line += f"{pad}{display.DIM}{row.description}{display.RESET}"
+        out.append(line)
+        # While the field is live its note gets a line of its own, indented
+        # under the value it is about. On the row it would be read as a
+        # description of the OPTION -- "already exists" beside "save as a new
+        # run" says the wrong thing entirely.
+        if mine and here:
+            aside = field.note(field.text)
+            if aside:
+                out.append(f"       {display.AMBER}▌{display.RESET} {aside}")
+    return out
+
+
+class Field:
+    """An editable value living ON one row of a choice panel.
+
+    For the case where picking an option and saying what it applies to are the
+    same decision, and splitting them into two screens makes the second one
+    arrive too late to matter. The fork ending is the case that motivated it:
+    "hold as a new launch" used to be picked from a menu, and only THEN did a
+    bare prompt ask what the new run should be called -- so the answer to "is
+    this name already taken?" landed after the fork had been committed to, and
+    unique_name() silently appended a `-2` nobody was shown.
+
+    On the row, the name is visible while the choice is still being made, and
+    `note` is recomputed on every keystroke, so a collision is stated before
+    Enter rather than resolved behind somebody's back.
+
+    `note` is a callable rather than a string because it is a function of what
+    has been typed so far, and the whole value of putting it here is that it
+    keeps up with the typing.
+
+    `ok` decides whether Enter is allowed to leave with what is typed, and is
+    separate from `note` because most notes are not refusals. "pouletrun
+    already exists -- enter saves this as pouletrun-2" is something to KNOW,
+    and Enter should work; "a run name is letters, digits, dot, dash and
+    underscore" is a refusal, and Enter must not. Before this the panel took
+    the illegal name, handed it on, and the caller printed an error and
+    returned -- throwing away a change set somebody had spent four prompts
+    assembling because they mistyped its name at the last step.
+    """
+
+    __slots__ = ("row", "line", "note", "hint", "ok")
+
+    def __init__(self, row, initial="", note=None, hint="", ok=None):
+        self.row = row
+        self.line = _Line(initial)
+        self.note = note or (lambda text: "")
+        self.ok = ok or (lambda text: True)
+        self.hint = hint or "type to change · enter confirms · esc cancels"
+
+    @property
+    def text(self):
+        return self.line.text.strip()
+
+    def render(self, active):
+        """The field as it sits on its row: caret when active, quiet when not.
+
+        A block character stands in for the terminal's own cursor. The panel
+        repaints whole lines from the top on every keystroke and never places a
+        real cursor inside one, so a caret has to be part of the text -- and a
+        field with no visible caret reads as a label rather than as something
+        you can type into, which is the entire point of putting it here.
+        """
+        text = self.line.text
+        if not active:
+            return (f"{display.DIM}{_MARK} {text or '—'}{display.RESET}")
+        at = self.line.cur
+        body = (f"{display.BOLD}{display.WHITE}{text[:at]}{display.RESET}"
+                f"{display.GREEN}█{display.RESET}"
+                f"{display.BOLD}{display.WHITE}{text[at:]}{display.RESET}")
+        return f"{display.GREEN}{_MARK}{display.RESET} {body}"
+
+
+def _text(value):
+    """A string that may have arrived as a callable. See choose's `question`."""
+    return value() if callable(value) else value
+
+
 def choose(question, options, note="", free_text=True, free_label="Something else",
-           multi=False, draw=None, cursor=0):
+           multi=False, draw=None, cursor=0, field=None,
+           on_enter=None, on_escape=None, on_text=None):
     """A numbered choice panel. Returns the chosen value, or None if cancelled.
 
     `options` are slots.Option-shaped: anything with .value, .label and
@@ -642,20 +922,64 @@ def choose(question, options, note="", free_text=True, free_label="Something els
     ordered the way they are: the panel has to be safe to explore, which means
     the row you land on by accident should be one where nothing happens.
 
+    `field` is a Field the cursor can type into when it rests on that row -- see
+    Field, and note that while it is active the digit keys are TEXT rather than
+    row selectors, because a run called `2` is a legal run name and a panel that
+    jumped rows halfway through typing one would be unusable. The chosen value
+    still comes back as the return; the caller reads field.text for the rest.
+
+    A PANEL WHOSE ROWS CHANGE WHILE IT IS OPEN. `options` may be a callable
+    instead of a list, re-read on every repaint, and `question` may be too. With
+    `on_enter` and `on_escape`, that is enough for a row to open in place --
+    /modify's panel unfolds a row's choices underneath it, as more rows in this
+    same flat list, and the heading becomes the question being asked.
+
+    It is one list and one cursor, deliberately. The alternative was a second
+    choose() for the opened row, and that cannot work: paint() rewrites its own
+    block by moving up its own line count, and `painted` starts at zero on every
+    call -- so a second panel paints BELOW the first rather than inside it,
+    which is the stacked-screens layout the in-place design exists to replace.
+    Nesting a cursor inside a cursor was the other option, and a flat list with
+    indented rows gets the same result without a second keyboard model.
+
+        on_enter(value)   what Enter does instead of returning. Falsy means the
+                          normal thing -- pick it and leave. True keeps the
+                          panel open; an int keeps it open and moves the cursor
+                          there, which is how opening a row lands you on its
+                          first choice.
+        on_escape()       True closes an open row and keeps the panel; falsy
+                          cancels the panel, which is what Escape means when
+                          nothing is open.
+        on_text(key)      a printable character or backspace that nothing else
+                          claimed. /modify narrows an open row's choices with
+                          it. Digits are NOT offered here when they are picking
+                          rows -- a key cannot both choose option 3 and type a
+                          3, and picking is the older meaning.
+
+    Both are called between repaints, so a hook may change whatever `options`
+    reads and the next paint will show it.
+
     Falls back to a printed list and input() with no terminal, so the panel
     works over a pipe and in tests. The fallback ignores `draw` and prints the
     plain list: a repaint hook is meaningless without a cursor to repaint for.
+    It also ignores the hooks and the callable forms, taking one reading of the
+    rows -- a panel nobody can press a key in cannot open anything.
     """
-    rows = list(options)
-    if free_text:
-        rows = rows + [_FreeRow(free_label)]
+    def current_rows():
+        got = list(_text(options) if callable(options) else options)
+        if free_text:
+            got = got + [_FreeRow(free_label)]
+        return got
+
+    rows = current_rows()
     if not rows:
         return [] if multi else None
 
     quick = len(rows) <= 9
 
     if not sys.stdin.isatty():
-        return _choose_headless(question, rows, note, quick, multi=multi)
+        return _choose_headless(_text(question), rows, _text(note), quick,
+                                multi=multi, field=field)
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
@@ -663,9 +987,24 @@ def choose(question, options, note="", free_text=True, free_label="Something els
     painted = 0
     picked = set()
 
+    def refresh(at=None):
+        """Re-read the rows after a hook has moved something underneath us.
+
+        The cursor is clamped rather than preserved by identity: the row it was
+        on may not exist any more, and landing at the end of a shorter list is
+        the one behaviour that is never surprising.
+        """
+        nonlocal rows, cursor, quick
+        rows = current_rows()
+        quick = len(rows) <= 9
+        if at is not None:
+            cursor = at
+        cursor = max(0, min(cursor, len(rows) - 1)) if rows else 0
+
     def block():
         out = []
-        head = f"  {display.GREEN}▌{display.RESET} {display.BOLD}{question}{display.RESET}"
+        head = (f"  {display.GREEN}▌{display.RESET} "
+                f"{display.BOLD}{_text(question)}{display.RESET}")
         if multi:
             head += (f"          {display.DIM}space to select · enter when "
                      f"done{display.RESET}")
@@ -674,33 +1013,35 @@ def choose(question, options, note="", free_text=True, free_label="Something els
         if draw:
             out.extend(draw(cursor, set(picked)))
         else:
-            for i, row in enumerate(rows):
-                here = i == cursor
-                mark = f"{display.GREEN}❯{display.RESET}" if here else " "
-                if multi:
-                    box = (f"{display.GREEN}◉{display.RESET}" if i in picked
-                           else f"{display.DIM}◯{display.RESET}")
-                    num = box
-                else:
-                    num = f"{display.DIM}{i + 1:>2}{display.RESET}"
-                if i in picked:
-                    label = f"{display.GREEN}{row.label}{display.RESET}"
-                elif here:
-                    label = f"{display.BOLD}{display.WHITE}{row.label}{display.RESET}"
-                else:
-                    label = row.label
-                line = f"  {mark} {num}  {label}"
-                if row.description:
-                    line += f"   {display.DIM}{row.description}{display.RESET}"
-                out.append(line)
+            out.extend(option_lines(rows, cursor, picked, multi, field))
         out.append("")
-        if note:
-            out.append(f"     {display.DIM}{note}{display.RESET}")
-        if multi:
-            keys = "space toggles, enter confirms"
+        # The note under a live field is about that field, not about the panel.
+        # Saying "nothing is submitted by any of these" beneath a name somebody
+        # is typing answers a question they stopped asking two keystrokes ago.
+        on_field = (field is not None and 0 <= cursor < len(rows)
+                    and rows[cursor].value == field.row)
+        shown = _text(note)
+        if shown and not on_field:
+            out.append(f"     {display.DIM}{shown}{display.RESET}")
+        if on_enter is not None and not on_field:
+            # A panel that redefines Enter has to say so itself. Printing
+            # "enter picks" underneath a note that says "enter opens a row" is
+            # worse than printing nothing: two hints that disagree teach people
+            # to read neither.
+            return out
+        if on_field:
+            keys = field.hint
+        elif multi:
+            keys = "space toggles, enter confirms · esc cancels"
         else:
             keys = ("1-9 to pick" if quick else "digits move, enter picks")
-        out.append(f"     {display.DIM}↑↓ · {keys} · esc cancels{display.RESET}")
+            keys += " · esc cancels"
+        # Advertised only where there is something to reveal or hide. A panel
+        # whose rows carry no descriptions would be offering a key that does
+        # nothing visible, which is how a hint line stops being read.
+        if not on_field and any(r.description for r in rows):
+            keys += " · ? details" if not details_on() else " · ? hides details"
+        out.append(f"     {display.DIM}↑↓ · {keys}{display.RESET}")
         return out
 
     def paint():
@@ -722,9 +1063,35 @@ def choose(question, options, note="", free_text=True, free_label="Something els
         reader = _Reader(fd)
         while True:
             key = reader.key()
+            # A field under the cursor claims the keyboard for everything that
+            # is editing, and nothing that is navigation. ↑↓ still move off the
+            # row -- being unable to leave a field without answering it is the
+            # trap this panel exists to avoid -- and Enter still confirms.
+            on_field = (field is not None and 0 <= cursor < len(rows)
+                        and rows[cursor].value == field.row)
+            if on_field and key not in ("\r", "\n", "up", "down", "escape",
+                                        "\x1b", "\x03", "\t"):
+                if field.line.key(key) is not None:
+                    paint()
+                    continue
             if isinstance(key, tuple):            # a paste; ignore in a menu
                 continue
             if key in ("\r", "\n"):
+                # A field that refuses what is typed refuses Enter with it. The
+                # note is already on screen saying why, so this simply does
+                # nothing -- which is the correct amount of ceremony for a
+                # keypress that was a mistake, and infinitely better than the
+                # alternative it replaced: taking the bad value, failing in the
+                # caller, and discarding the whole change set on the way out.
+                if on_field and not field.ok(field.text):
+                    continue
+                if on_enter is not None and not multi and 0 <= cursor < len(rows):
+                    verdict = on_enter(rows[cursor].value)
+                    if verdict is not False and verdict is not None:
+                        refresh(verdict if isinstance(verdict, int)
+                                and not isinstance(verdict, bool) else None)
+                        paint()
+                        continue
                 if multi:
                     # Enter on an empty set takes the row under the cursor.
                     # Confirming nothing is almost always a missed space bar,
@@ -742,8 +1109,17 @@ def choose(question, options, note="", free_text=True, free_label="Something els
             # the raw byte, so matching on "\x1b" here would never fire and the
             # panel would be inescapable.
             if key in ("escape", "\x1b", "\x04"):
+                if on_escape is not None and on_escape():
+                    refresh()
+                    paint()
+                    continue
                 break
-            if key == " " and multi:
+            if key == "?" and not on_field:
+                # Not while a field is live: `?` is a character somebody might
+                # be typing, and a panel that reflowed underneath a half-typed
+                # name would be answering a question nobody asked.
+                _DETAILS[0] = not _DETAILS[0]
+            elif key == " " and multi:
                 picked.symmetric_difference_update({cursor})
             elif key == "up":
                 cursor = (cursor - 1) % len(rows)
@@ -760,8 +1136,25 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                     if multi and quick:
                         picked.symmetric_difference_update({cursor})
                     elif quick:
+                        # A digit is Enter on that row, so it goes through the
+                        # same hook. Without this, 3 would pick a row that
+                        # Enter would merely have opened -- the two keys are
+                        # advertised as the same action and have to be one.
+                        if on_enter is not None:
+                            verdict = on_enter(rows[cursor].value)
+                            if verdict is not False and verdict is not None:
+                                refresh(verdict if isinstance(verdict, int)
+                                        and not isinstance(verdict, bool)
+                                        else None)
+                                paint()
+                                continue
                         chosen = rows[cursor]
                         break
+            elif on_text is not None and (
+                    key in ("\x7f", "\x08") or
+                    (len(key) == 1 and key.isprintable())):
+                if on_text(key):
+                    refresh()
             paint()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
@@ -774,7 +1167,7 @@ def choose(question, options, note="", free_text=True, free_label="Something els
         for i in sorted(picked):
             row = rows[i]
             if row.value is _ELSEWHERE:
-                extra = ask(question)
+                extra = ask(_text(question))
                 if extra:
                     out.append(extra)
             else:
@@ -785,7 +1178,7 @@ def choose(question, options, note="", free_text=True, free_label="Something els
         print()
         return None
     if chosen.value is _ELSEWHERE:
-        return ask(question) or None
+        return ask(_text(question)) or None
     return chosen.value
 
 
@@ -801,7 +1194,7 @@ class _FreeRow:
         self.description = "type your own"
 
 
-def _choose_headless(question, rows, note, quick, multi=False):
+def _choose_headless(question, rows, note, quick, multi=False, field=None):
     """No terminal: print the list, read a number or free text.
 
     Deliberately accepts the option *text* as well as its number, so a scripted
@@ -810,10 +1203,21 @@ def _choose_headless(question, rows, note, quick, multi=False):
     In multi mode a comma-separated answer selects several rows, by number or by
     text or a mix of both. This is what keeps the multi-select testable without
     a tty, which is the only way the panel gets exercised in CI at all.
+
+    A `field` cannot be typed into here -- there is no cursor to put on its row
+    -- but its value is still PRINTED, because it is part of what that row
+    means. A scripted run that picks "save as a new run" gets the proposed name
+    and needs to be able to see what it got.
     """
     print(f"\n{question}")
     for i, row in enumerate(rows):
-        tail = f"   {row.description}" if row.description else ""
+        if field is not None and row.value == field.row:
+            tail = f"   {field.text}"
+            aside = field.note(field.text)
+            if aside:
+                tail += f"   ({aside})"
+        else:
+            tail = f"   {row.description}" if row.description else ""
         print(f"  {i + 1:>2}  {row.label}{tail}")
     if note:
         print(f"      {note}")
@@ -913,11 +1317,11 @@ def ask(label, default=""):
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    text, cur = default, len(default)
+    line = _Line(default)
 
     def paint():
-        sys.stdout.write(f"\r{prompt}{text}\033[K")
-        back = len(text) - cur
+        sys.stdout.write(f"\r{prompt}{line.text}\033[K")
+        back = len(line.text) - line.cur
         if back:
             sys.stdout.write(f"\033[{back}D")
         sys.stdout.flush()
@@ -928,41 +1332,25 @@ def ask(label, default=""):
         reader = _Reader(fd)
         while True:
             key = reader.key()
-            if isinstance(key, tuple) and key[0] == "paste":
-                text = text[:cur] + key[1] + text[cur:]
-                cur += len(key[1])
-            elif key in ("\r", "\n"):
+            # Everything this question does differently from the main prompt,
+            # and nothing it does the same. Enter submits, Tab completes a PATH
+            # rather than a command, and Ctrl+D on an empty line is EOF. The
+            # editing keys go to _Line, which is the whole point of _Line.
+            if key in ("\r", "\n"):
                 break
-            elif key == "\x03":
+            if key == "\x03":
                 raise KeyboardInterrupt
-            elif key == "\x04" and not text:
+            if key == "\x04" and not line.text:
                 raise EOFError
-            elif key == "\t":
-                text, cur = _complete_path(text, cur)
-            elif key in ("\x7f", "\x08"):
-                if cur:
-                    text = text[:cur - 1] + text[cur:]
-                    cur -= 1
-            elif key == "delete":
-                text = text[:cur] + text[cur + 1:]
-            elif key == "left":
-                cur = max(0, cur - 1)
-            elif key == "right":
-                cur = min(len(text), cur + 1)
-            elif key in ("home", "\x01"):
-                cur = 0
-            elif key in ("end", "\x05"):
-                cur = len(text)
-            elif key == "\x15":                       # Ctrl+U -- clear it
-                text, cur = "", 0
-            elif len(key) == 1 and key.isprintable():
-                text = text[:cur] + key + text[cur:]
-                cur += 1
+            if key == "\t":
+                line.text, line.cur = _complete_path(line.text, line.cur)
+            else:
+                line.key(key)
             paint()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
     print("\r\n", end="")
-    return text
+    return line.text
 
 
 # --------------------------------------------------------------------------
