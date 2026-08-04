@@ -862,7 +862,8 @@ def _modify_guided(agent, name, record, fork_only=False):
         tuned = override.summary(
             override.read(override.path_for(name, directory, proposal)))
         rows = modify.rows_for(proposal, name, resources=tuned)
-        m = (mirror.read(proposal.get("generated"), name=name, resources=tuned)
+        m = (mirror.read(proposal.get("generated"), name=name, resources=tuned,
+                         missing=proposal.get("missing"))
              or mirror.from_slots(proposal, name=name, resources=tuned)).ensure(
                  [row for row, _ in rows])
         # Cursor order follows the mirror, not ROWS, so ↓ moves down the screen.
@@ -2135,6 +2136,62 @@ def _run_note(record):
     return f"{what}  {check.get('verdict', '')}".strip()
 
 
+def _learned_files(line, directory):
+    """Readset, design and pairs this line names, kept only if they resolve on
+    disk.
+
+    A name that is not there must not be "learned" -- prep.ready() would then
+    believe the run is complete when genpipes will reject the argument. Uses
+    the same resolution intake.brief() already applies to the same line, so
+    the two never disagree about whether a named file exists.
+    """
+    parsed = intake.read(line)
+    return {slot: parsed[slot] for slot in ("readset", "design", "pairs")
+            if parsed.get(slot) and intake._resolves(parsed[slot], directory)}
+
+
+def _gap_note(state, directory):
+    """What to tell the model about what is still needed, or None once ready.
+
+    Built from prep.missing()/prep.ready() -- the same table slots.gaps() uses
+    to drive the offline fake-LLM's question sequence -- rather than left for
+    the model to infer. A fully-specified request is told there is nothing
+    left to ask and to generate now; an underspecified one is told the single
+    next thing to ask about, in slots.gaps()'s order, and nothing else.
+
+    `directory` is still os.getcwd() here, the same as every other candidate
+    lookup in this file. It is the right directory for resolving a RELATIVE
+    PATH THE USER TYPED (that part is fine) but the wrong one for candidate
+    DISCOVERY if a project directory has been established elsewhere in the
+    conversation -- see AGENT-FIXES.md defect 1. Once that lands, thread its
+    project_dir through here instead of defaulting to the cwd.
+    """
+    if not state.pipeline:
+        return None
+    candidates = intake.candidates(directory)
+    gap = prep.missing(state, candidates)
+
+    lines = [f"The user is preparing a {state.pipeline} run."]
+    if state.protocol:
+        lines.append(f"Protocol: -t {state.protocol}. Settled -- do not ask "
+                     f"for it again.")
+    for label, value in (("readset", state.readset), ("design", state.design),
+                         ("pairs", state.pairs)):
+        if value:
+            lines.append(f"{label.capitalize()}: {value}. Settled -- do not "
+                         f"ask for it again.")
+
+    if gap is None:
+        lines.append("Everything required is settled. Do not ask about the "
+                     "step range, cluster config or output directory -- every "
+                     "step is the default and the cluster ini for this "
+                     "machine is not a decision. Generate the command now.")
+    else:
+        lines.append(f"Still needed, and the ONLY thing to ask about right "
+                     f"now: {gap.question}")
+    return "\n".join(lines)
+
+
 def _preparing(agent, state, line):
     """Decide whether this line is the beginning of a run, and say so once.
 
@@ -2146,8 +2203,10 @@ def _preparing(agent, state, line):
 
     Three outcomes:
 
-      already preparing   Stay in it. Learn whatever this line settled and say
-                          nothing more -- the label is already on screen.
+      already preparing   Stay in it. Learn whatever this line settled --
+                          pipeline, protocol, and now readset/design/pairs
+                          too -- and say what is still needed, from
+                          prep.missing(), not from the model's own judgement.
       ambiguous           One short clarification, asked before a model call is
                           spent either way. Not a guess in either direction:
                           guessing "question" wastes their time, guessing "run"
@@ -2158,12 +2217,14 @@ def _preparing(agent, state, line):
     """
     intent = prep.intent(line)
     found = prep.goal(line)
+    directory = os.getcwd()
 
     if state.active:
         if found:
             state.learn(pipeline=found.pipeline, protocol=found.protocol,
                         described=found.described)
-        return state, None
+        state.learn(**_learned_files(line, directory))
+        return state, _gap_note(state, directory)
 
     if intent == prep.QUESTION:
         return state, None
@@ -2181,6 +2242,7 @@ def _preparing(agent, state, line):
     if found:
         state.learn(pipeline=found.pipeline, protocol=found.protocol,
                     described=found.described)
+    state.learn(**_learned_files(line, directory))
 
     print(f"  {display.GREEN}●{display.RESET} {display.BOLD}Preparing run…"
           f"{display.RESET}")
@@ -2189,29 +2251,7 @@ def _preparing(agent, state, line):
         print(f"    {display.DIM}{summary}{display.RESET}")
     print()
 
-    if not found:
-        return state, None
-
-    # What the description was taken to mean, stated to the model as settled.
-    # The pipeline is inferred readily -- it is visible in the gate box and a
-    # wrong one costs one correction. A protocol is passed on ONLY where the
-    # mapping is unambiguous, because a wrong protocol produces a run that
-    # completes successfully and answers a different question.
-    lines = [f"The user is asking for a run, not an explanation. They described "
-             f"the goal as: {found.described}."]
-    lines.append(f"That is the {found.pipeline} pipeline. Do not ask them to "
-                 f"choose a pipeline; they have described one.")
-    if found.protocol:
-        lines.append(f"The protocol that means is -t {found.protocol}. Do not "
-                     f"ask them to choose a protocol either.")
-    else:
-        lines.append("The protocol is NOT determined by what they said. Ask "
-                     "for it -- do not guess, it decides which callers run and "
-                     "what the numbers at the end mean.")
-    lines.append("Do not ask about the step range or the cluster config: every "
-                 "step is the default, and the cluster ini for this machine is "
-                 "not a decision. Ask only for documents the protocol requires.")
-    return state, "\n".join(lines)
+    return state, _gap_note(state, directory)
 
 
 def _briefed(line, already_sent):

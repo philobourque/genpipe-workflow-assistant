@@ -43,7 +43,7 @@ from genpipe.cli import build_agent
 
 GEN = ("module load mugqic/genpipes/6.1.1 && genpipes rnaseq -t stringtie "
        "-s 1-5 -c rnaseq.base.ini common_ini/rorqual.ini -r readset.tsv "
-       "-g cmd.sh")
+       "-d design.tsv -g cmd.sh")
 GEN_REVISED = GEN.replace("-s 1-5", "-s 6-12")
 
 
@@ -65,6 +65,8 @@ def fixtures(work):
             f.write("[DEFAULT]\ncluster_server=rorqual\n")
     with open(os.path.join(work, "readset.tsv"), "w") as f:
         f.write("Sample\tReadset\tLibrary\n")
+    with open(os.path.join(work, "design.tsv"), "w") as f:
+        f.write("Sample\tContrast\n")
 
 
 def fresh_agent(work, llm_script, on_reject=None):

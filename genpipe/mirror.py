@@ -250,7 +250,7 @@ def _groups(tokens):
     return groups
 
 
-def _absent(row):
+def _absent(row, required=False):
     """The line for a row the command does not set.
 
     `output` gets a longer note than the rest because its absence is not
@@ -258,6 +258,13 @@ def _absent(row):
     missing `-o` means GenPipes writes into whatever directory you happened to
     be standing in. That is a decision nobody made, and it is the only one the
     gate has always called out in red.
+
+    `required=True` is the second such case: a row named in the proposal's
+    `missing` list (see gate.build_proposal) is not "this run doesn't use
+    this flag" the way an absent `-p` on a germline run is -- it is a flag
+    every run needs and this one does not have. Drawn the same way `output`
+    already is, in red, because the reasoning is the same: a silent absence
+    here is what let an approvable box go out with no readset row at all.
     """
     if row == "output":
         return Line("output", "output", "-o", [], warn=True,
@@ -266,6 +273,9 @@ def _absent(row):
         return Line("resources", "resources", "", [],
                     note="no step tuned — walltime, cpu and memory as the "
                          "inis set them")
+    if required:
+        return Line(row, row, FLAG_OF.get(row, ""), [], warn=True,
+                    note="not set — required")
     return Line(row, row, FLAG_OF.get(row, ""), [], note="not set")
 
 
@@ -289,7 +299,7 @@ def _ordered(lines):
          for i, line in enumerate(lines)), key=lambda pair: pair[0])]
 
 
-def read(generated, name="", resources=""):
+def read(generated, name="", resources="", missing=()):
     """Tokenise a generated command into a Mirror.
 
     `name` adds the run's name as the first line. It is not a flag and says so
@@ -303,6 +313,11 @@ def read(generated, name="", resources=""):
     last entry on `-c` and wins over every GenPipes ini. It already appears in
     the `-c` line as a path; the point of a second line is that a path ending in
     `.override.ini` does not say a walltime was doubled.
+
+    `missing` is gate.build_proposal's own verdict on what this command needs
+    and does not have -- pass proposal["missing"] straight through. Rows named
+    here are drawn as required-but-absent (see _absent) rather than silently
+    skipped the way an unused `-p` is.
     """
     text = invocation(generated)
     if not text:
@@ -340,6 +355,8 @@ def read(generated, name="", resources=""):
     # rather than trailing the flags that have no row at all -- an absence is
     # still that row, and it reads as an afterthought anywhere else.
     seen.setdefault("output", _absent("output"))
+    for row in missing or ():
+        seen.setdefault(row, _absent(row, required=True))
     if resources:
         seen["resources"] = Line("resources", "resources", "", [resources],
                                  note="last in the -c stack, so it wins")
@@ -369,8 +386,13 @@ def from_slots(proposal, name="", resources=""):
     does not know is simply absent, whereas read() would have shown it. Callers
     should try read() first and treat an empty Mirror as the signal to come
     here, which is what `mirror.read(...) or mirror.from_slots(...)` does.
+
+    `missing` (proposal["missing"], set by gate.build_proposal) is read
+    straight off the proposal rather than taken as a separate argument, unlike
+    read() -- this function already has the whole proposal in hand.
     """
     values = (proposal or {}).get("slots") or {}
+    missing = set((proposal or {}).get("missing") or ())
     pipeline = values.get("pipeline") or ""
     lines = []
     for row in ROWS:
@@ -389,6 +411,8 @@ def from_slots(proposal, name="", resources=""):
         if raw in (None, "", [], ()):
             if row == "output":
                 lines.append(_absent("output"))
+            elif row in missing:
+                lines.append(_absent(row, required=True))
             continue
         got = ([str(v) for v in raw] if isinstance(raw, (list, tuple))
                else [str(raw)])

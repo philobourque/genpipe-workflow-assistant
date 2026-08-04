@@ -31,6 +31,8 @@ attribute -- rather than LangGraph state, so nothing here needs a graph to run.
 """
 import re
 
+from . import slots
+
 # Text that means "this really submits". Searched against executable_lines(),
 # never the raw block -- see that function for why.
 _SUBMIT_PATTERNS = [
@@ -497,6 +499,17 @@ def build_proposal(messages, code):
     if m and m.group(1) != "tools":
         pipeline = m.group(1)
 
+    # What genpipes cannot run without, whether or not the model happened to
+    # write it. slots.gaps() is the same table the offline fake-LLM's question
+    # sequence and prep.Preparation both use -- one required-slot table, not a
+    # second one invented here. Empty means the proposal is complete; it does
+    # NOT mean the pipeline/protocol were understood, since an unknown pipeline
+    # makes slots.gaps() ask about that instead (harmless here: build_proposal
+    # is about what's missing from a command already believed to be genpipes).
+    missing = [g.slot for g in slots.gaps(
+        pipeline=pipeline, protocol=protocol,
+        readset=readset, design=design, pairs=pairs)]
+
     lines = ["About to submit this GenPipes run:", f"  command: {cmd}"]
     if pipeline:
         lines.append(f"  pipeline: {pipeline}")
@@ -510,9 +523,12 @@ def build_proposal(messages, code):
         lines.append(f"  design file: {design}")
     if pairs:
         lines.append(f"  pairs file: {pairs}")
+    if missing:
+        lines.append(f"  MISSING (required): {', '.join(missing)}")
     lines.append("Approve to submit, or request an adjustment (protocol, steps, config).")
     return {
         "command": cmd,
+        "missing": missing,
         # The generation command itself, kept so the gate can show what the
         # script being approved was BUILT from. `bash cmd.sh` is what runs, and
         # on its own it says nothing: two runs a week apart submit the same

@@ -1035,6 +1035,13 @@ def modify_panel(entries_of, changes=None, notes=None, required=None,
             if here:
                 focus = len(out)
 
+            if entry.kind == modify.TYPED:
+                # Draws nothing. The row above it is already showing the caret
+                # and what has been typed into it; a second line saying so
+                # would be the same answer twice, and putting it under the row
+                # is exactly the stacked layout this panel exists to remove.
+                continue
+
             if entry.kind == modify.CHOICE:
                 mark = f"{GREEN}❯{RESET}" if here else " "
                 label = (f"{BOLD}{WHITE}{entry.label}{RESET}" if here
@@ -1255,8 +1262,9 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     # default this is the only place it is seen before it is approved. Laid out
     # by mirror.py rather than wrapped as prose: the people this is for know a
     # GenPipes command by its shape, and a paragraph does not have one.
+    missing = proposal.get("missing") or ()
     m = (mirror.read(proposal.get("generated"), name=thread_id,
-                     resources=resources)
+                     resources=resources, missing=missing)
          or mirror.from_slots(proposal, name=thread_id, resources=resources))
     drawn = mirror_lines(m, changed=changed)
     if drawn:
@@ -1279,6 +1287,14 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
                   f"{finding.variable} {finding.problem}")
             print(f"      {DIM}{'fix':<17}{RESET}{WHITE}{finding.fix}{RESET}")
         print()
+    elif missing:
+        # No separate line here -- the mirror above already carries a red
+        # "not set \u2014 required" row per missing slot (see mirror._absent). A
+        # second list saying the same names again would just be noise; what
+        # changes is that /approve is withheld the same way it is for a
+        # blocking environment finding, and for the same reason: offering an
+        # action that cannot work invites trying it anyway.
+        pass
     else:
         print(_action("/approve", "submits to Slurm \u2014 cannot be undone"))
 
@@ -1325,7 +1341,9 @@ def run_view(proposal, name, status, resources="", blockers=()):
           f"{RESET}")
     print()
     print(f"      {BOLD}{WHITE}{proposal.get('command', '?')}{RESET}")
-    m = (mirror.read(proposal.get("generated"), name=name, resources=resources)
+    missing = proposal.get("missing") or ()
+    m = (mirror.read(proposal.get("generated"), name=name, resources=resources,
+                     missing=missing)
          or mirror.from_slots(proposal, name=name, resources=resources))
     drawn = mirror_lines(m)
     if drawn:
@@ -1340,7 +1358,7 @@ def run_view(proposal, name, status, resources="", blockers=()):
     if blockers:
         print()
     for verb, consequence in _VERBS.get(status, ()):
-        if verb == "/approve" and blockers:
+        if verb == "/approve" and (blockers or missing):
             continue
         print(_action(verb, consequence))
     print(f"      {'':<{_MIRROR_LABEL + _MIRROR_FLAG}}{DIM}tab completes the "

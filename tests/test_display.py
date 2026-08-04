@@ -108,6 +108,23 @@ def main():
                "current directory")
 
     # ---------------------------------------------------------------- #
+    r.section("the gate withholds /approve when something required is missing")
+    incomplete = {
+        "command": "bash cmd.sh",
+        "script": "cmd.sh",
+        "missing": ["readset"],
+        "slots": {"pipeline": "dnaseq", "protocol": "germline_snv",
+                  "steps": "1-5", "inis": [], "design": None, "pairs": None,
+                  "readset": None, "output_dir": None},
+    }
+    out = drawn(display.gate, incomplete, "no-readset-run")
+    r.check("no /approve offered", "/approve" not in out, out)
+    r.contains("but /modify still is", out, "/modify")
+    r.contains("but /reject still is", out, "/reject")
+    r.contains("the missing row is drawn, not silently skipped", out, "readset")
+    r.contains("and marked required", out, "required")
+
+    # ---------------------------------------------------------------- #
     r.section("held runs, surfaced at startup")
     out = drawn(display.pending, [
         {"name": "patient-42", "proposal": {"command": "bash cmd.sh"}}])

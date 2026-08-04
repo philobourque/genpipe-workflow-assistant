@@ -131,6 +131,12 @@ from langgraph.types import interrupt, Command
 # a run name is the difference between "work it out" and "this is not a hold".
 _UNSET = object()
 
+# The slots ask_user() will not let a declined question default its way past.
+# Same set slots.gaps() ever raises a Gap for -- pipeline, protocol, and the
+# three file roles -- as opposed to a free-form question like "which steps",
+# where declining and defaulting is the whole point (see prep.ASSUMED).
+_ESSENTIAL_SLOTS = {"pipeline", "protocol", "readset", "design", "pairs"}
+
 # Biomni's A1 was built to drive an analysis to completion: its system prompt
 # pushes <execute> for everything and never says when NOT to. Here that default
 # is wrong twice over. Most of what a GenPipes user types is talk -- a greeting,
@@ -483,10 +489,27 @@ class GenpipeA1(A1):
                                     "slot": gap.slot})   # <-- PAUSES here
                 if isinstance(answer, dict):
                     answer = answer.get("answer")
-                note = (f"The user answered: {answer}" if answer else
-                        "The user declined to answer. Choose a sensible default, "
-                        "state which one you chose, and carry on -- do not ask "
-                        "again.")
+                if answer:
+                    note = f"The user answered: {answer}"
+                elif gap.slot in _ESSENTIAL_SLOTS:
+                    # Esc on pipeline/protocol/readset/design/pairs used to be
+                    # read the same as declining a question about step range or
+                    # cluster config -- "pick something sensible and carry on" --
+                    # which is how a declined protocol question still produced a
+                    # filled-in gate box (germline_snv, chosen by the model, never
+                    # confirmed by anyone). These are the slots gate.build_proposal
+                    # will refuse to approve without anyway, so a guess here would
+                    # only be corrected later, at best -- do not guess it at all.
+                    note = (f"The user declined to answer -- no {gap.slot} was "
+                            f"given. This is required and must NOT be guessed or "
+                            f"defaulted. Do not generate or submit anything for "
+                            f"this run. Say plainly that you cannot prepare it "
+                            f"without a {gap.slot}, and stop until they bring it "
+                            f"up again.")
+                else:
+                    note = ("The user declined to answer. Choose a sensible "
+                            "default, state which one you chose, and carry on "
+                            "-- do not ask again.")
             # Fed back as an <observation> because that is the shape the model is
             # already prompted to read after an <execute>. A bespoke format here
             # would be one more thing for it to learn for no gain.
@@ -940,6 +963,21 @@ class GenpipeA1(A1):
                     "Nothing has reached the scheduler.")
                 status = self._gate_status(config)
                 status["blockers"] = blockers
+                return status
+            # The command itself may be incomplete even when the environment is
+            # sound -- a readset the model never asked for, a design a protocol
+            # needs but the conversation never supplied. gate.build_proposal
+            # computed this against slots.gaps() when the proposal was built;
+            # read straight off the stored record rather than the box on screen,
+            # which may be a day old and could in principle have been edited
+            # underneath it.
+            incomplete = ((record or {}).get("proposal") or {}).get("missing")
+            if incomplete:
+                display.problem(
+                    f"Not approved -- missing: {', '.join(incomplete)}.",
+                    f"/modify {name} to add it, or /reject to abandon this run.")
+                status = self._gate_status(config)
+                status["missing"] = incomplete
                 return status
         self.log = []
         command = Command(resume={"approved": bool(approved), "feedback": feedback})

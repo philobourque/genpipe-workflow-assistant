@@ -164,6 +164,30 @@ def main():
     r.contains("the protocol", text, "stringtie")
     r.contains("and the readset", text, "readset.tsv")
 
+    # ------------------------------------------------------------------ #
+    r.section("a request that already answers everything is ready at once")
+    # The complaint this guards: a conversation that named pipeline, protocol,
+    # readset AND design together still got interrogated one field at a time.
+    # ready()/missing() are the check cli._preparing() must drive off of --
+    # once every required slot is filled, there is nothing left to ask.
+    state = prep.Preparation(pipeline="rnaseq", protocol="stringtie",
+                             readset="readset.tsv", design="design.tsv")
+    r.equal("nothing left to ask", prep.missing(state), None)
+    r.check("ready() agrees", prep.ready(state))
+
+    state = prep.Preparation(pipeline="dnaseq", protocol="somatic_ensemble",
+                             readset="readset.tsv", pairs="pairs.csv")
+    r.equal("a somatic run with its pairs file is ready too",
+            prep.missing(state), None)
+    r.check("ready() agrees", prep.ready(state))
+
+    state = prep.Preparation(pipeline="dnaseq", protocol="somatic_ensemble",
+                             readset="readset.tsv")
+    r.check("but not ready without the pairs file it needs",
+            not prep.ready(state))
+    r.equal("and pairs is exactly what's asked for",
+            prep.missing(state).slot, "pairs")
+
     return r.finish()
 
 

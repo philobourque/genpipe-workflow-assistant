@@ -632,11 +632,22 @@ class DevLLM:
         from langchain_core.messages import AIMessage
 
         self.calls += 1
+        # Scoped to the CURRENT run, not the whole thread. One conversation can
+        # produce any number of runs one after another (see cli._repl), and
+        # without this a second "run rnaseq stringtie steps 1-5" typed right
+        # after the first one had already been generated and submitted was
+        # read against the FIRST run's tally: generations == 1, submissions ==
+        # 1 already, so the branches below fell straight through to "The
+        # pipeline was submitted" instead of asking about or building the
+        # second one. _run_start finds where the current run began; everything
+        # before it belongs to an earlier, concluded exchange.
+        start = _run_start(messages)
+        scoped = messages[start:]
         # The system prompt is deliberately excluded: it is a reference document,
         # not something anyone said.
-        mine = [str(getattr(m, "content", "") or "") for m in messages
+        mine = [str(getattr(m, "content", "") or "") for m in scoped
                 if type(m).__name__ == "AIMessage"]
-        theirs = [str(getattr(m, "content", "") or "") for m in messages
+        theirs = [str(getattr(m, "content", "") or "") for m in scoped
                   if type(m).__name__ == "HumanMessage"]
         task = theirs[0] if theirs else ""
         feedback = [t for t in theirs[1:] if "was not approved" in t]
@@ -718,6 +729,36 @@ _RUN_VERBS = re.compile(
 _QUESTION = re.compile(
     r"^\s*(?:what|how|which|why|when|where|who|is|are|does|do|did|can|could|"
     r"should|would|tell me|explain|remind me|difference)\b", re.I)
+
+
+def _run_start(messages):
+    """Index into `messages` where the CURRENT run began, or 0.
+
+    The most recent HumanMessage that wants a run all by itself -- judged the
+    same way _wants_a_run judges a single line, said=latest=that line's own
+    text. Panel answers are never candidates: the graph always wraps them as
+    `<observation>...</observation>` (see agent.ask_user), never as a bare
+    HumanMessage, so a typed "dnaseq" answered INTO a pipeline choice panel
+    cannot be mistaken for a fresh "run dnaseq" request and reset the anchor
+    mid-run. Rejection feedback is excluded for the same reason feedback is
+    excluded elsewhere in this class: "was not approved" is a continuation of
+    the run being revised, not a new one starting.
+
+    Returns 0 -- the start of the whole thread -- when nothing anchors,
+    which is the previous behaviour: a normal single-run conversation is
+    unaffected by this function existing at all.
+    """
+    start = 0
+    for i, m in enumerate(messages):
+        if type(m).__name__ != "HumanMessage":
+            continue
+        content = str(getattr(m, "content", "") or "")
+        if content.lstrip().startswith("<observation>") or "was not approved" in content:
+            continue
+        line = _typed(content)
+        if _wants_a_run(line, line):
+            start = i
+    return start
 
 
 def _wants_a_run(said, latest):

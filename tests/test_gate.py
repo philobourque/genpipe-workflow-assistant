@@ -235,6 +235,37 @@ def main():
     r.truthy("even though an ask can be parsed out of it",
              g.ask_request(both) is not None)
 
+    r.section("build_proposal(): missing is the required-slot check, not "
+              "just a display of what's present")
+    # The two shapes that reached a real gate with something essential absent
+    # and nothing saying so -- see AGENT-FIXES.md / GATE-FIX.md.
+    dnaseq_no_readset = g.build_proposal(
+        [Msg("<execute>genpipes dnaseq -t germline_snv -s 1-5 -d design.tsv "
+             "-g cmd.sh</execute>")],
+        "bash cmd.sh")
+    r.equal("a design with no readset is still missing the readset",
+            dnaseq_no_readset["missing"], ["readset"])
+
+    ampliconseq_bare = g.build_proposal(
+        [Msg("<execute>genpipes ampliconseq -g cmd.sh</execute>")],
+        "bash cmd.sh")
+    r.equal("a bare command with nothing at all is missing the readset",
+            ampliconseq_bare["missing"], ["readset"])
+
+    rnaseq_no_design = g.build_proposal(
+        [Msg("<execute>genpipes rnaseq -t stringtie -r readset.tsv "
+             "-g cmd.sh</execute>")],
+        "bash cmd.sh")
+    r.equal("stringtie without a design is missing the design",
+            rnaseq_no_design["missing"], ["design"])
+
+    complete = g.build_proposal(
+        [Msg("<execute>genpipes dnaseq -t germline_snv -s 1-5 "
+             "-r readset.tsv -g cmd.sh</execute>")],
+        "bash cmd.sh")
+    r.equal("nothing missing once the required slots are all filled",
+            complete["missing"], [])
+
     return r.finish()
 
 
