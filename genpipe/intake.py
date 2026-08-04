@@ -75,15 +75,23 @@ def find_protocol(text, pipeline):
 
 
 def find_files(text):
-    """Filenames in the request, bucketed by the role their name implies.
+    """Filenames THE PERSON NAMED, bucketed by the role their name implies.
 
     A path whose name says nothing about its role is left out entirely rather
     than assigned to the most likely bucket. Guessing that `samples.tsv` is a
     readset is right often enough to be dangerous and wrong often enough to
     matter.
+
+    Only their own words are read. brief() appends an inventory of the working
+    directory to the message, and this used to scan that too -- so a run
+    launched from a directory that happened to contain a design.tsv came out
+    with `-d design.tsv` on the command line, naming a file from the launch
+    directory that had nothing to do with the data. A file is on the command
+    line because somebody said so, never because it was lying around.
     """
     found = {"readset": None, "design": None, "pairs": None}
-    for token in re.findall(r"\S+", text or ""):
+    text = (text or "").split(CONTEXT_MARK)[0]
+    for token in re.findall(r"\S+", text):
         token = token.strip("'\"`,;()[]")
         if not token.lower().endswith(_FILE_SUFFIXES):
             continue
@@ -142,6 +150,59 @@ def candidates(directory=".", limit=8):
     return buckets
 
 
+def find_directories(text):
+    """Directories the person named, in the order they said them.
+
+    A request that names where the data is -- "the fastqs are in
+    /lustre09/.../alain_rnaseq" -- has told us where to look for the readset
+    too, and asking "which readset file?" while holding that path is asking a
+    question whose answer is one listdir away.
+
+    Only their own words, for the same reason find_files reads only theirs, and
+    only paths that are really directories: a token has to survive isdir() to
+    get here, so a sentence that mentions a word with a slash in it does not
+    send us reading somebody's home.
+    """
+    out = []
+    for token in re.findall(r"\S+", (text or "").split(CONTEXT_MARK)[0]):
+        token = token.strip("'\"`,;()[]").rstrip(":")
+        if "/" not in token and not token.startswith("~"):
+            continue
+        path = os.path.expanduser(token)
+        try:
+            if os.path.isdir(path) and path not in out:
+                out.append(path)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def near_miss(name, directory="."):
+    """The file they probably meant, when the one they named is not there.
+
+    `myReadset.ts` for `myReadset.tsv` -- one character, and the whole run was
+    built without a readset because of it. The answer was echoed back as
+    accepted and then silently dropped, which is the worst way to fail: there
+    was no reason to doubt it had landed.
+
+    Deliberately narrow. Only a name that differs by its extension or its case
+    counts, and only when exactly one file in the directory matches -- a fuzzy
+    match with several answers is a question, not a correction.
+    """
+    if not name:
+        return None
+    where = os.path.dirname(name) or directory
+    stem = os.path.splitext(os.path.basename(name))[0].lower()
+    try:
+        names = os.listdir(where)
+    except OSError:
+        return None
+    hits = [n for n in names
+            if os.path.splitext(n)[0].lower() == stem
+            and n.lower().endswith(_FILE_SUFFIXES)]
+    return os.path.join(where, hits[0]) if len(hits) == 1 else None
+
+
 # Where the person's own words stop and the appended facts begin. One line, in
 # the text itself, because everything downstream has only the string: the
 # renderer cuts here so their turn is shown as they typed it rather than with an
@@ -183,23 +244,60 @@ def brief(text, directory="."):
     re-read stale filenames.
     """
     stated = read(text)
-    known, missing = [], []
+    known, missing, corrected = [], [], []
     for slot, value in stated.items():
         if not value:
             continue
-        if slot in _FILE_SLOTS and not _resolves(value, directory):
-            missing.append((slot, value))
-        else:
+        if slot not in _FILE_SLOTS or _resolves(value, directory):
             known.append((slot, value))
+            continue
+        # Named but not there. Before reporting it as missing, look for the
+        # file they meant -- see near_miss.
+        better = near_miss(value, directory)
+        if better:
+            corrected.append((slot, value, better))
+            known.append((slot, better))
+        else:
+            missing.append((slot, value))
+
+    # Directories they pointed at. Read before anything is asked, because the
+    # question this answers -- "which readset file?" -- is one nobody should be
+    # made to answer while the agent is holding the folder it is sitting in.
+    #
+    # This is NOT the filesystem search the system prompt forbids, and the
+    # difference is worth stating: one non-recursive listing of a directory
+    # named in the request, versus walking a tree nobody pointed at. The ban is
+    # on wandering, and following a path somebody handed over is the opposite.
+    named = {}
+    for where in find_directories(text):
+        hits = {role: paths for role, paths in candidates(where).items() if paths}
+        if hits:
+            named[where] = hits
+
     found = candidates(directory)
     seen = [(role, paths) for role, paths in found.items() if paths]
-    if not known and not seen and not missing:
+    if not known and not seen and not missing and not named:
         return text
 
     lines = [text, "", CONTEXT_MARK]
     if known:
         lines.append("Already settled by the request above -- do not ask again:")
         lines += [f"- {slot}: {value}" for slot, value in known]
+        lines.append("")
+    if corrected:
+        lines.append("Read as the nearest real file, because what was named is "
+                     "not on disk and exactly one file differs only by extension. "
+                     "Use the corrected path, and say that you did:")
+        lines += [f"- {slot}: {was} -> {now}" for slot, was, now in corrected]
+        lines.append("")
+    if named:
+        lines.append("In the directory the request POINTS AT. This is where their "
+                     "data is, so prefer these over anything in the working "
+                     "directory. Exactly one candidate for a role means use it and "
+                     "say so; several means ask which:")
+        for where, hits in named.items():
+            for role, paths in hits.items():
+                lines.append(f"- possible {role} in {where}: {', '.join(paths)}")
         lines.append("")
     if missing:
         lines.append("Named in the request but NOT on disk here. Do NOT pass these "
@@ -210,7 +308,8 @@ def brief(text, directory="."):
     if seen:
         lines.append(f"Files in the working directory ({os.path.abspath(directory)}) "
                      f"that could fill a role. These are candidates, not "
-                     f"choices -- confirm before using one:")
+                     f"choices -- confirm before using one, and never prefer one "
+                     f"over a file in a directory the request named:")
         for role, paths in seen:
             lines.append(f"- possible {role}: {', '.join(paths)}")
         lines.append("")

@@ -301,4 +301,57 @@ try:
 finally:
     builtins.input = real_input
 
+# --------------------------------------------------------------------- #
+r.section("a directory the request names is read before anything is asked")
+# The whole of the observed failure: a request that gave the folder the data
+# was in was answered with "Which readset file?", while the agent held the path
+# to the directory the readset was sitting in.
+data = tempfile.mkdtemp(prefix="named-")
+launch = tempfile.mkdtemp(prefix="launch-")
+try:
+    open(os.path.join(data, "myReadset.tsv"), "w").close()
+    for i in range(9):
+        open(os.path.join(data, f"S{i}_R1.fastq.gz"), "w").close()
+    open(os.path.join(launch, "design.tsv"), "w").close()
+
+    r.equal("the named directory is found", intake.find_directories(
+        f"rna-seq on Rorqual (9 samples): {data}"), [data])
+    r.equal("a directory that does not exist is not followed",
+            intake.find_directories("look in /no/such/place"), [])
+    r.check("and a bare word with no slash sends us nowhere",
+            intake.find_directories("run rnaseq stringtie") == [])
+
+    text = intake.brief(f"mouse rna-seq fastq on Rorqual (9 samples): {data}",
+                        directory=launch)
+    r.contains("the readset in it is offered", text, "myReadset.tsv")
+    r.contains("labelled as the directory the request points at", text, "POINTS AT")
+
+    # ----------------------------------------------------------------- #
+    r.section("a file that is named but misspelled is corrected, not dropped")
+    # One character -- myReadset.ts for myReadset.tsv -- and the run was built
+    # with no readset at all, after echoing the answer back as accepted.
+    r.equal("the nearest real file is found",
+            intake.near_miss(os.path.join(data, "myReadset.ts")),
+            os.path.join(data, "myReadset.tsv"))
+    r.equal("a name with no near match stays unresolved",
+            intake.near_miss(os.path.join(data, "nothing_like_it.ts")), None)
+    open(os.path.join(data, "myReadset.csv"), "w").close()
+    r.equal("and two matches are a question, not a correction",
+            intake.near_miss(os.path.join(data, "myReadset.ts")), None)
+
+    # ----------------------------------------------------------------- #
+    r.section("files are on the command line because somebody said so")
+    # A design.tsv in the directory the app was launched from reached the
+    # command line as -d, naming a file with nothing to do with the data.
+    stated = intake.find_files(intake.brief("run rnaseq stringtie",
+                                            directory=launch))
+    r.equal("a file merely lying around is not picked up",
+            stated["design"], None)
+    r.equal("but a file the person names still is",
+            intake.find_files("use design.tsv for contrasts")["design"],
+            "design.tsv")
+finally:
+    shutil.rmtree(data, ignore_errors=True)
+    shutil.rmtree(launch, ignore_errors=True)
+
 sys.exit(r.finish())
