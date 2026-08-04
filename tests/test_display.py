@@ -129,22 +129,37 @@ def main():
     out = drawn(display.pending, [
         {"name": "patient-42", "proposal": {"command": "bash cmd.sh"}}])
     r.contains("counts them", out, "1 run held")
-    r.contains("names them", out, "patient-42")
     r.contains("and says where to look", out, "/list")
     r.equal("nothing at all when nothing is held",
             drawn(display.pending, []).strip(), "")
 
     # A startup notice is a reminder, not a report. Nine held runs from a
-    # fortnight of experiments must not be nine lines above the prompt.
+    # fortnight of experiments must not be nine lines above the prompt -- and
+    # naming even three of them was still a report: stale names, no news in any
+    # of them, occupying the line nearest the cursor.
     many = drawn(display.pending,
                  [{"name": f"run-{i}", "proposal": {"command": "bash cmd.sh"}}
                   for i in range(9)])
     r.equal("nine held runs still take one line",
             len([l for l in many.splitlines() if l.strip()]), 1)
     r.contains("the count is all of them", many, "9 runs held")
-    r.contains("naming the first few", many, "run-0")
-    r.contains("and saying how many it left out", many, "+6 more")
+    r.check("but no names -- that is what /list is for", "run-0" not in many)
+    r.contains("so it points at /list instead", many, "/list")
     r.check("no commands are echoed", "bash cmd.sh" not in many)
+
+    # What changed on its own IS news, and keeps its names: there are rarely
+    # many, and each one is something you did not know a moment ago.
+    news = drawn(display.pending, [], since={
+        "failed": [{"name": "rnaseq-0803"}]})
+    r.contains("a run that failed while away is named", news, "rnaseq-0803")
+
+    # ---------------------------------------------------------------- #
+    r.section("the invitation sits nearest the prompt")
+    out = drawn(display.welcome)
+    r.contains("it asks rather than reports", out, "What can I help you with today?")
+    r.contains("and says what an answer looks like", out, "describe the run you want")
+    for cmd in ("/help", "/list", "/check all"):
+        r.contains(f"offering {cmd}", out, cmd)
 
     # ---------------------------------------------------------------- #
     r.section("/list distinguishes held from live")

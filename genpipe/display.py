@@ -173,20 +173,88 @@ def _identity(source, model):
     return who or "no model configured yet"
 
 
+# The wordmark, drawn rather than set in type. "GenPipes assistant" as one bold
+# line was the same size as every other line in the box, so the product's own
+# name carried no more weight than the path underneath it.
+#
+# Box-drawing glyphs rather than a figlet font: they sit on the same grid as the
+# frame around them, and they stay legible in a terminal that would render an
+# ASCII-art font as noise. 22 columns wide, which fits the 32-column left half
+# with room to spare.
+_WORDMARK = [
+    "╔═╗╔═╗╔╗╔╔═╗╦╔═╗╔═╗╔═╗",
+    "║ ╦║╣ ║║║╠═╝║╠═╝║╣ ╚═╗",
+    "╚═╝╚═╝╝╚╝╩  ╩╩  ╚═╝╚═╝",
+]
+
+# The identity half's width. A constant rather than a local in banner() because
+# _left_column centres the wordmark against it, and a centre computed from a
+# number that lives somewhere else is one edit away from being off by two.
+_LEFT_W = 32
+
+
+def welcome():
+    """The invitation, printed last -- immediately above the prompt.
+
+    The banner is a reference card and it is at the top of the scrollback by the
+    time anybody types. What sat here instead was a roll-call of held runs, which
+    is the least useful thing that could occupy the line nearest the cursor: nine
+    names from a fortnight of testing, none of them news, none of them anything
+    you were about to act on.
+
+    So the nearest line is a question, and under it the three commands that
+    answer "what can I do from here". Green, because every command everywhere in
+    this interface is green.
+    """
+    print()
+    print(f"  {BOLD}What can I help you with today?{RESET}")
+    print()
+    print(f"  {GREY}Ask a GenPipes question or describe the run you want.{RESET}")
+    print()
+    print(f"    {GREEN}/help{RESET} {GREY}commands{RESET}     "
+          f"{GREEN}/list{RESET} {GREY}runs{RESET}     "
+          f"{GREEN}/check all{RESET} {GREY}refresh statuses{RESET}")
+    print()
+
+
+def _centre(cell, w):
+    """Leading spaces that centre a styled string in w columns.
+
+    Measured on the visible text, so the escape sequences that colour the
+    wordmark do not push it off centre -- which is exactly what a plain
+    str.center() would do here.
+    """
+    return " " * max(0, (w - _vis_len(cell)) // 2) + cell
+
+
 def _left_column(user, source, model, path):
+    """The identity half: who you are, what this is.
+
+    The model and the working directory used to close this column and now live
+    on the right. They are reference, not identity, and while they sat here the
+    left half was the taller of the two -- so the frame padded the right half
+    with four blank rows to match, directly under "Once it's running", which is
+    what made the box look badly balanced once the wordmark grew.
+    """
     lines = [""]
     lines.append(f"{BOLD}Welcome back, {user}{RESET}")
     lines.append("")
-    lines += [f"   {row}" for row in _helix()]
+    lines += [_centre(f"{BOLD}{GREEN}{row}{RESET}", _LEFT_W) for row in _WORDMARK]
+    # The name in real letters under the glyphs that draw it. The wordmark is a
+    # picture: it cannot be grepped out of a screenshot, pasted into an issue,
+    # or read aloud by anything. Whatever the mark looks like, the product has
+    # to say its own name in text somewhere.
+    lines.append(_centre(f"{GREY}assistant{RESET}  {GREY}{DIM}{VERSION}{RESET}",
+                         _LEFT_W))
     lines.append("")
-    lines.append(f"{BOLD}{GREEN}GenPipes{RESET} {BOLD}assistant{RESET}  "
-                 f"{GREY}{VERSION}{RESET}")
-    lines.append(f"{GREY}{_identity(source, model)}{RESET}")
-    lines.append(f"{DIM}{_tilde(path)}{RESET}")
+    # Centred with the wordmark, not on its old fixed indent: the two are one
+    # lockup, and a mark whose halves disagree about their centre line reads as
+    # a mistake rather than as a choice.
+    lines += [_centre(row, _LEFT_W) for row in _helix()]
     return lines
 
 
-def _right_column(w):
+def _right_column(w, source=None, model=None, path=None):
     lines = [""]
     lines.append(f"{BOLD}Getting started{RESET}")
     lines += _wrap("Ask a question or describe the GenPipes run you want:", w)
@@ -212,6 +280,13 @@ def _right_column(w):
     lines += _wrap("You can monitor it, cancel it, or diagnose a failure:", w)
     lines.append(f"  {GREEN}/check{RESET}  {GREEN}/jobs{RESET}  "
                  f"{GREEN}/cancel{RESET}  {GREEN}/diagnose{RESET}")
+    # What this session is actually using. It closes the reference half rather
+    # than the identity half because that is what it is -- something you look up
+    # -- and because putting it here is what makes the two columns the same
+    # height instead of padding one to match the other.
+    lines.append(f"{GREY}{DIM}{'─' * w}{RESET}")
+    lines.append(f"{GREY}{_identity(source, model)}{RESET}")
+    lines.append(f"{DIM}{_tilde(path or '')}{RESET}")
     # The approval promise used to close this screen. It says more where it is
     # demonstrated -- at the gate, holding a real submission -- than as a claim
     # made to someone who has not yet typed anything.
@@ -236,7 +311,7 @@ def banner(source=None, model=None):
         cols = 80
 
     total = min(cols - 2, 104)
-    left_w = 32
+    left_w = _LEFT_W
     right_w = total - left_w - 7
 
     # One line in the right column can't be reflowed -- the example command --
@@ -246,13 +321,13 @@ def banner(source=None, model=None):
         print()
         for line in _left_column(user, source, model, path):
             print(f"  {line}" if line else "")
-        for line in _right_column(min(cols - 4, 60)):
+        for line in _right_column(min(cols - 4, 60), source, model, path):
             print(f"  {line}" if line else "")
         print()
         return
 
     left = _left_column(user, source, model, path)
-    right = _right_column(right_w)
+    right = _right_column(right_w, source, model, path)
     rows = max(len(left), len(right))
     left += [""] * (rows - len(left))
     right += [""] * (rows - len(right))
@@ -2199,10 +2274,15 @@ def pending(records, since=None, seen=""):
 
     print()
     if records:
+        # A count, not a roll-call. Nine held runs from a fortnight of testing
+        # listed three stale names and a "+6 more", which reads as debris rather
+        # than as news -- none of those names is something you did not already
+        # know, and /list is one keystroke away for anyone who wants them. What
+        # DID change on its own gets named below, because that is the half of
+        # this notice worth printing.
         n = len(records)
-        print(f"  {AMBER}▌{RESET} {AMBER}{n} run{'s' if n > 1 else ''} held"
-              f"{RESET}{DIM}, waiting on you:{RESET} "
-              f"{WHITE}{_names(records)}{RESET}   {DIM}/list{RESET}")
+        print(f"  {AMBER}▌{RESET} {AMBER}{n} run{'s' if n > 1 else ''} held{RESET}"
+              f"{DIM}, waiting on you{RESET}   {GREEN}/list{RESET}")
     if failed:
         # Never presented as live truth -- it is what a check saw, and the run
         # may well have been fixed or cancelled since.

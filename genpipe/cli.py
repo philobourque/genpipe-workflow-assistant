@@ -2379,6 +2379,9 @@ def main(argv=None):
     # check still exists (preflight.check), it is just not shouted.
     if not fake_cluster:
         display.environment([f for f in preflight.check() if f.blocking])
+    # Last thing before the prompt, so the question it asks is the nearest line
+    # above the cursor rather than three screens up behind the status lines.
+    display.welcome()
     try:
         _repl(agent)
     except KeyboardInterrupt:
