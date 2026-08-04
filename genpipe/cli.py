@@ -2181,6 +2181,10 @@ def _repl(agent):
         # about the line -- the "Preparing run…" heading in particular -- has to
         # come after it, which it cannot if the echo waits for the graph.
         display.echo(line)
+        # A new turn is a new job. Without this the next checklist would be
+        # repainted onto the last one's lines, over the top of the answer that
+        # sits between them.
+        display.reset_plan()
 
         if line.startswith("/"):
             parts = line[1:].split()

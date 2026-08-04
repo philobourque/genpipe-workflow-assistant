@@ -784,6 +784,45 @@ def main():
     r.contains("what was added", text, "1 run added")
     r.contains("and what was not, with why", text, "already known")
 
+    # ---------------------------------------------------------------- #
+    r.section("the plan is drawn, and drawn once")
+    # The model's checklist used to be parsed and thrown away, which left the
+    # fold with nothing to say what the agent was working through.
+    checklist = ("1. [x] read the readset\n"
+                 "2. [x] resolve the genome\n"
+                 "3. [ ] generate the command\n"
+                 "4. [ ] submit to the gate")
+
+    display.reset_plan()
+    text = drawn(display.render, Msg(checklist))
+    r.contains("the block is labelled", text, "Plan")
+    r.contains("every stage is named", text, "submit to the gate")
+    r.contains("finished stages are ticked", text, "✓ read the readset")
+    r.contains("the current one is marked", text, "▶ generate the command")
+    r.check("and stages not started carry no marker",
+            "▶ submit to the gate" not in text and "✓ submit" not in text)
+
+    # The fold is what makes this necessary: with the working folded away the
+    # plan is the only thing on screen saying what is happening, so it is the
+    # one part of the working that must survive being folded.
+    display.reset_plan()
+    quiet = drawn(display.render, Msg(checklist))
+    r.contains("and it survives the fold, unlike the rest of the working",
+               quiet, "generate the command")
+
+    # Re-emitting the same list is how the model reports progress. Off a
+    # terminal there is nothing to repaint, so the duplicate is dropped rather
+    # than printed again -- which is the bug that got it discarded originally.
+    display.reset_plan()
+    drawn(display.render, Msg(checklist))
+    again = drawn(display.render, Msg(checklist))
+    r.check("an unchanged plan is not printed twice", "Plan" not in again)
+
+    # A different list is a different job and gets its own block.
+    other = "1. [ ] read the logs\n2. [ ] explain the failure"
+    fresh = drawn(display.render, Msg(other))
+    r.contains("but a new plan starts a new block", fresh, "read the logs")
+
     return r.finish()
 
 

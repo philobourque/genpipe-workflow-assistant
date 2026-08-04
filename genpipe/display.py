@@ -27,6 +27,13 @@ reading every time. `/verbose` unfolds it, permanently, and unfolds what has
 already scrolled past as well. When it is folded, one dim line says how many
 steps were taken, so the fold is visible rather than silent.
 
+What is NEVER folded is the plan -- the model's own checklist of the stages it
+is about to work through. That is the one part of the working that answers
+"what is it doing, and how far along is it?", which is exactly the question the
+fold leaves you with. It is drawn as a single block that repaints in place as
+stages complete, so the progression happens on one set of lines instead of
+reprinting the whole list on every turn. See _draw_plan.
+
 Unfolded, the hierarchy is:
 
   GATE      heavy red box. The one moment the run stops and needs a human.
@@ -51,6 +58,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import textwrap
 
 from . import mirror
@@ -564,6 +572,117 @@ def echo(text):
     print()
 
 
+# ---------------------------------------------------------------------------
+# The plan block.
+#
+# The model re-emits its whole checklist every turn with one more box ticked.
+# Printed naively that is the same six lines over and over, which is why this
+# used to be dropped on the floor -- but dropping it took away the only thing
+# that said what the agent was working through. So it is kept and drawn ONCE,
+# on a block that repaints itself in place while the list keeps its shape.
+#
+# Repainting is only safe while the block is still the last thing on screen.
+# _plan_lines is that permission: it holds the block's height, and anything
+# else that reaches the screen clears it back to zero, after which the next
+# plan draws fresh below whatever interrupted it.
+#
+# "Anything else" is enforced by shadowing print for this module (see below)
+# rather than by a call at each of the several dozen sites that print. The
+# shim is the only way to be sure: a display function added later invalidates
+# the block for free, whereas a convention to call an invalidator by hand is
+# one forgotten call away from a block that repaints over somebody's output.
+# ---------------------------------------------------------------------------
+
+_real_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001 -- deliberate, see above
+    """print, plus "the plan block is no longer at the bottom of the screen".
+
+    Module-level shadowing, so every bare print() in this file is covered
+    whenever it was written. _draw_plan writes its own repaint through
+    sys.stdout directly, which is what keeps it exempt.
+    """
+    global _plan_lines
+    _plan_lines = 0
+    return _real_print(*args, **kwargs)
+
+# The item texts last drawn, so a re-emitted list is recognised as the same
+# plan rather than a new one. Ticks are deliberately not part of the identity --
+# a changed tick is the update we are trying to draw.
+_plan = None
+
+# Height of the block on screen, or 0 when it may no longer be repainted.
+_plan_lines = 0
+
+
+def reset_plan():
+    """Forget the current plan. Called when a new turn starts, so the next
+    task's checklist is a new block rather than an in-place edit of the last
+    task's -- two different jobs must not share one set of lines."""
+    global _plan, _plan_lines
+    _plan = None
+    _plan_lines = 0
+
+
+def _plan_body(items):
+    """The block's lines, without the trailing blank.
+
+    Three states, and the marker column is what distinguishes them, because
+    colour alone does not survive being read at a glance or copied into a bug
+    report:
+
+      ✓  done      green
+      ▶  current   the first unticked item, bright
+         pending   no marker, dim -- it has not started, so it gets no ink
+    """
+    out = [f"  {CYAN}⏺{RESET} {BOLD}Plan{RESET}"]
+    current = next((i for i, (_, done) in enumerate(items) if not done), None)
+    for i, (text, done) in enumerate(items):
+        if done:
+            out.append(f"    {GREEN}✓{RESET} {DIM}{text}{RESET}")
+        elif i == current:
+            out.append(f"    {CYAN}▶{RESET} {text}")
+        else:
+            out.append(f"    {DIM}  {text}{RESET}")
+    return out
+
+
+def _draw_plan(items):
+    """Draw or update the plan block."""
+    global _plan, _plan_lines
+    texts = [t for t, _ in items]
+    body = _plan_body(items)
+
+    same = _plan == texts
+    if same and _plan_lines and _tty():
+        # Back up over the block and lay the new one down on the same rows.
+        # \033[J clears from the cursor to the end of the screen, so a plan
+        # that has lost a line does not leave the old last line stranded.
+        sys.stdout.write(f"\033[{_plan_lines}A\033[J")
+    elif same and not _tty():
+        # Nothing can be repainted and the list has not changed shape, so
+        # reprinting it would just be the duplication this block exists to
+        # avoid. The final state still gets drawn when the plan completes.
+        return
+    else:
+        print()
+        _plan_lines = 0
+
+    for line in body:
+        print(line)
+    print()
+    _plan = texts
+    _plan_lines = len(body) + 1
+
+
+def _tty():
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _draw(event):
     """Draw one parsed event."""
     k = event["kind"]
@@ -700,14 +819,15 @@ def _flush_fold():
 def render(message):
     """Parse a message and draw what is worth drawing.
 
-    Three things are never drawn, at any verbosity, and all three are the same
-    judgement -- that a transcript is for following the work, not for auditing
-    the agent:
+    One thing is never drawn, at any verbosity, and it is a judgement that a
+    transcript is for following the work rather than for auditing the agent:
 
-      the model's checklist   It re-emits the whole list every turn with one more
-                              box ticked, which is six lines of repetition for one
-                              line of news.
       documentation lookups   see _HIDDEN.
+
+    One thing is drawn at EVERY verbosity, for the same reason from the other
+    side: the model's checklist. It re-emits the whole list each turn with one
+    more box ticked, so it is drawn once and repainted in place -- see
+    _draw_plan, which turns that repetition into progress instead of noise.
 
     Everything else is drawn when VERBOSE is on. When it is off -- the default --
     only the person's own line and the agent's reply are drawn; the working is
@@ -717,6 +837,11 @@ def render(message):
     for event in parse(message):
         kind = event["kind"]
         if kind == "plan":
+            # Never folded, at any verbosity. The fold's whole cost is that it
+            # leaves you unable to tell what the agent is doing; the plan is
+            # the answer to that, so folding it away with the rest would be
+            # hiding the index along with the chapters.
+            _draw_plan(event["items"])
             continue
         if kind == "code":
             _swallowing = event.get("label") in _HIDDEN
