@@ -811,7 +811,7 @@ def already_stacked(proposal, path):
 # lets the layout be tested without a pty.
 # ---------------------------------------------------------------------------
 
-ROW, CHOICE, EXTRA = "row", "choice", "extra"
+ROW, CHOICE, EXTRA, TYPED = "row", "choice", "extra", "typed"
 
 # The two rows that are not rows. They keep their names here rather than as
 # literals in cli.py because both the flattener and the renderer need to
@@ -826,11 +826,15 @@ DONE = "__done__"
 
 
 class Entry:
-    """One line of the panel, whichever of the three kinds it is.
+    """One line of the panel, whichever of the four kinds it is.
 
         kind    ROW      a line of the command
                 CHOICE   one option belonging to the row above it
                 EXTRA    'describe it instead', and nothing else so far
+                TYPED    the open row has nothing left to offer, so Enter takes
+                         what was typed. It draws NOTHING -- the caret is
+                         already on the row itself -- and exists only so the
+                         keyboard has something to land on.
         row     the /modify row this belongs to -- for a CHOICE, its parent
         value   the identity ui.choose hands back for the cursor. A tuple, so a
                 protocol called `name` cannot collide with the `name` row.
@@ -903,11 +907,21 @@ def panel_entries(m, offered, open_row=None, choices=(), typed="",
                          (ROW, line.row) if openable else (ROW, at, "shown"),
                          line=line))
         if line.row and line.row == open_row:
-            for choice in matching(choices, typed):
+            left = matching(choices, typed)
+            for choice in left:
                 out.append(Entry(CHOICE, line.row,
                                  (CHOICE, line.row, choice.value),
                                  label=choice.label,
                                  description=choice.description))
+            if not left:
+                # Nothing to offer. Either the row never had a vocabulary -- a
+                # step range is a range and a path is a path -- or what was
+                # typed narrowed the list to nothing, which for a file row is
+                # somebody naming a path the scan did not find. Both are the
+                # same situation from the keyboard's side: the answer is the
+                # text, and Enter takes it. check() decides whether it is legal,
+                # so `protocol` does not become free text by this door.
+                out.append(Entry(TYPED, line.row, (TYPED, line.row)))
 
     if extras:
         if changes:
@@ -925,10 +939,14 @@ def panel_entries(m, offered, open_row=None, choices=(), typed="",
     # 3 is the third line under the row, not the third selectable thing on the
     # screen. It also keeps the cursor from wandering off to another row while
     # one is mid-answer, leaving a row open nowhere near where you are looking.
+    #
+    # TYPED joins them without disturbing that, because it is emitted only when
+    # there are no choices to number: the digits stay 1..n over the visible
+    # lines, and a panel that shows nothing to pick has nothing to mis-pick.
     at = 0
     for entry in out:
         if open_row is not None:
-            ok = entry.kind == CHOICE
+            ok = entry.kind in (CHOICE, TYPED)
         elif entry.kind == ROW:
             ok = len(entry.value) == 2 and entry.value[1] == entry.row
         else:

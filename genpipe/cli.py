@@ -728,8 +728,7 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
 
         ("done",   None)   review what has been changed
         ("else",   None)   describe it instead, in prose
-        ("ask",    row)    that row has no vocabulary; it needs a typed answer,
-                           which is still a screen of its own -- see _ask_row
+        ("ask",    row)    resources -- see below
         ("cancel", None)   escape with nothing open
 
     Enter OPENS a row rather than ticking it, and picking a choice collapses it
@@ -738,8 +737,24 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
     keystroke left over, hence the DONE row; the cursor must not wander while a
     row is open, hence panel_entries' selectability rule; and typing narrows the
     open row rather than jumping between rows, hence on_text.
+
+    A row with no vocabulary opens the same way -- the caret lands on the row
+    and Enter takes what was typed, via the TYPED entry panel_entries emits.
+    This used to drop out to a prompt underneath the panel, which put the whole
+    stacked-questions layout back on screen one row at a time.
+
+    RESOURCES IS THE ONE THAT STILL LEAVES, and it is not an exception to the
+    rule so much as a different question. It is not a value somebody types: it
+    is an override ini this tool writes, and writing it means asking which step,
+    which keys and what values. That is a flow, not a field, so it gets a screen
+    rather than a caret.
     """
-    state = {"open": None, "typed": "", "out": None, "row": None}
+    state = {"open": None, "typed": "", "out": None, "row": None,
+             # The last refusal, as (row, message). It rides in the panel's
+             # notes rather than being printed, because anything printed above
+             # a panel that repaints over itself is gone by the next keystroke
+             # -- which is how the same wrong answer gets typed twice.
+             "problem": None}
 
     def choices():
         if not state["open"]:
@@ -760,37 +775,47 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
             return modify.question_for(state["open"], proposal, pending=changes)
         return "What should change?"
 
+    def settle(row, picked):
+        """Take `picked` for `row`, or leave the row open saying why not."""
+        verdict = modify.check(row, picked, proposal, registry=agent.registry,
+                               name=name, pending=changes)
+        if not verdict:
+            # A tier-1 refusal leaves the row open with what was typed still
+            # there. Closing it would throw away the narrowing and make the
+            # person start the row again to read the reason.
+            state["problem"] = (row, verdict.message)
+            return True
+        changes[row] = picked
+        required.pop(row, None)
+        # What this answer has just made mandatory -- changing the pipeline
+        # invalidates the protocol, the -c stack and the step numbers. Chased
+        # here rather than at the review, so the rows turn red while the person
+        # is still looking at the panel that made them red.
+        for other, why in modify.required_after(proposal, changes).items():
+            if not changes.get(other):
+                required[other] = why
+        state.update(open=None, typed="", problem=None)
+        return modify.cursor_of(entries(), row)
+
     def on_enter(value):
         kind = value[0]
         if kind == modify.CHOICE:
-            row, picked = value[1], value[2]
-            verdict = modify.check(row, picked, proposal, registry=agent.registry,
-                                   name=name, pending=changes)
-            if not verdict:
-                # A tier-1 refusal leaves the row open with what was typed
-                # still there. Closing it would throw away the narrowing and
-                # make the person start the row again to read the reason.
-                return True
-            changes[row] = picked
-            required.pop(row, None)
-            state.update(open=None, typed="")
-            return modify.cursor_of(entries(), row)
+            return settle(value[1], value[2])
+        if kind == modify.TYPED:
+            return settle(value[1], state["typed"].strip())
         if kind == modify.ROW:
             row = value[1]
-            if not modify.options_for(row, proposal, candidates, pending=changes):
-                # No vocabulary -- a step range is a range and a path is a path.
-                # Stage 3 unfolds these into a caret on the row; until then the
-                # panel steps aside for the typed prompt that already works.
+            if row == modify.RESOURCES:
                 state.update(out="ask", row=row)
                 return False
-            state.update(open=row, typed="")
+            state.update(open=row, typed="", problem=None)
             return 0
         state.update(out="done" if value[1] == modify.DONE else "else")
         return False
 
     def on_escape():
         if state["open"]:
-            state.update(open=None, typed="")
+            state.update(open=None, typed="", problem=None)
             return True
         return False
 
@@ -801,16 +826,28 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
             state["typed"] = state["typed"][:-1]
         else:
             state["typed"] += key
+        # The refusal was about what was typed a keystroke ago. Keeping it on
+        # screen while the text under it changes makes it look like a verdict
+        # on the new text, which it is not.
+        state["problem"] = None
         return True
 
+    def notes():
+        if not state["problem"]:
+            return {}
+        row, message = state["problem"]
+        return {row: (display.RED, message)}
+
     draw = display.modify_panel(entries, changes=lambda: changes,
-                                required=lambda: required,
+                                required=lambda: required, notes=notes,
                                 typed=lambda: state["typed"],
                                 open_of=lambda: state["open"],
                                 details=ui.details_on)
     def keys():
         if state["open"]:
-            return "↑↓ · 1-9 to pick · type to narrow · esc closes the row"
+            if choices():
+                return "↑↓ · 1-9 to pick · type to narrow · esc closes the row"
+            return "type the new value · enter confirms · esc closes the row"
         return ("↑↓ · enter opens a row · esc leaves this run alone, "
                 "changes and all")
 
@@ -887,14 +924,15 @@ def _modify_guided(agent, name, record, fork_only=False):
                 _modify_direct(agent, name, text)
             return
         if outcome == "ask":
-            # A row with no vocabulary. Answered on its own screen for now, and
-            # the answer comes straight back into the panel -- so the loop
-            # continues rather than falling through to the review.
-            filled = _fill_rows(agent, name, proposal, [row], directory,
-                                candidates, changes, mirror_of=m)
-            if filled is None:
+            # Resources -- the one row that is a flow rather than a field. Its
+            # screen writes an override ini and hands back the path, which goes
+            # into `changes` like any other answer, and the loop comes straight
+            # back to the panel with that row now green.
+            path = _fill_resources(agent, name, proposal, directory)
+            if path is None:
                 return
-            changes = filled
+            if path:
+                changes[row] = path
             continue
 
         if not changes:
@@ -1003,187 +1041,6 @@ def _ask_ending(agent, name, changes, fork_only=False):
         free_text=False, field=field,
         note="nothing is submitted by any of these  ·  esc discards them")
     return ending, field.text
-
-
-def _ask_row(m, row, proposal, name, changes, options, question, step="",
-             note="", problem=""):
-    """Ask for one row's value with the command still on screen above it.
-
-    The mirror does not leave. Every answer in this flow is an answer ABOUT a
-    command, and the old arrangement -- panel, then a stack of bare prompts
-    scrolling down the terminal -- took the command away at exactly the moment
-    the questions about it started. Seven prompts in, somebody was editing a
-    thing they could not see, and the six answers they had already given were
-    three screens up.
-
-    What is drawn above the question is the collapsed mirror -- see
-    display.fill_header -- which is the invocation, the answers so far, and the
-    row being asked. Not the whole thing: the full mirror plus a protocol list
-    plus the prompt runs past twenty-four rows, and once the terminal scrolls,
-    the cursor arithmetic that repaints a panel on every keystroke is wrong.
-
-    A row with options gets them; a row without gets a Field, which is the same
-    editable value the fork's name sits in. Free text used to mean dropping out
-    of the panel entirely into ui.ask, and dropping out is what took the mirror
-    with it.
-    """
-    # `changes` is row -> new value; the header wants old and new together, and
-    # `name` is the one row whose "old" is the run's name rather than a slot.
-    so_far = {r: ((name if r == "name" else modify.current(proposal, r)), v)
-              for r, v in changes.items()}
-    current = name if row == "name" else modify.current(proposal, row)
-    if row == "name":
-        note = note or "the command does not change; this is only what you call it"
-
-    def header():
-        out = display.fill_header(m, row, so_far, current, step=step, note=note)
-        if problem:
-            out.append(f"    {display.RED}▌{display.RESET} {problem}")
-            out.append("")
-        return out
-
-    if options:
-        rows = list(options) + [ui._FreeRow("Something else…")]
-
-        def draw(cursor, picked_rows):
-            return header() + ui.option_lines(rows, cursor, picked_rows)
-
-        return ui.choose(question, options, free_text=True, draw=draw)
-
-    # No vocabulary for this row -- a step range is a range and a path is a
-    # path, and inventing options for either would be inventing. One row, whose
-    # value is the answer.
-    field = ui.Field("value", "", hint="enter confirms · esc leaves it alone")
-    rows = [slots.Option("value", row, "")]
-
-    def draw(cursor, picked_rows):
-        return header() + ui.option_lines(rows, cursor, picked_rows,
-                                          field=field, numbered=False)
-
-    picked = ui.choose(question, rows, free_text=False, field=field, draw=draw)
-    return field.text if picked else None
-
-
-def _fill_rows(agent, name, proposal, picked, directory, candidates,
-               changes=None, mirror_of=None):
-    """Ask for each selected row's new value, validating inline, then chase
-    whatever those answers have just made mandatory.
-
-    `mirror_of` is the Mirror the picking panel drew, handed down so the same
-    command stays on screen while its rows are answered -- see _ask_row.
-
-    Inline is the point. Making somebody fill three fields and then telling them
-    the first was wrong is the worst version of a form, and a tier-1 failure --
-    a protocol from the wrong pipeline, a design file that is not on disk -- is
-    knowable the instant it is typed, without a model and without a generation.
-
-    DEPENDENCY ORDER, NOT PICK ORDER. The rows are asked in modify.FILL_ORDER,
-    so the pipeline is settled before anything that reads it. Asking in the
-    order somebody happened to tick the boxes means offering rnaseq's protocols
-    to a run that is about to become chipseq, and the answer looks right on
-    screen while being an answer to the wrong question.
-
-    THEN THE CASCADE. Changing the pipeline invalidates the protocol, the -c
-    stack and the step numbers -- see modify.required_after. Those rows come
-    back as a second round, drawn red and labelled required, because leaving
-    them is not an option: a run generated from them does not fail, it generates
-    and runs for hours with the wrong parameters, which is the shape of failure
-    genpipes.md keeps returning to.
-    """
-    # Answers from an earlier pass, if the caller is coming back round. Copied
-    # rather than mutated so a caller that decides to discard the pass still has
-    # what it started with.
-    changes = dict(changes or {})
-    queue = modify.fill_order(picked)
-    asked = set(changes)
-    round_note = ""
-
-    # Said once, and only when the order actually differs from the order the
-    # boxes were ticked in. Somebody who selected top to bottom and is then
-    # asked bottom-up has been given no reason for it, and the reason is a good
-    # one -- so a line that explains it costs less than the doubt it removes.
-    # Silent when the two agree, because then there is nothing to explain.
-    if len(queue) > 1 and queue != list(picked):
-        first = queue[0]
-        print()
-        print(f"  {display.DIM}▌ asked in dependency order, not the order you "
-              f"ticked them{display.RESET}")
-        print(f"  {display.DIM}▌ {first} comes first because the rest are read "
-              f"against it{display.RESET}")
-
-    while queue:
-        total = len(queue)
-        for i, row in enumerate(queue, 1):
-            asked.add(row)
-
-            if row == modify.RESOURCES:
-                print()
-                print(f"  {display.DIM}▌ {i} of {total} — resources"
-                      f"{display.RESET}")
-                # Not a value somebody types. It is a file this tool writes, and
-                # the flow that writes it asks a different set of questions --
-                # which step, which keys, what values -- so it gets its own
-                # function rather than a fourth branch inside a loop meant for
-                # one prompt.
-                path = _fill_resources(agent, name, proposal, directory)
-                if path is None:
-                    return None
-                if path:
-                    changes[row] = path
-                continue
-
-            options = modify.options_for(row, proposal, candidates,
-                                         pending=changes)
-            problem = ""
-            while True:
-                question = modify.question_for(row, proposal, pending=changes)
-                try:
-                    value = _ask_row(mirror_of, row, proposal, name, changes,
-                                     options, question,
-                                     step=(f"required · {i} of {total}"
-                                           if round_note
-                                           else f"{i} of {total}"),
-                                     note=(round_note or {}).get(row, ""),
-                                     problem=problem)
-                except (EOFError, KeyboardInterrupt):
-                    return None
-                if value is None or not str(value).strip():
-                    break                   # skipped this row, keep the rest
-                verdict = modify.check(row, str(value), proposal, directory,
-                                       registry=agent.registry, name=name,
-                                       pending=changes)
-                if verdict.ok:
-                    if verdict.note:
-                        print(f"  {display.AMBER}▌{display.RESET} "
-                              f"{display.DIM}{verdict.note}{display.RESET}")
-                    changes[row] = str(value).strip()
-                    break
-                # Carried into the next draw rather than printed here. A message
-                # printed above a panel that is about to repaint over itself is
-                # either scrolled away or overwritten, which is how somebody
-                # retypes the same wrong answer twice -- see the transcript
-                # where 'dfedf' was entered, refused, and entered again.
-                problem = verdict.message
-                if verdict.options:
-                    options = verdict.options
-
-        # What the answers just given have made mandatory. Rows already asked
-        # once are not asked again even if they are still unsatisfied -- somebody
-        # who skipped a required field twice has said what they mean, and a loop
-        # that will not let them out is worse than a run they were warned about.
-        required = modify.required_after(proposal, changes)
-        pending = [row for row in required if row not in asked]
-        if not pending:
-            unmet = [r for r in required if not changes.get(r)]
-            if unmet:
-                display.still_required(
-                    {r: why for r, why in required.items() if r in unmet})
-            return changes
-        display.now_required(
-            {row: why for row, why in required.items() if row in pending})
-        queue = modify.fill_order(pending)
-        round_note = required
-    return changes
 
 
 def _fill_resources(agent, name, proposal, directory):
