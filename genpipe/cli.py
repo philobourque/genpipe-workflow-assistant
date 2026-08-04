@@ -1505,9 +1505,30 @@ def _cmd_sort(agent, args):
     is almost always that it is old rather than that it is wrong, and /history
     still has to be able to answer "what did I run in June?".
     """
+    # `show` was advertised in this command's own hint line and had nothing
+    # behind it -- it fell through to the name branch below and came back as
+    # "No run named 'show'". A hidden row you cannot bring back is a deletion,
+    # which is the one thing this command promises not to be.
+    if args and args[0].lower() in ("show", "all", "unhide", "restore"):
+        rest = args[1:]
+        buried = [r for r in agent.registry.all(prune=False) if r.get("hidden")]
+        if not buried:
+            display.nothing("Nothing is hidden from /list.")
+            return
+        names = rest or [r["name"] for r in buried]
+        back = [n for n in names if agent.registry.get(n)]
+        for name in back:
+            agent.registry.hide(name, hidden=False)
+        if back:
+            display.done(f"Back in /list: {', '.join(back)}", "/list to see them")
+        for name in (n for n in names if n not in back):
+            display.problem(f"No run named '{name}'.")
+        return
+
     records = agent.registry.live()
     if not records:
-        display.nothing("Nothing in /list to sort.")
+        display.nothing("Nothing in /list to sort.",
+                        "/sort show brings back anything already hidden")
         return
     if args:
         # Named directly: /sort chipseq-0728 rnaseq-0726
@@ -1525,9 +1546,14 @@ def _cmd_sort(agent, args):
     options = [slots.Option(r["name"], r["name"], _run_note(r)) for r in records]
     options.append(slots.Option("__track__", "add a run instead",
                                 "/track or /scan adopts one that already exists"))
+    # "as many as you like" is the part the key hint at the foot of the panel
+    # cannot carry on its own: "space toggles" tells you which key, not that
+    # this list is one you tick rather than one you pick a single row from.
     picked = ui.choose("Which rows should /list stop showing?", options,
                        free_text=False, multi=True,
-                       note="nothing is deleted — /history keeps everything")
+                       note="tick as many as you like — nothing is deleted, "
+                            "/history keeps everything and /sort show brings "
+                            "rows back")
     if not picked:
         display.nothing("Left alone.")
         return
@@ -1757,7 +1783,7 @@ def _cmd_where(agent, args):
 
 
 def _cmd_help(agent, args):
-    display.help_text(HELP)
+    display.help_text(help_rows())
 
 
 # One table, three consumers: the dispatcher below, the completion menu the
@@ -1792,7 +1818,7 @@ COMMAND_SPECS = [
     ("diagnose", "<name> [question]",  "read the logs and explain a failure",     "fixing",   _cmd_diagnose),
     ("hold",     "<name> [release]",   "stop a run's queued jobs being scheduled", "fixing",  _cmd_hold),
     ("cancel",   "<name>",             "scancel a run's remaining jobs",          "fixing",   _cmd_cancel),
-    ("sort",     "[names...]",         "hide rows from /list; history keeps them", "fixing",  _cmd_sort),
+    ("sort",     "[names...|show]",    "tick rows to hide from /list; show undoes", "fixing", _cmd_sort),
     ("scan",     "[path]",             "find GenPipes runs already on disk",      "fixing",   _cmd_scan),
     ("track",    "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track),
     ("readset",  "[dir|schema]",       "build a readset file from filenames",     "setup",    _cmd_readset),
@@ -1805,8 +1831,36 @@ COMMAND_SPECS = [
 ]
 
 COMMANDS = {name: fn for name, _, _, _, fn in COMMAND_SPECS if fn}
-MENU = [(name, args, desc) for name, args, desc, _, _ in COMMAND_SPECS]
-HELP = [(name, args, desc, group) for name, args, desc, group, _ in COMMAND_SPECS]
+
+
+def _specs_now():
+    """COMMAND_SPECS with the state-dependent rows filled in for right now.
+
+    Just /verbose so far. Its row was written as a fixed "[off]", which is a
+    label for one of the two states it can be in and is therefore wrong half
+    the time -- it read as "off" while the working was already being shown. A
+    toggle has to say which way it will flip and where it currently stands, so
+    both halves of the row are rewritten from the live setting.
+    """
+    out = []
+    for name, args, desc, group, fn in COMMAND_SPECS:
+        if name == "verbose":
+            if display.VERBOSE:
+                args, desc = "[off]", "fold the agent's working away  ·  now: showing"
+            else:
+                args, desc = "[on]", "show the agent's working  ·  now: folded away"
+        out.append((name, args, desc, group, fn))
+    return out
+
+
+def menu():
+    """Rows for the completion menu the prompt draws as you type."""
+    return [(name, args, desc) for name, args, desc, _, _ in _specs_now()]
+
+
+def help_rows():
+    """Rows for /help."""
+    return [(name, args, desc, group) for name, args, desc, group, _ in _specs_now()]
 
 
 def _resolve(word):
@@ -2154,7 +2208,7 @@ def _repl(agent):
 
     The prompt is created once and kept, so history survives across turns.
     """
-    prompt = ui.Prompt(MENU, arguments=lambda cmd: _run_names(agent, cmd))
+    prompt = ui.Prompt(menu, arguments=lambda cmd: _run_names(agent, cmd))
     thread = _conversation_id()
     context = None              # the last directory brief sent on this thread
     preparation = prep.Preparation()

@@ -32,6 +32,7 @@ import tempfile
 
 from harness import Report, ScriptedLLM, execute_block, solution
 
+from genpipe import display
 from genpipe import fakecluster
 from genpipe import runs as runs_store
 
@@ -268,6 +269,42 @@ def main():
                     run_name not in [x["name"] for x in reg.live()])
             r.contains("still in /history",
                        str([x["name"] for x in reg.all()]), run_name)
+
+            # ============================================================== #
+            r.section("/sort hides a row, and /sort show brings it back")
+            # `show` was in this command's own hint line with no handler behind
+            # it, so it fell through to the name branch and came back as "No
+            # run named 'show'" -- which made hiding a one-way door.
+            cli._cmd_sort(agent, [second])
+            reg = runs_store.Registry(store)
+            r.check("the named run leaves /list",
+                    second not in [x["name"] for x in reg.live()])
+            r.check("but it is still on record",
+                    second in [x["name"] for x in reg.all(prune=False)])
+
+            cli._cmd_sort(agent, ["show"])
+            reg = runs_store.Registry(store)
+            r.check("and show puts it back", second in [x["name"] for x in reg.live()])
+
+            # ============================================================== #
+            r.section("/verbose's menu row says which way it will flip")
+            # It was written as a fixed "[off]", which is a label for one of the
+            # two states it can be in and so reads wrong in the other.
+            was = display.VERBOSE
+            try:
+                display.set_verbose(False)
+                row = [m for m in cli.menu() if m[0] == "verbose"][0]
+                r.equal("folded away, the argument offered is on", row[1], "[on]")
+                r.contains("and the row says where it stands", row[2], "folded away")
+
+                display.set_verbose(True)
+                row = [m for m in cli.menu() if m[0] == "verbose"][0]
+                r.equal("showing, the argument offered is off", row[1], "[off]")
+                r.contains("and the row says that too", row[2], "showing")
+                r.contains("/help reads from the same place",
+                           str(cli.help_rows()), "showing")
+            finally:
+                display.set_verbose(was)
 
         return r.finish()
     finally:

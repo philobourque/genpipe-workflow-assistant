@@ -614,7 +614,11 @@ class Prompt:
     accumulates across the session."""
 
     def __init__(self, commands=(), arguments=None):
-        self.commands = list(commands)
+        # A callable is allowed and is resolved on every read, so a command
+        # whose hint depends on state -- /verbose, whose argument is whichever
+        # way it would flip -- is right each time the menu opens rather than
+        # frozen as it was when the prompt was built.
+        self.commands = commands if callable(commands) else list(commands)
         # See _Editor.arguments: a callable that turns a command name into the
         # values its first argument could take.
         self.arguments = arguments
@@ -633,9 +637,11 @@ class Prompt:
         if not sys.stdin.isatty():
             return input("genpipe> ")
 
+        commands = self.commands() if callable(self.commands) else self.commands
+
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
-        ed = _Editor(self.commands, self.history, initial=initial,
+        ed = _Editor(commands, self.history, initial=initial,
                      arguments=self.arguments)
         try:
             tty.setraw(fd)
