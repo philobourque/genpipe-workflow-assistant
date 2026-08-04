@@ -714,7 +714,7 @@ def _typed(message):
     run something. It marks where its own text starts (intake.CONTEXT_MARK).
     """
     from . import intake as _intake
-    return message.split(_intake.CONTEXT_MARK, 1)[0]
+    return _intake.spoken(message)
 
 
 # A request to put work on the cluster, as opposed to a question about it. Verbs
@@ -885,11 +885,17 @@ def _next_question(said, limit=2):
     Everything the user has said is read, answers included, so a question
     already answered is not asked twice -- the same accumulation a real model
     does by reading its own history.
+
+    Each message is stripped of brief()'s appended context ON ITS OWN before
+    they are joined. Joining first and stripping once cuts at the request's mark
+    and takes every answer with it, so the slot never fills, and the same
+    question is asked until the ask budget runs out -- which is precisely what
+    it did: two identical readset panels, then a gate with no readset in it.
     """
     from . import intake as _intake
     from . import slots as _slots
 
-    stated = _intake.read(" ".join(said))
+    stated = _intake.read(_spoken_join(said))
     gaps = _slots.gaps(**stated)
     if not gaps:
         return None
@@ -916,7 +922,7 @@ def _gen_block(task, feedback=(), answers=()):
     """
     import re as _re
 
-    text = " ".join([task, *feedback, *answers]).lower()
+    text = _spoken_join([task, *feedback, *answers]).lower()
 
     # Longest name first, so rnaseq_denovo_assembly is not read as rnaseq, and
     # on a word boundary so it is a request rather than an incidental mention.
@@ -939,7 +945,10 @@ def _gen_block(task, feedback=(), answers=()):
     # line, so that choosing one in a panel visibly changes what gets approved.
     # The stub validates that it exists, which is the check that would catch a
     # panel handing back something the run cannot use.
-    files = _intake_files(" ".join([task, *feedback, *answers]))
+    # Each message stripped of brief()'s appended context on its own, then
+    # joined -- see intake.spoken. Joining first and stripping once cuts at the
+    # request's mark and throws the answers away with the context.
+    files = _intake_files(_spoken_join([task, *feedback, *answers]))
 
     flag = f"-t {protocol} " if protocol else ""
     readset = f"-r {files['readset']} " if files.get("readset") else ""
@@ -955,6 +964,12 @@ def _intake_files(text):
     """intake.find_files, imported lazily to keep this module's import cheap."""
     from . import intake as _intake
     return _intake.find_files(text)
+
+
+def _spoken_join(parts):
+    """Several messages, each stripped of its appended context, then joined."""
+    from . import intake as _intake
+    return " ".join(_intake.spoken(p) for p in parts)
 
 
 # Imported lazily by the module that needs it, to keep this file stdlib-only at

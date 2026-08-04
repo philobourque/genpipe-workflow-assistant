@@ -90,8 +90,7 @@ def find_files(text):
     line because somebody said so, never because it was lying around.
     """
     found = {"readset": None, "design": None, "pairs": None}
-    text = (text or "").split(CONTEXT_MARK)[0]
-    for token in re.findall(r"\S+", text):
+    for token in re.findall(r"\S+", spoken(text)):
         token = token.strip("'\"`,;()[]")
         if not token.lower().endswith(_FILE_SUFFIXES):
             continue
@@ -150,6 +149,33 @@ def candidates(directory=".", limit=8):
     return buckets
 
 
+def spoken(text):
+    """One message, with brief()'s appended context cut off the end.
+
+    Apply this to each message SEPARATELY, never to several joined together.
+    The context block has a mark where it starts and nothing where it ends, so
+    in a concatenation there is no way to tell where the appended facts stop and
+    the next real message begins -- cutting at the first mark would take every
+    later message with it. That is not hypothetical: joining the request to the
+    answers that followed it, then cutting once, silently dropped the readset
+    chosen in a panel, and the gate withheld /approve for a slot that had in
+    fact been filled.
+    """
+    return _untagged(str(text or "").split(CONTEXT_MARK)[0])
+
+
+def _untagged(text):
+    """Tag markers turned into spaces, so a path at the end of one is still a path.
+
+    Answers to ask() come back to the model wrapped as
+    `<observation>The user answered: /data/readset.tsv</observation>`, and
+    splitting that on whitespace yields `readset.tsv</observation>` -- which
+    ends in neither .tsv nor anything else recognisable, so the readset was
+    dropped and the same question asked again until the ask budget ran out.
+    """
+    return re.sub(r"</?[A-Za-z_][A-Za-z0-9_]*>", " ", text)
+
+
 def find_directories(text):
     """Directories the person named, in the order they said them.
 
@@ -164,7 +190,7 @@ def find_directories(text):
     send us reading somebody's home.
     """
     out = []
-    for token in re.findall(r"\S+", (text or "").split(CONTEXT_MARK)[0]):
+    for token in re.findall(r"\S+", spoken(text)):
         token = token.strip("'\"`,;()[]").rstrip(":")
         if "/" not in token and not token.startswith("~"):
             continue
