@@ -43,8 +43,21 @@ deliverables/
 *.config.trace.ini
 # Scratch inputs and generated scripts from walking testcases/SCENARIOS.md.
 design.tsv
-*_cit.sh
+*_cit*.sh
 *_cit/
+# The two generated scripts that carry no convention in their names, because a
+# person typed them. There is no glob for "a pipeline wrote this": every one of
+# them opens `#!/bin/bash` and runs to six figures of bytes, so they are named
+# here rather than caught by a pattern loose enough to swallow start_agent.sh.
+dnaseq_trail2.sh
+# Overrides: what override.py writes ({name}.override.ini), and the hand-made
+# ones alongside them.
+*.override.ini
+override_*.ini
+override_*.ini.bak
+# Transcripts and sacct dumps kept while testing against the real scheduler.
+*.log
+*_log.tsv
 # What the last cluster test case recorded. Useful locally, not shared history.
 testcases/last-run-*.json
 

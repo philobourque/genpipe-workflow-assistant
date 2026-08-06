@@ -896,7 +896,9 @@ def _next_question(said, limit=2):
     from . import slots as _slots
 
     stated = _intake.read(_spoken_join(said))
-    gaps = _slots.gaps(**stated)
+    # project_dir is intake's, not slots.gaps()' -- gaps() has never asked
+    # about a directory, only about the five file/pipeline slots.
+    gaps = _slots.gaps(**{k: v for k, v in stated.items() if k != "project_dir"})
     if not gaps:
         return None
     gap = gaps[0]

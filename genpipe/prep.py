@@ -262,7 +262,7 @@ class Preparation:
     """
 
     __slots__ = ("pipeline", "protocol", "readset", "design", "pairs",
-                 "described", "active")
+                 "project_dir", "described", "active")
 
     def __init__(self, **kw):
         for slot in self.__slots__:
@@ -320,6 +320,8 @@ def summary(prep):
     generation is spent on the wrong one.
     """
     parts = [p for p in (prep.pipeline, prep.protocol) if p]
+    if prep.project_dir:
+        parts.append(f"project dir {prep.project_dir}")
     for label, value in (("readset", prep.readset), ("design", prep.design),
                          ("pairs", prep.pairs)):
         if value:

@@ -354,4 +354,57 @@ finally:
     shutil.rmtree(data, ignore_errors=True)
     shutil.rmtree(launch, ignore_errors=True)
 
+# --------------------------------------------------------------------------
+r.section("project_dir: a directory named in the request becomes first-class "
+          "state, and nothing falls back to the process's own cwd")
+
+# read() now recognises a project directory the same way find_directories()
+# does -- the first one named, and only a real one.
+data = tempfile.mkdtemp(prefix="project-")
+try:
+    stated = intake.read(f"run rnaseq on the samples in {data}")
+    r.equal("project_dir is picked up by read()", stated["project_dir"], data)
+    r.equal("no directory named means no project_dir",
+            intake.read("run rnaseq on my samples")["project_dir"], None)
+    r.equal("a directory that does not exist is not a project_dir",
+            intake.read("run rnaseq on /no/such/place")["project_dir"], None)
+
+    # candidates()/context_for() must never guess a directory: None in means
+    # nothing discovered, not "whatever the caller happened to be standing in".
+    r.equal("candidates(None) discovers nothing",
+            intake.candidates(None), {"readset": [], "design": [], "pairs": []})
+    stated2, found2 = intake.context_for("hello")
+    r.equal("context_for with no directory established finds nothing",
+            found2, {"readset": [], "design": [], "pairs": []})
+
+    # _resolves must not silently join a relative name against nothing.
+    r.check("an absolute path can still resolve with no directory established",
+            intake._resolves(__file__, None))
+    r.check("a relative path resolves nothing without a directory",
+            not intake._resolves("readset.tsv", None))
+finally:
+    shutil.rmtree(data, ignore_errors=True)
+
+# The scenario this whole defect is named after: launched from a directory
+# that happens to contain an unrelated design.tsv, asked about mouse rnaseq
+# with no path in the sentence at all. brief() must never go looking on its
+# own -- it only ever sees what its caller establishes as the project
+# directory, and a caller that passes nothing (None) gets nothing back.
+launch_cwd = tempfile.mkdtemp(prefix="unrelated-cwd-")
+try:
+    open(os.path.join(launch_cwd, "design.tsv"), "w").close()
+    real_cwd = os.getcwd()
+    os.chdir(launch_cwd)
+    try:
+        text = intake.brief("I want to run an rnaseq pipeline on mouse data")
+        r.contains("the pipeline is still recognised", text, "pipeline: rnaseq")
+        r.truthy("but nothing else is discovered, and no directory is scanned",
+                 "possible" not in text and "candidates" not in text)
+        r.truthy("the unrelated design.tsv is never mentioned",
+                 "design.tsv" not in text)
+    finally:
+        os.chdir(real_cwd)
+finally:
+    shutil.rmtree(launch_cwd, ignore_errors=True)
+
 sys.exit(r.finish())

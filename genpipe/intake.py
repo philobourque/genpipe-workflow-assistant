@@ -103,36 +103,48 @@ def find_files(text):
 
 
 def read(text):
-    """Everything the request states outright."""
+    """Everything the request states outright, including a project directory."""
     pipeline = find_pipeline(text)
     files = find_files(text)
+    dirs = find_directories(text)
     return {
         "pipeline": pipeline,
         "protocol": find_protocol(text, pipeline),
         "readset": files["readset"],
         "design": files["design"],
         "pairs": files["pairs"],
+        "project_dir": dirs[0] if dirs else None,
     }
 
 
 def _resolves(name, directory):
-    """Is this filename actually there? Relative names are resolved against the
-    directory the request was typed in, which is the one genpipes will run in."""
+    """Is this filename actually there? Relative names are resolved against
+    `directory` -- the established project directory, if there is one. An
+    absolute name is checked on its own; a relative one with no directory to
+    resolve against is not assumed to be anywhere in particular."""
     try:
-        return os.path.exists(name if os.path.isabs(name)
-                              else os.path.join(directory, name))
+        if os.path.isabs(name):
+            return os.path.exists(name)
+        return directory is not None and os.path.exists(os.path.join(directory, name))
     except (OSError, ValueError):
         return False
 
 
-def candidates(directory=".", limit=8):
-    """Files in the working directory that could fill each role.
+def candidates(directory=None, limit=8):
+    """Files in `directory` that could fill each role, or nothing if no
+    directory has been established.
 
     Cheap, non-recursive and best-effort: these become numbered options in the
     panel, and the free-text row covers everything this misses. A slow or
     clever search would be the wrong trade for a list nobody is obliged to use.
+
+    `directory=None` -- no project directory known yet -- returns empty
+    buckets rather than falling back to the process's current directory. The
+    caller decides what counts as "established"; this function never guesses.
     """
     buckets = {"readset": [], "design": [], "pairs": []}
+    if directory is None:
+        return buckets
     try:
         names = sorted(os.listdir(directory))
     except OSError:
@@ -203,7 +215,7 @@ def find_directories(text):
     return out
 
 
-def near_miss(name, directory="."):
+def near_miss(name, directory=None):
     """The file they probably meant, when the one they named is not there.
 
     `myReadset.ts` for `myReadset.tsv` -- one character, and the whole run was
@@ -218,6 +230,8 @@ def near_miss(name, directory="."):
     if not name:
         return None
     where = os.path.dirname(name) or directory
+    if not where:
+        return None
     stem = os.path.splitext(os.path.basename(name))[0].lower()
     try:
         names = os.listdir(where)
@@ -238,13 +252,21 @@ def near_miss(name, directory="."):
 CONTEXT_MARK = "--- context for you, not typed by the user ---"
 
 
-def brief(text, directory="."):
+def brief(text, directory=None):
     """The request, plus what can be established about it without asking.
 
     Appended rather than rewritten, so the person's own words stay in front of
     the model. A request rebuilt from parsed fields loses the intent that was
     never in a field -- "the samples Marie sent", "same as last time" -- and
     that intent is often the part that decides whether the answer is useful.
+
+    `directory` is the PROJECT directory already established for this
+    conversation -- from an earlier turn, or from an explicit /project -- not
+    the process's current working directory. Pass None when nothing has been
+    established yet; this function never falls back to os.getcwd(), and
+    discovers nothing when it has nowhere to look. A directory named in `text`
+    itself always wins over `directory`, because the person is telling you
+    right now where today's data is.
 
     Two kinds of fact go in, and the distinction between them is stated in the
     text rather than left for the model to infer:
@@ -270,16 +292,18 @@ def brief(text, directory="."):
     re-read stale filenames.
     """
     stated = read(text)
+    established = stated.get("project_dir") or directory
+
     known, missing, corrected = [], [], []
     for slot, value in stated.items():
         if not value:
             continue
-        if slot not in _FILE_SLOTS or _resolves(value, directory):
+        if slot not in _FILE_SLOTS or _resolves(value, established):
             known.append((slot, value))
             continue
         # Named but not there. Before reporting it as missing, look for the
         # file they meant -- see near_miss.
-        better = near_miss(value, directory)
+        better = near_miss(value, established)
         if better:
             corrected.append((slot, value, better))
             known.append((slot, better))
@@ -300,8 +324,14 @@ def brief(text, directory="."):
         if hits:
             named[where] = hits
 
-    found = candidates(directory)
-    seen = [(role, paths) for role, paths in found.items() if paths]
+    # An established project directory not already named in THIS message --
+    # carried over from an earlier turn, or set by /project -- gets the same
+    # one-listing treatment, never the process's cwd.
+    seen = []
+    if established and established not in named:
+        found = candidates(established)
+        seen = [(role, paths) for role, paths in found.items() if paths]
+
     if not known and not seen and not missing and not named:
         return text
 
@@ -318,9 +348,9 @@ def brief(text, directory="."):
         lines.append("")
     if named:
         lines.append("In the directory the request POINTS AT. This is where their "
-                     "data is, so prefer these over anything in the working "
-                     "directory. Exactly one candidate for a role means use it and "
-                     "say so; several means ask which:")
+                     "data is, so prefer these over anything found elsewhere. "
+                     "Exactly one candidate for a role means use it and say so; "
+                     "several means ask which:")
         for where, hits in named.items():
             for role, paths in hits.items():
                 lines.append(f"- possible {role} in {where}: {', '.join(paths)}")
@@ -332,7 +362,7 @@ def brief(text, directory="."):
         lines += [f"- {slot}: {value} (not found)" for slot, value in missing]
         lines.append("")
     if seen:
-        lines.append(f"Files in the working directory ({os.path.abspath(directory)}) "
+        lines.append(f"Files in the project directory ({os.path.abspath(established)}) "
                      f"that could fill a role. These are candidates, not "
                      f"choices -- confirm before using one, and never prefer one "
                      f"over a file in a directory the request named:")
@@ -342,11 +372,12 @@ def brief(text, directory="."):
     return "\n".join(lines).rstrip() + "\n"
 
 
-def context_for(text, directory="."):
+def context_for(text, directory=None):
     """Everything the ask node needs to turn a slot name into a real panel.
 
     Returns (stated, candidates). Kept separate from brief() because the two
     happen at different moments -- brief once, before the agent runs; this one
-    every time the agent asks something.
+    every time the agent asks something. `directory` is the established
+    project directory, or None -- never the process's cwd.
     """
     return read(text), candidates(directory)

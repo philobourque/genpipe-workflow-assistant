@@ -246,11 +246,18 @@ def main():
 
         # ================================================================== #
         r.section("a task is named at the gate, without being asked")
-        app.line("run rnaseq stringtie steps 1-5")
+        # The project directory is named explicitly. Phase 1 (AGENT-FIXES.md
+        # defect 1) stopped intake from treating the process's own launch
+        # directory as an implicit project directory -- discovery only ever
+        # looks where the request points, never at cwd on its own -- so the
+        # seeded readset/design here have to be pointed at the same way a real
+        # request would point at them.
+        app.line(f"run rnaseq stringtie steps 1-5, everything is in {workdir}")
         # Two panels stand between the request and the name prompt now: the
-        # readset and the design, neither of which this request names. Answering
-        # them with the seeded files keeps the run name -- and therefore every
-        # assertion below -- the same as before intake existed.
+        # readset and the design, neither of which this request names by
+        # FILENAME. Answering them with the seeded files keeps the run name --
+        # and therefore every assertion below -- the same as before intake
+        # existed.
         # send(), not line(): with nine or fewer rows a digit selects
         # immediately, so a trailing Enter would leak into whatever prompt comes
         # next -- which is the name prompt, whose suggestion is pre-filled.
@@ -402,11 +409,15 @@ def main():
 
         # ================================================================== #
         r.section("a reused name is redirected, not allowed to clobber")
-        app.line("run rnaseq stringtie steps 1-5")
+        # A fresh Preparation started for this run (the previous one reached
+        # the gate, which resets it -- see cli._repl), so the project
+        # directory has to be named again; it is never picked up from cwd.
+        app.line(f"run rnaseq stringtie steps 1-5, everything is in {workdir}")
         # Two panels stand between the request and the name prompt now: the
-        # readset and the design, neither of which this request names. Answering
-        # them with the seeded files keeps the run name -- and therefore every
-        # assertion below -- the same as before intake existed.
+        # readset and the design, neither of which this request names by
+        # FILENAME. Answering them with the seeded files keeps the run name --
+        # and therefore every assertion below -- the same as before intake
+        # existed.
         # send(), not line(): with nine or fewer rows a digit selects
         # immediately, so a trailing Enter would leak into the next prompt.
         app.wait_for("Which readset file", timeout=30)
@@ -447,20 +458,26 @@ def main():
 
         # ================================================================== #
         r.section("the held run survives into a NEW process")
-        # The relaunched app must announce the decision left behind, since its
-        # name existed only in the previous session's scrollback.
+        # The startup screen no longer reports what is held. It used to, on the
+        # grounds that a decision left at the gate existed only in the previous
+        # session's scrollback -- but in practice the counts were of accumulated
+        # testing rather than of anything anybody was about to act on, and they
+        # occupied the space between the banner and the prompt.
+        #
+        # What is asserted now is the part that actually matters: the run itself
+        # survived the process, and /list still finds it. The reminder was
+        # convenience; the persistence is the guarantee.
         again = App(workdir, state="failed-oom")
         try:
             r.check("relaunches", again.wait_for("ready", timeout=120))
-            screen = again.emitted()
-            # One line, however many are held. display.pending deliberately
-            # does NOT reprint every held command: a fortnight of experiments
-            # made the largest thing on a fresh screen the list of things you
-            # had not decided, and pushed the prompt to the bottom of the
-            # scrollback.
-            r.contains("announces the pending approval", screen, "held")
-            r.contains("names the run waiting", screen, second or f"{name}-2")
-            r.contains("and where to see the commands", screen, "/list")
+            r.check("and the opening screen stays quiet about what is held",
+                    "waiting on you" not in again.emitted())
+            again.line("/list")
+            again.pump(1.0)
+            listed = again.emitted()
+            r.contains("but /list still has the held run", listed,
+                       second or f"{name}-2")
+            r.contains("and still says it is waiting", listed, "held")
         finally:
             again.close()
 

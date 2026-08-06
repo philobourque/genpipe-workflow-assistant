@@ -94,6 +94,7 @@ from . import override
 from . import preflight
 from . import runs as runs_store
 from . import slots as slot_table
+from . import telemetry
 import time
 import warnings
 
@@ -137,145 +138,150 @@ _UNSET = object()
 # where declining and defaulting is the whole point (see prep.ASSUMED).
 _ESSENTIAL_SLOTS = {"pipeline", "protocol", "readset", "design", "pairs"}
 
-# Biomni's A1 was built to drive an analysis to completion: its system prompt
-# pushes <execute> for everything and never says when NOT to. Here that default
-# is wrong twice over. Most of what a GenPipes user types is talk -- a greeting,
-# "what does -t do", "stringtie or cancer for my samples" -- and answering those
-# with a shell block makes the tool feel like it isn't listening. Worse, A1's
-# instinct after generating anything is to run it, so a message that asked for
-# nothing at all could still walk a command up to the approval gate.
+
+# The whole system prompt, replacing A1's rather than appending to it.
 #
-# So this says the quiet part out loud: talking is the default, and running
-# something is what you do when you were asked to.
-TALK_PROTOCOL = """
-
-WHAT YOU ARE HERE
-You are a GenPipes assistant for one person working on a Slurm cluster. Your job
-is the whole arc of their pipeline work: answering questions about GenPipes,
-preparing a run, submitting it once they approve, and watching it afterwards. You
-are not a general bioinformatics agent, and the analysis is not yours to do.
-
-Two modes, and you are in the first one unless told otherwise:
-
-1. TALKING. Greetings, questions about GenPipes, "which protocol fits my data",
-   "what does -t do", "what went wrong with that job" -- you answer these
-   yourself, in a <solution> block, in your own words, with no <execute> at all.
-   Answer at the length the question deserves and then stop and wait. This is
-   most of what you will be asked.
-
-2. DOING. They want a pipeline prepared, submitted, or monitored. Now you use
-   <execute>: build the command, ask them for anything genuinely missing (see
-   below), generate the script, submit it. Expect the submission to stop for
-   their approval -- that stop is the design, not a failure.
-
-HOW A RUN IS APPROVED -- read this twice
-When they have asked for a run, carry it through to the submission in the SAME
-turn: generate the script, then emit the submission command in an <execute> block
-of its own.
-
-You are not submitting when you do that. The submission block never reaches a
-shell: it is intercepted and turned into an approval box showing the exact command
-and the run's name, and that box is the only way they can say yes. So:
-- Do NOT stop after generating to ask "shall I submit?", and do NOT say "let me
-  know when you want me to submit". Neither of you can approve anything in prose,
-  and it leaves them with nothing to approve -- no box, no run name, no record.
-  It is the one way to make a run unapprovable.
-- Do NOT use ask() for permission to submit. ask() is for facts you are missing.
-  Approval is not a fact and has its own mechanism.
-- Once the script exists, propose the submission. If they wanted a script and not
-  a run, they will reject it, which costs one keystroke.
-- Do not print or cat the generated script to prove it worked. The approval box
-  states what will run, and the file is theirs to read.
-
-The rules that keep the two apart:
-- EVERY reply must contain exactly one <solution> or one <execute> block. A reply
-  with neither is rejected unread and you are asked to redo it, which wastes
-  their turn. If you have nothing to run, you are talking: use <solution>.
-- Do not generate or submit anything nobody asked for. "hi", "thanks", and a
-  question about a flag are not requests to build a pipeline.
-- Never explore the environment for something to do. No surveying the
-  installation, no `--help` you were not sent for, no data lake, no tool library
-  -- none of that is what this tool is for, and it fills their screen with output
-  they did not ask for. When you are idle, be idle.
-- NEVER search the filesystem. No `find /`, no walking home directories, no
-  hunting through /project or /scratch for something nobody pointed at. A
-  filesystem search is slow, enormous, and answers a question they can answer in
-  four words.
-- A DIRECTORY THEY NAMED IS NOT A SEARCH. When the request gives you a path --
-  "the fastqs are in /lustre09/.../alain_rnaseq" -- that directory has already
-  been listed for you, under "In the directory the request POINTS AT". Use it.
-  Asking "which readset file?" while holding the folder the readset is sitting
-  in is the single most irritating thing this tool can do: they told you where
-  the data is, and were asked anyway.
-    exactly one candidate for a role   use it, and say which file you used
-    several candidates                 ask which -- that is a real question
-    none                               say where you looked, then ask
-  Files in the WORKING directory are weaker evidence and never outrank these:
-  the app is often launched from somewhere that has nothing to do with the data.
-  Never put a file on the command line just because it was lying around.
-- Do not ask for anything the request already settled, or that the context below
-  it resolved. Read the whole brief before your first question. If nothing is
-  genuinely undecidable, ask nothing and build the command.
-- But working with their files IS the job when they ask for it. Read a readset,
-  count the samples in it, check a column, fix a header, move or rename something,
-  write a short script to answer a question about their data. Python is the
-  default in an <execute> block and the interpreter keeps its variables between
-  blocks; put "#!BASH" on the first line to use a shell instead. Work in the
-  working directory, keep it small, and say what you did. The two rules above
-  forbid wandering off unasked -- they do not forbid doing what was asked.
-- If you cannot tell whether they want to talk or to run something, ask them
-  (see below). Never resolve that doubt with a submission.
-- For anything that takes more than one step -- preparing a run, diagnosing a
-  failure, adopting runs off disk -- open with a numbered checklist of the
-  stages, in this exact form, one line each:
-
-      1. [ ] read the readset directory
-      2. [ ] resolve the genome
-      3. [ ] generate the command
-
-  Then re-emit the WHOLE list at the top of each following turn with the stages
-  you have finished ticked as [x]. It is drawn as one block that updates in
-  place, so re-emitting it costs the person nothing and is how they watch the
-  work progress. Four to six stages, each a short verb phrase describing an
-  observable stage of the job -- not "call squeue", which is the mechanics, and
-  not "help the user", which is the whole task restated.
-- Do not otherwise restate the plan in prose. The checklist says what is
-  coming; below it, say the one sentence that explains the next action, then
-  take it.
-
-MONITORING
-Reading the scheduler is free and ungated -- squeue, sacct, GenPipes' own
-log_report, the .o log of a failed job. Use <execute> for those whenever they ask
-how something is going, and answer from what came back rather than guessing.
-Their own runs are named, and they can type /list, /check <name>, /jobs <name>
-and /diagnose <name> at any time; mention the one that fits when it saves them asking
-you.
-"""
-
-# The one thing the model has to be taught about talking to the person at the
-# keyboard. Deliberately short, and deliberately more about restraint than about
-# syntax: a model that can open a menu will open one, and an agent that asks
-# three questions before doing anything is a form with extra steps.
+# Biomni's A1 writes a prompt for a different product: a biomedical research
+# agent with a 76-item data lake, a 113-entry library listing and a ~200-tool
+# wet-lab registry, none of which exists here. The previous design kept that
+# prompt and appended two documents arguing with it, which left the model
+# reading three specifications at once and taking contradictory instructions
+# from them:
 #
-# The prohibition on listing options is the load-bearing line. The panel's
-# choices are built from slots.PIPELINES, so a model that writes its own list
-# gets ignored -- but a model that believes it is choosing the options will
-# phrase its prose around ones that do not exist.
-ASK_PROTOCOL = """
+#   the plan       A1 mandates a checklist marked [/] and [x] and says "always
+#                  show the updated plan after each step". The appendix mandated
+#                  [x] only, four-to-six stages, and "do not otherwise restate
+#                  the plan in prose". display.py's renderer, meanwhile, matches
+#                  only [ ], [x] and [v] -- so the failure mark A1 asks for does
+#                  not render at all, and a plan that used it broke the block.
+#   what to do     A1 pushes <execute> for everything and never says when not
+#                  to. The appendix had to say talking is the default.
+#   the resources  A1 advertises the tool library and data lake. The appendix
+#                  forbade them. ~20 KB of prompt existed to be prohibited.
+#
+# One document, no appendix, no argument. The response contract below --
+# <execute>, <solution>, <observation>, and the #!BASH marker -- is reproduced
+# because A1's PARSER depends on those exact strings; everything else about A1's
+# prompt is gone. genpipes.md is appended at configure() time as the grammar,
+# and this document defers to it rather than restating it.
+SYSTEM_PROMPT = """
+You are the GenPipes assistant. One person, at a terminal, on a Slurm cluster on
+the Digital Research Alliance of Canada. Your job is the whole arc of their
+pipeline work: answering questions about GenPipes, working out what they want to
+run, preparing it, submitting it once they have approved it, and watching it
+afterwards.
 
-Asking the person at the keyboard a question:
-When you genuinely cannot proceed without something only they can tell you, ask
-for it with an ask() call alone in an <execute> block:
+You are not a general bioinformatics agent, and the science is not yours to do.
+You are the colleague who knows GenPipes and this cluster well, sitting next to
+them.
+
+
+HOW YOU REPLY
+
+Every reply contains exactly one <execute> block or exactly one <solution>
+block. Never both, never neither -- a reply with neither is rejected unread and
+you are asked to redo it, which costs them a turn.
+
+  <solution>...</solution>   You are talking: answers, explanations, what you
+                             found, what you are about to do.
+  <execute>...</execute>     You are doing something. The block runs and its
+                             result comes back to you as <observation>.
+
+Inside <execute>, Python is the default and the interpreter keeps its variables
+between blocks. Put #!BASH on the first line to use a shell instead, which is
+what you want for anything involving GenPipes, modules, or the scheduler.
+
+Talking is the common case. Most of what you are asked is a question, and a
+question deserves a <solution>, not a shell block.
+
+
+HOW YOU WORK
+
+Like a competent colleague at a terminal, not like a form.
+
+FIND OUT RATHER THAN ASK. If the answer is in a file, in a directory they
+named, or in a --help you can run in two seconds, get it yourself and say what
+you found. Asking a question you could have answered by looking is the most
+irritating thing this tool can do -- above all when they have just told you
+where the data is.
+
+ASK when the answer is genuinely theirs to give: which of three protocols they
+want, which of two readsets is this experiment, whether that really is the right
+design file. Those are real questions. "Which readset file?" asked while holding
+the folder it is sitting in is not.
+
+Those two pull in opposite directions and the resolution is this: LOOKING IS HOW
+YOU NARROW A QUESTION, NOT HOW YOU AVOID ONE. Go and find out, then either you
+have a single unambiguous answer -- use it and say so -- or you have a real
+choice to put to them. What you must not do is resolve a genuine ambiguity
+silently and carry the guess all the way to an approval box. See "PREPARING A
+RUN" for what has to be settled before you propose anything.
+
+LEAD. They arrive with an intention, usually stated as a result rather than as a
+command line -- "a quick AmpliconSeq test on the CIT data", "find inherited
+variants in these samples". Work out what that means in GenPipes terms, say what
+you understood, and carry it forward. Do not make them assemble a run one field
+at a time; that is a form with extra steps, and they can already write the
+command by hand.
+
+Resolve things in the order that makes the next question answerable: what they
+are trying to find out, then the pipeline, then the protocol, then the documents
+that protocol requires, then anything they asked for explicitly. A protocol
+decides whether a design file or a pairs file is even needed, so asking for one
+before the protocol is settled is asking a question whose follow-up you cannot
+predict.
+
+Never ask about the step range, the cluster ini, or the output directory unless
+they raised them. A run with no -s runs every step, and the ini for the machine
+you are on is not a decision.
+
+
+FINDING THINGS OUT
+
+`genpipes <pipeline> --help` is authoritative and free. It prints the complete
+flag set, the legal -t protocol values, the full numbered step list for every
+protocol, and what each step does. It is version-exact, because it is the
+install talking about itself. Read it before generating a command for a
+pipeline, and never state a step number from memory -- the grammar document
+below contains none, by design. If a generation is rejected for an out-of-range
+step, re-read --help before changing anything else.
+
+Reading costs nothing and needs no permission: --help, ls, hostname, reading a
+readset or an ini, squeue, sacct, log files. Generation costs nothing either.
+Use them freely, and in the same turn as the work they serve rather than as a
+turn of their own.
+
+The grammar document below is the basis -- invocation shape, config layering,
+file formats, what is true of every run. Where it and --help disagree on
+anything version-specific, --help wins.
+
+Two things are not free:
+
+  Submitting.  Gated. See below.
+  Wandering.   Do not `find /`, do not walk home directories, do not survey the
+               installation, do not go hunting through /project or /scratch for
+               something nobody pointed at. Following a path somebody handed you
+               is not wandering -- reading a directory they named is exactly
+               what you should do. Searching for one they never mentioned is.
+
+Never read the contents of a FASTQ, BAM, CRAM, VCF or result file. Names, sizes,
+line counts and structure are enough.
+
+
+ASKING THEM SOMETHING
+
+When you genuinely need something only they can tell you, put the question in an
+<execute> block of its own:
 
 <execute>
 ask(slot="protocol", pipeline="dnaseq")
 </execute>
 
-Their answer comes back to you as an <observation>. The slots that get a proper
-choice panel are: pipeline, protocol, readset, design, pairs. Pass pipeline= and
-protocol= when you know them, so the question can name what it is about. Do NOT
-write out the available options -- they are filled in from this tool's own
-tables, and any list you write would be ignored or, worse, wrong.
+The slots that get a proper choice panel are pipeline, protocol, readset, design
+and pairs. Pass pipeline= and protocol= when you know them, so the question can
+name what it is about. Do NOT write out the available options -- they are filled
+in from this tool's own tables, and any list you write would be ignored or,
+worse, wrong.
 
 For anything with no slot of its own, ask in your own words:
 
@@ -283,17 +289,214 @@ For anything with no slot of its own, ask in your own words:
 ask(question="Which steps should this run -- all of them, or a range?")
 </execute>
 
-When to ask, and when not to:
-- Ask only when the answer changes what you would do and you cannot get it
-  yourself. Reading a file, listing a directory, or running
-  `genpipes <pipeline> --help` is not a question -- do that instead.
-- Never ask for something already stated in the conversation, and never ask the
-  same thing twice. If they declined to answer, proceed with a sensible default
-  and say plainly which one you chose.
-- Ask one thing at a time. Do not stack an ask() next to other code; a block
-  containing anything besides the ask() call will be run as code instead.
-- A question is not approval. Submitting is always gated separately, however
-  many things they have confirmed along the way.
+Their answer comes back as an <observation> and you carry straight on in the
+same turn.
+
+  - One question at a time, and nothing else in the block. A block containing
+    anything besides the ask() call is run as code instead.
+  - Never ask for something already stated in the request, already resolved by
+    the context appended below their message, or already answered earlier in the
+    conversation.
+  - Never ask the same thing twice.
+  - Do not ask permission to submit. Approval is not a fact you are missing; it
+    has its own mechanism.
+  - Look first, then ask what looking could not settle. "Could not settle"
+    includes finding several plausible answers -- that is the case the panel
+    exists for, not a case for picking one.
+
+
+WHEN THEY CANNOT ANSWER
+
+"idk", "not sure", "you pick", "whatever the test data uses" -- these are not
+values. Never record one as a filename, a path, a protocol or a pipeline.
+
+They mean you asked the wrong question, or asked it too early. Recover: say what
+you were trying to establish, look where it could plausibly be, and come back
+with either the answer or a better question. If they named a dataset rather than
+a path -- "the CVMFS test data", "the CIT set" -- that is a location you can
+resolve. Go and resolve it, then tell them what you are using.
+
+If it truly cannot be resolved and it is required, say plainly that the run
+cannot be prepared without it, and stop until they bring it up again. Do not
+guess a readset, a design, a pairs file, a protocol or a pipeline. A guessed
+protocol produces a run that completes successfully and answers a different
+question, which is worse than one that fails.
+
+
+WHEN THE REQUEST IS UNCLEAR
+
+If you cannot tell whether they want to be told something or want something run,
+ask -- one short question, in a <solution>. Never resolve that doubt by
+submitting, and never resolve it by starting a questionnaire.
+
+When they describe a scientific goal rather than naming a pipeline, say what you
+took it to mean before acting on it: "that's dnaseq -t germline_snv -- inherited
+SNVs and small indels". One sentence, and it is the cheapest correction there
+is: seeing it wrong is what makes somebody say so before a generation is spent
+on it.
+
+
+PREPARING A RUN: SETTLE IT BEFORE YOU BUILD IT
+
+Looking things up NARROWS a question. It does not skip it. For each input the
+run needs, in this order -- pipeline, protocol, readset, then whatever that
+protocol also requires (design, or pairs) -- go and look, then:
+
+  exactly one candidate, and    use it, and say plainly which file you used and
+  nothing about it is in doubt  where it came from
+  more than one candidate       ask(slot=...). This is a real question and the
+                                panel is how to put it
+  none found                    say where you looked, then ask(slot=...)
+  they named it outright        use it; do not ask again
+
+Anything they asked for explicitly must actually appear on the command line. If
+they said "steps 1-4", `-s 1-4` is on it. If they said "a new output directory",
+`-o <that directory>` is on it -- creating a directory and writing the script
+into it is not the same as passing it to GenPipes, and a run that quietly writes
+somewhere else is exactly the kind of surprise this tool exists to prevent. If
+you cannot honour something they asked for, say so and ask; do not drop it.
+
+BEFORE YOU PROPOSE A SUBMISSION, ALL OF THIS MUST BE TRUE:
+
+  - the pipeline and protocol are settled
+  - every file the protocol requires is a real path you have confirmed exists,
+    and it is either one they named or one they picked in a panel
+  - everything they explicitly asked for is on the command line
+  - the command was generated with -g and the script exists
+
+If any of it is not true, you are not ready to propose. Ask for the missing
+piece instead -- one thing at a time, through ask(), in the order above. The
+approval box is for deciding whether to SUBMIT a finished command. It is not a
+place to discover that the readset was never chosen, and a box carrying a hole
+in it wastes the one decision you are asking them to make.
+
+
+SUBMITTING IT
+
+Once all of the above holds, generate the script with -g and propose the
+submission in the same turn:
+
+<execute>
+propose_submission("ampliconseq_cit_cmd.sh")
+</execute>
+
+That does not submit. It is intercepted and turned into an approval box showing
+the exact command and the run's name, and that box is the only way they can say
+yes. Approval is typed by them, never inferred, and no prose from either of you
+can stand in for it.
+
+  - Do NOT stop after generating to ask "shall I submit?", and do not say "let
+    me know when you want me to submit". Neither of you can approve anything in
+    prose, and it leaves them nothing to approve -- no box, no run name, no
+    record. It is the one way to make a run unapprovable.
+  - Once the script exists, propose it. If they wanted a script and not a run,
+    they reject it, which costs one keystroke.
+  - Do not print or cat the generated script to prove it worked. The box states
+    what will run, and the file is theirs to read.
+
+
+AT THE GATE
+
+While a run waits for approval, anything they type reaches you rather than the
+scheduler. It may be a change, a question, a correction, or something about
+nothing in particular. Read it for what it actually is:
+
+  a change      "make it steps 1-4", "use the other readset" -- regenerate the
+                command with the change and propose it again.
+  a question    "why did you pick stringtie?", "what will this cost?" -- answer
+                it. Then propose the SAME submission again, unchanged, so the
+                box comes back and the run is still there to approve. Answering
+                without re-proposing leaves them with nothing to say yes to.
+  anything else deal with it, then put the run back in front of them.
+
+A question is not a rejection. Never let a run quietly disappear because they
+asked about it, and never read curiosity as consent.
+
+
+WORKING WITH THEIR FILES
+
+Reading a readset, counting its samples, checking a column, fixing a header,
+renaming something, writing a short script to answer a question about their
+data -- that is the job when they ask for it. Work in the working directory,
+keep it small, and say what you did. The rule against wandering forbids going
+off unasked; it does not forbid doing what was asked.
+
+
+MONITORING
+
+Reading the scheduler is free and ungated: squeue, sacct, GenPipes' own
+log_report, the .o log of a failed job. Use <execute> for those whenever they
+ask how something is going, and answer from what came back rather than from what
+you expect. Their runs are named, and they can type /list, /check <name>,
+/jobs <name> and /diagnose <name> at any time -- mention the one that fits when
+it saves them asking you.
+
+
+RESTRAINT
+
+Do not generate or submit anything nobody asked for. "hi", "thanks", and a
+question about a flag are not requests to build a pipeline. When you are idle,
+be idle.
+"""
+
+
+# The progress checklist, parked. Set PLANS to True to put it back in the
+# prompt -- nothing else needs changing, and display.py's renderer, its parser
+# and their tests are all untouched and still passing.
+#
+# It is off because the block arrives on screen TWICE. display.parse() lifts
+# `1. [ ] ...` lines out of the reply and draws them as the "Plan" block that
+# updates in place, but it does not remove them from the prose it then prints,
+# so the same four stages appear again as raw markdown directly underneath --
+# once rendered, once literal. That is a rendering defect rather than a
+# prompting one: the parser and the passthrough disagree about who owns those
+# lines, and no wording in here can settle it.
+#
+# So this text is kept intact rather than rewritten from memory later. Fixing
+# the double-draw is a display.py job -- parse() has to consume the lines it
+# claims -- and when that is done this goes back on, possibly behind a mode
+# rather than on by default.
+PLANS = False
+
+PLAN_PROTOCOL = """
+
+THE PLAN
+
+For work with several stages -- preparing a run, diagnosing a failure -- open
+with a numbered checklist, exactly this shape, one line each:
+
+    1. [ ] read the ampliconseq step list
+    2. [ ] locate the CIT readset
+    3. [ ] generate the command
+
+Re-emit the whole list at the top of each following turn with the finished
+stages marked [x]. It is drawn as one block that updates in place, so
+re-emitting it costs them nothing and is how they watch progress.
+
+Four to six stages. Each a short verb phrase for an observable stage of the job
+-- not "call squeue", which is mechanics, and not "help the user", which is the
+task restated. Use only [ ] and [x]: no other mark renders, so a stage that
+failed is described in your prose and the list is changed, rather than given a
+symbol of its own.
+
+Do not otherwise restate the plan. Below the list, say the one sentence that
+explains the next action, then take it. Work that is one step needs no plan.
+"""
+
+# Said only while PLANS is off. Stated rather than left unsaid, because A1's
+# prompt trained this habit hard and "no instruction to do it" is not the same
+# as "an instruction not to": the numbered checklist is what a model reaches for
+# unprompted on any multi-step task.
+NO_PLANS = """
+
+NO PROGRESS CHECKLISTS
+
+Do not open with a numbered checklist of stages, and do not re-emit one as you
+go. No "1. [ ] read the step list". Say in one sentence what you are about to
+do, then do it, and say what you found. Numbered lists are still fine when the
+CONTENT is a list -- the steps a pipeline will run, the files you found, options
+they are choosing between. What is not wanted is a running tally of your own
+progress.
 """
 
 
@@ -393,6 +596,19 @@ def _observation_from_the_machine(node):
     return run_and_relabel
 
 
+def _timed(node, kind, telemetry):
+    """Wrap a graph node so its wall time is recorded under `kind`.
+
+    This is where "one full model inference per <execute> block" (or per
+    execute round) becomes a number instead of an impression from reading a
+    transcript -- see AGENT-FIXES.md and genpipe/telemetry.py. A no-op unless
+    telemetry.enabled, so it costs nothing in normal use.
+    """
+    def timed(state):
+        return telemetry.timed(kind, _call, node, state)
+    return timed
+
+
 def _never_prefill(node):
     """Wrap the generate node so the model is never handed its own last word.
 
@@ -422,16 +638,25 @@ class GenpipeA1(A1):
                 "loop only. Run with self_critic=False."
             )
 
-        # 1. Let A1 do its normal work: build the system prompt (injecting
-        #    genpipes.md) and compile its ungated graph into self.app.
+        # 1. Let A1 compile its ungated graph into self.app. Its system prompt
+        #    is built here too and then discarded below -- the nodes are what
+        #    this call is for.
         super().configure(self_critic=False,
                           test_time_scale_round=test_time_scale_round)
 
-        # Biomni supports answering directly with <solution>, but never tells the
-        # model when to prefer it over <execute>. These two append the missing
-        # halves: when to just talk, and how to put a question to the user.
-        self.system_prompt += TALK_PROTOCOL
-        self.system_prompt += ASK_PROTOCOL
+        # 2. Replace A1's prompt outright. See SYSTEM_PROMPT for why appending
+        #    to it stopped being viable: the two documents contradicted each
+        #    other on the plan format, on when to run code, and on whether a
+        #    tool library existed at all.
+        #
+        #    genpipes.md arrives via add_software() -- Biomni files it under
+        #    "software" and calls configure() again -- so it is read back out of
+        #    that registry and appended here as the grammar. Without this it
+        #    would go out with A1's prompt, taking the one document that is
+        #    actually about GenPipes with it.
+        self.system_prompt = (SYSTEM_PROMPT
+                              + (PLAN_PROTOCOL if PLANS else NO_PLANS)
+                              + self._grammar())
         # Who it is talking to. A1's prompt has no notion of a person on the
         # other end, and a conversational agent that cannot use your name is
         # oddly formal -- but one that opens every message with it is worse, so
@@ -440,16 +665,22 @@ class GenpipeA1(A1):
         self.address_user(display.who())
         # 2. Borrow A1's real nodes from the compiled graph. No reimplementation.
         #    Each is wrapped, not replaced: _quiet swallows biomni's debug
-        #    printing ("parsing error...", a traceback per non-zero exit), and the
-        #    other two keep the conversation in a shape the Anthropic API accepts.
-        generate = _quiet(_never_prefill(self.app.nodes["generate"].bound))
-        execute = _quiet(_observation_from_the_machine(_shell_not_python(
-            self.app.nodes["execute"].bound)))
+        #    printing ("parsing error...", a traceback per non-zero exit), the
+        #    other two keep the conversation in a shape the Anthropic API
+        #    accepts, and _timed records how long each actually took (see
+        #    genpipe/telemetry.py) -- a no-op unless telemetry is enabled.
+        generate = _timed(
+            _quiet(_never_prefill(self.app.nodes["generate"].bound)),
+            "generate", self.telemetry)
+        execute = _timed(
+            _quiet(_observation_from_the_machine(_shell_not_python(
+                self.app.nodes["execute"].bound))),
+            "execute", self.telemetry)
 
         # 3. This is a checkpointer from the LangGraph library : the component
         #    Langraph uses to persist a graph's state. The gate pauses with
         #    interrupt(), and a pause can only survive if the graph's state is
-        #    written to disk rather than held in memory. SqliteSaver is LangGraph's 
+        #    written to disk rather than held in memory. SqliteSaver is LangGraph's
         #    disk-backed checkpointer: it writes a snapshot after every graph step
         #    into a SQLite file, tagged by thread_id, so a paused run can be resumed
         #    later, even in a fresh process. One store covers both: the same on-disk
@@ -459,6 +690,18 @@ class GenpipeA1(A1):
             db_path = os.path.join(self.path, "genpipe_checkpoints.sqlite")
             conn = sqlite3.connect(db_path, check_same_thread=False)
             self._gate_checkpointer = SqliteSaver(conn)
+            # Timed in place, once, so every write after every graph step --
+            # not just the ones this file adds -- shows up as "checkpoint" in
+            # telemetry.summary(). A no-op wrapper unless telemetry is enabled.
+            if not getattr(self._gate_checkpointer, "_genpipe_timed", False):
+                original_put = self._gate_checkpointer.put
+                telemetry = self.telemetry
+
+                def _timed_put(*args, **kwargs):
+                    return telemetry.timed("checkpoint", original_put, *args, **kwargs)
+
+                self._gate_checkpointer.put = _timed_put
+                self._gate_checkpointer._genpipe_timed = True
         self.checkpointer = self._gate_checkpointer
 
         # 4. Routing out of generate: identical to A1 except that execute-bound
@@ -551,6 +794,18 @@ class GenpipeA1(A1):
             code = self._extract_pending_code(state)
             reply = interrupt(self._build_proposal(state, code))   # <-- PAUSES here
             if reply.get("approved"):
+                # propose_submission("cmd.sh") is a request, not runnable code:
+                # handing it to the interpreter gets `NameError: name
+                # 'propose_submission' is not defined` and nothing submitted,
+                # having just told the person their run was approved. So the
+                # approved block is rewritten to the command it stood for.
+                #
+                # Rewritten HERE rather than where the box is built, because
+                # this is the only path on which the code is about to actually
+                # run, and it happens after the interrupt: the person approved
+                # the command shown in the box, which is the same string
+                # gate.submission_line() puts in it.
+                self._make_runnable(state, code)
                 state["next_step"] = "execute"                     # let it run
             else:
                 note = reply.get("feedback") or "Adjust the command before resubmitting."
@@ -581,6 +836,42 @@ class GenpipeA1(A1):
 
         self.app = workflow.compile(checkpointer=self.checkpointer)
     
+    def _make_runnable(self, state, code):
+        """Turn an approved propose_submission() into the shell command it means.
+
+        Edits the last message's <execute> block in place, so the execute node --
+        which reads the pending code back out of the message, not from anything
+        passed to it -- sees `#!BASH\\nbash cmd.sh`. A block that was already a
+        real submission (`bash cmd.sh`, chunk_genpipes) is left exactly as it is:
+        it needs no translation, and rewriting it would risk changing what runs
+        after somebody approved what they were shown.
+        """
+        if not gate.proposed_script(code or ""):
+            return
+        line = gate.submission_line(code)
+        for message in reversed(state.get("messages") or []):
+            content = getattr(message, "content", "") or ""
+            if code in content:
+                message.content = content.replace(code, f"\n#!BASH\n{line}\n")
+                return
+
+    def _grammar(self):
+        """genpipes.md, as registered by cli.build_agent's add_software().
+
+        Biomni has no notion of "a document the model should read"; the nearest
+        thing it offers is the software registry, so the grammar is filed there
+        and fished back out here. Returns "" before registration -- configure()
+        runs once at construction, before add_software, and again from inside
+        add_software once the grammar is in place.
+        """
+        entry = (getattr(self, "_custom_software", None) or {}).get("genpipes")
+        text = (entry or {}).get("description") if isinstance(entry, dict) else entry
+        if not text:
+            return ""
+        return ("\n\n\nTHE GENPIPES GRAMMAR\n\nWhat follows is the reference for "
+                "this installation. It is the basis; --help is authoritative on "
+                "anything version-specific.\n\n") + text
+
     def address_user(self, name):
         """Tell the model what to call the person, replacing any earlier name.
 
@@ -605,21 +896,26 @@ class GenpipeA1(A1):
     def _gap_for(self, request):
         """Turn a parsed ask() call into a slots.Gap the caller can render.
 
-        The candidate files are read from the current working directory at the
-        moment the question is asked, not from anything cached at startup. A
-        conversation can run for an hour and a readset can arrive during it.
+        The candidate files are read from the project directory named in what
+        the user just said, at the moment the question is asked, not from
+        anything cached at startup, and never from the process's own working
+        directory (AGENT-FIXES.md defect 1) -- a candidate pulled from wherever
+        this process happens to be running is a fabrication, not a fact about
+        the user's data.
         """
         slot = request.get("slot")
         pipeline = request.get("pipeline")
         protocol = request.get("protocol")
+        task = getattr(self, "user_task", "") or ""
 
         # A model that asks about a protocol without saying whose is common
         # enough to be worth recovering from, and the pipeline is nearly always
         # sitting in what the user just said.
         if slot in ("protocol", "design", "pairs") and not pipeline:
-            pipeline = intake.find_pipeline(getattr(self, "user_task", "") or "")
+            pipeline = intake.find_pipeline(task)
 
-        found = intake.candidates(os.getcwd())
+        named = intake.find_directories(task)
+        found = intake.candidates(named[0] if named else None)
         return slot_table.gap_for(
             slot,
             pipeline=pipeline,
@@ -666,6 +962,17 @@ class GenpipeA1(A1):
         if not hasattr(self, "_registry"):
             self._registry = runs_store.Registry(self.path)
         return self._registry
+
+    @property
+    def telemetry(self):
+        """Call/timing counters for the generate/execute loop -- see
+        genpipe/telemetry.py. Off by default (GENPIPE_TELEMETRY=1 to enable);
+        lazy for the same reason `registry` is: configure() runs during
+        A1.__init__ and again from add_software(), and test_agent_gate.py
+        builds a bare instance with object.__new__, no __init__ at all."""
+        if not hasattr(self, "_telemetry"):
+            self._telemetry = telemetry.Telemetry()
+        return self._telemetry
 
     def track(self, name, job_list_path):
         """Register a run launched outside the agent -- no thread_id, no prior
@@ -796,13 +1103,22 @@ class GenpipeA1(A1):
         control back, and waits however long it waits.
 
         Both are the same LangGraph mechanism. Only the payload differs.
+
+        Timed as one turn in telemetry, from the first stream to the last --
+        including every question answered in place -- because that whole span
+        is what a person waits through between typing a line and seeing a
+        reply.
         """
-        for _ in range(self.MAX_QUESTIONS_PER_TURN):
-            self._stream(payload, config, on_step)
-            value = self._interrupt_value(config)
-            if not (isinstance(value, dict) and value.get("kind") == "ask"):
-                return
-            payload = Command(resume={"answer": self._answer(value)})
+        self.telemetry.start_turn()
+        try:
+            for _ in range(self.MAX_QUESTIONS_PER_TURN):
+                self._stream(payload, config, on_step)
+                value = self._interrupt_value(config)
+                if not (isinstance(value, dict) and value.get("kind") == "ask"):
+                    return
+                payload = Command(resume={"answer": self._answer(value)})
+        finally:
+            self.telemetry.end_turn()
 
     def run(self, prompt, thread_id, on_step=None, name=_UNSET):
         """Add one turn to a conversation and drive it to a stop.
@@ -1034,7 +1350,38 @@ class GenpipeA1(A1):
         self._drive(command, config, on_step)
         if approved:
             self._record_submission(name, started)
-        return self._settle(thread_id, config, held=None if approved else name)
+        status = self._settle(thread_id, config, held=None if approved else name)
+
+        # A run that was NOT approved must still be waiting when this returns.
+        # The turn just went back through generate, and the model was free to
+        # answer in prose -- which is exactly what should happen when the
+        # feedback was a question rather than a change ("why stringtie?"). But a
+        # turn that ends in <solution> ends the graph, so _settle sees "done",
+        # holds nothing, and the run drops off /list: a question asked at the
+        # gate would have silently destroyed the decision it was asking about.
+        #
+        # The prompt tells the model to re-propose after answering, and when it
+        # does, _settle above has already re-held the run and there is nothing to
+        # do here. This is the floor under that instruction, not a substitute for
+        # it: the proposal is stored on the record and is restored unchanged, so
+        # what comes back is the same command they were already looking at.
+        if not approved and (status or {}).get("status") != "paused":
+            self._rehold(name, thread_id, record)
+        return status
+
+    def _rehold(self, name, thread_id, record):
+        """Put a still-undecided run back in the registry after a turn that
+        answered rather than resubmitted. No-op if it is already held."""
+        if self.registry.held_for_thread(thread_id):
+            return
+        proposal = (record or {}).get("proposal")
+        if not proposal:
+            return
+        self.registry.hold(name, thread_id, proposal,
+                           (record or {}).get("cwd") or os.getcwd())
+        display.nothing(
+            f"{name} is still waiting for a decision.",
+            f"/approve {name}   ·   /modify {name} <change>   ·   /reject {name}")
 
     def _history(self, config):
         """Everything already said on this thread, or [] for a new one."""

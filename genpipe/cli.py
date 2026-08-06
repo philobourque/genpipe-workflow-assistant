@@ -729,7 +729,7 @@ def _modify_past(agent, name, record, change=""):
 
 
 def _run_panel(agent, name, proposal, m, offered, candidates, changes,
-               required):
+               required, fork_only=False):
     """The in-place panel. Returns (outcome, row) and mutates `changes`.
 
         ("done",   None)   review what has been changed
@@ -854,6 +854,8 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
             if choices():
                 return "↑↓ · 1-9 to pick · type to narrow · esc closes the row"
             return "type the new value · enter confirms · esc closes the row"
+        if fork_only:
+            return "↑↓ · enter opens a row · esc leaves without creating a new run"
         return ("↑↓ · enter opens a row · esc leaves this run alone, "
                 "changes and all")
 
@@ -883,6 +885,21 @@ def _modify_guided(agent, name, record, fork_only=False):
     proposal = record.get("proposal") or {}
     directory = record.get("workdir") or os.getcwd()
     candidates = intake.candidates(directory)
+
+    # Checked once, outside the loop below: mirror.read()'s emptiness depends
+    # only on the recorded command, which does not change from one pass of
+    # this loop to the next. A command that exists but could not be reliably
+    # tokenised (see mirror.read()'s corruption check) falls back to the
+    # proposal's parsed slots -- degraded, but not silently: this is the one
+    # place that fallback is told apart from "no generation was ever
+    # captured", so the person sees a warning instead of trusting fields that
+    # were reconstructed rather than read.
+    generated = proposal.get("generated")
+    if generated and not mirror.read(generated):
+        display.problem(
+            "The original command could not be read back reliably.",
+            "Showing the fields recorded when it was built instead — "
+            "double-check anything unusual before applying changes.")
 
     picked = None
     changes = {}
@@ -917,9 +934,14 @@ def _modify_guided(agent, name, record, fork_only=False):
                    if line.row in {row for row, _ in rows}]
 
         outcome, row = _run_panel(agent, name, proposal, m, offered,
-                                  candidates, changes, required)
+                                  candidates, changes, required,
+                                  fork_only=fork_only)
         if outcome == "cancel":
-            display.nothing("Left alone.", f"'{name}' is still held.")
+            if fork_only:
+                display.nothing("Nothing created.",
+                                f"'{name}' and its job list are unchanged.")
+            else:
+                display.nothing("Left alone.", f"'{name}' is still held.")
             return
         if outcome == "else":
             try:
@@ -942,7 +964,11 @@ def _modify_guided(agent, name, record, fork_only=False):
             continue
 
         if not changes:
-            display.nothing("Nothing changed.", f"'{name}' is still held.")
+            if fork_only:
+                display.nothing("Nothing changed.",
+                                f"'{name}' and its job list are unchanged.")
+            else:
+                display.nothing("Nothing changed.", f"'{name}' is still held.")
             return
 
         deltas = [(row, modify.current(proposal, row) if row != "name" else name,
@@ -964,7 +990,11 @@ def _modify_guided(agent, name, record, fork_only=False):
         # esc, or a headless caller that answered nothing. Silence is not
         # consent for a change set somebody spent four prompts assembling, but
         # it is not a change either.
-        display.nothing("Left alone.", f"'{name}' is still held.")
+        if fork_only:
+            display.nothing("Nothing created.",
+                            f"'{name}' and its job list are unchanged.")
+        else:
+            display.nothing("Left alone.", f"'{name}' is still held.")
         return
 
     _apply_changes(agent, name, proposal, changes)
@@ -1788,6 +1818,24 @@ def _cmd_where(agent, args):
     ])
 
 
+def _cmd_telemetry(agent, args):
+    """/telemetry -- counts and timings from the generate/execute loop, when
+    GENPIPE_TELEMETRY=1 turned them on. Off by default; see genpipe/telemetry.py."""
+    if not agent.telemetry.enabled:
+        display.nothing("Telemetry is off.",
+                        "Set GENPIPE_TELEMETRY=1 before starting the app to "
+                        "record generate/execute/checkpoint timings.")
+        return
+    summary = agent.telemetry.summary()
+    if not summary:
+        display.nothing("Nothing recorded yet this session.")
+        return
+    rows = [(kind, f"{row['count']} call(s), {row['total']:.2f}s total, "
+                   f"{row['mean']:.2f}s mean")
+            for kind, row in sorted(summary.items())]
+    display.where(rows)
+
+
 def _cmd_help(agent, args):
     display.help_text(help_rows())
 
@@ -1829,6 +1877,7 @@ COMMAND_SPECS = [
     ("track",    "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track),
     ("readset",  "[dir|schema]",       "build a readset file from filenames",     "setup",    _cmd_readset),
     ("where",    "",                   "which directories this is using",         "setup",    _cmd_where),
+    ("telemetry", "",                  "generate/execute/checkpoint timings",     "setup",    _cmd_telemetry),
     ("user",     "[name]",             "show or change what it calls you",        "setup",    _cmd_user),
     ("model",    "[provider [model]]", "show or switch the model behind this",    "setup",    _cmd_model),
     ("key",      "",                   "add or rotate an API key",                "setup",    _cmd_key),
@@ -1902,6 +1951,27 @@ def _panel(gap):
                      note=gap.note, free_text=gap.free_text)
 
 
+def _dispatch_line(agent, line):
+    """Run a slash command. One implementation, shared by every caller that
+    needs to dispatch a typed command."""
+    parts = line[1:].split()
+    if not parts:
+        return
+    cmd, args = _resolve(parts[0].lower()), parts[1:]
+    handler = COMMANDS.get(cmd)
+    if handler is None:
+        print(f"  {display.RED}No such command: {line.split()[0]}{display.RESET}"
+              f"  {display.GREY}(try /help){display.RESET}\n")
+        return
+    try:
+        handler(agent, args)
+    except KeyboardInterrupt:
+        print()
+        display.nothing("Stopped.")
+    except Exception as e:
+        print(f"  {display.RED}{type(e).__name__}: {e}{display.RESET}\n")
+
+
 def _asker(activity):
     """Wrap the panel so the spinner gets out of its way and comes back after.
 
@@ -1926,21 +1996,29 @@ def _conversation_id():
 def _at_the_gate(agent, thread, line):
     """Handle a line typed while this conversation is parked at the gate.
 
-    Returns True when the line was dealt with here. Order matters and is the
-    whole safety property of this function:
+    Returns True when the line was dealt with here. Exactly one thing is decided
+    here rather than by the model, and it is the safety property: an
+    approval-shaped line is REFUSED, with the command that would work. Zero
+    model calls. Approval is typed, never inferred -- no prose may ever cause a
+    submission, and a helpful assistant that reads "looks good" as consent is
+    the exact failure this gate exists to prevent.
 
-      1. An approval-shaped line is REFUSED, with the command that would work.
-         Zero model calls. Approval is typed, never inferred -- no prose may
-         ever cause a submission, and a helpful assistant that reads "looks
-         good" as consent is the exact failure this gate exists to prevent.
-      2. Anything else routes to the /modify path, stating the interpretation
-         first so a misreading is visible while it is still free.
-      3. Two held runs and bare prose is ambiguous. Ask; do not guess.
+    Everything else goes to the agent as feedback and is READ BY THE MODEL.
+    This used to classify first and send every non-approval down /modify, which
+    is why "why did you propose the submission gate without asking me for
+    additional info" came back as a refusal to guess which run was meant: a
+    question was treated as an edit, and then abandoned for ambiguity that did
+    not exist. The thread names the run -- held_for_thread returned it -- so
+    there is nothing to disambiguate, and whether a line is a question, a
+    change, or neither is a reading task, not a keyword test. The prompt tells
+    the model to answer a question and then re-propose the same submission, and
+    agent.resume() re-holds the run if it does not.
 
-    What it must never do is call agent.run(). A held conversation cannot take a
-    normal turn: LangGraph starts a fresh superstep and DISCARDS the pending
+    What this must never do is call agent.run(). A held conversation cannot take
+    a normal turn: LangGraph starts a fresh superstep and DISCARDS the pending
     interrupt, destroying an approval that is still outstanding. That failure is
-    silent -- it looks exactly like it worked.
+    silent -- it looks exactly like it worked. Resuming is not that: it delivers
+    the line into the graph exactly where it stopped.
     """
     waiting = agent.registry.held_for_thread(thread)
     if not waiting:
@@ -1953,17 +2031,7 @@ def _at_the_gate(agent, thread, line):
             f"/approve {name}   ·   nothing has reached the scheduler")
         return True
 
-    held = agent.registry.held()
-    if len(held) > 1:
-        names = ", ".join(r["name"] for r in held)
-        display.problem(
-            "There is more than one run waiting, so I will not guess which "
-            "this is about.",
-            f"/modify <name> {line}   ·   held: {names}")
-        return True
-
-    display.reading_as(name, line)
-    _modify_direct(agent, name, line)
+    _rework(agent, name, line)
     return True
 
 
@@ -2061,123 +2129,107 @@ def _learned_files(line, directory):
     believe the run is complete when genpipes will reject the argument. Uses
     the same resolution intake.brief() already applies to the same line, so
     the two never disagree about whether a named file exists.
+
+    `directory` is the project directory established for this conversation, or
+    None -- never the process's cwd. With no project directory established, an
+    absolute path can still resolve; a bare relative filename cannot, and is
+    correctly left unlearned rather than guessed against wherever the app
+    happens to have been launched from.
     """
     parsed = intake.read(line)
     return {slot: parsed[slot] for slot in ("readset", "design", "pairs")
             if parsed.get(slot) and intake._resolves(parsed[slot], directory)}
 
 
-def _gap_note(state, directory):
-    """What to tell the model about what is still needed, or None once ready.
+def _settled(state, directory):
+    """What earlier turns established, as facts for the model -- or None.
 
-    Built from prep.missing()/prep.ready() -- the same table slots.gaps() uses
-    to drive the offline fake-LLM's question sequence -- rather than left for
-    the model to infer. A fully-specified request is told there is nothing
-    left to ask and to generate now; an underspecified one is told the single
-    next thing to ask about, in slots.gaps()'s order, and nothing else.
+    This is memory, not instruction. It exists because `intake.brief()` parses
+    only the line in front of it, so a protocol named three turns ago is
+    invisible by the time the readset arrives, and being asked twice for
+    something you already said is what makes people go back to writing the
+    command by hand.
 
-    `directory` is still os.getcwd() here, the same as every other candidate
-    lookup in this file. It is the right directory for resolving a RELATIVE
-    PATH THE USER TYPED (that part is fine) but the wrong one for candidate
-    DISCOVERY if a project directory has been established elsewhere in the
-    conversation -- see AGENT-FIXES.md defect 1. Once that lands, thread its
-    project_dir through here instead of defaulting to the cwd.
+    It used to do more: it also computed the single next gap from
+    prep.missing() and told the model that this was "the ONLY thing to ask
+    about right now". That is gone. Which question comes next depends on what
+    the model has already worked out for itself -- it may have resolved the
+    readset from a directory the request named, in which case the gap table's
+    next question is one nobody needs answered. Stating the settled facts and
+    leaving the asking to the model is the whole point of the change; a note
+    that dictated the next question would put the questionnaire back, one
+    indirection further away.
+
+    `directory` is the project directory established so far, or None -- never
+    the process's cwd. See AGENT-FIXES.md defect 1.
     """
-    if not state.pipeline:
-        return None
-    candidates = intake.candidates(directory)
-    gap = prep.missing(state, candidates)
-
-    lines = [f"The user is preparing a {state.pipeline} run."]
+    lines = []
+    if state.pipeline:
+        lines.append(f"Pipeline: {state.pipeline}.")
+    if state.described:
+        lines.append(f"Understood as: {state.described}.")
+    if state.project_dir:
+        lines.append(f"Project directory: {state.project_dir}. Their data is "
+                     f"here; do not look anywhere else for it.")
     if state.protocol:
-        lines.append(f"Protocol: -t {state.protocol}. Settled -- do not ask "
-                     f"for it again.")
+        lines.append(f"Protocol: -t {state.protocol}.")
     for label, value in (("readset", state.readset), ("design", state.design),
                          ("pairs", state.pairs)):
         if value:
-            lines.append(f"{label.capitalize()}: {value}. Settled -- do not "
-                         f"ask for it again.")
-
-    if gap is None:
-        lines.append("Everything required is settled. Do not ask about the "
-                     "step range, cluster config or output directory -- every "
-                     "step is the default and the cluster ini for this "
-                     "machine is not a decision. Generate the command now.")
-    else:
-        lines.append(f"Still needed, and the ONLY thing to ask about right "
-                     f"now: {gap.question}")
-    return "\n".join(lines)
+            lines.append(f"{label.capitalize()}: {value}.")
+    if not lines:
+        return None
+    return ("Settled earlier in this conversation. Do not ask about any of it "
+            "again:\n" + "\n".join(f"- {line}" for line in lines))
 
 
-def _preparing(agent, state, line):
-    """Decide whether this line is the beginning of a run, and say so once.
+def _track(state, line):
+    """Record what this line settles, and return (state, facts-for-the-model).
 
-    Returns (state, extra) -- the carried preparation and an extra context block
-    for the model, or None. `state` is a prep.Preparation that persists across
-    turns: forgetting what was already settled is the single most damaging thing
-    this flow could do, because being asked twice for a readset you already
-    named is what makes people go back to writing the command by hand.
+    All that is left of what used to be _preparing(). The classification it did
+    -- run, question, or ambiguous, decided by keyword tables over the line --
+    is gone, along with the choice panel it raised when it could not tell and
+    the `Preparing run...` header it printed when it could. Reading intent is
+    the model's job now, and it is better at it than a list of opening words:
+    "run" appears in "how do I run dnaseq?", and a person who says "a quick
+    AmpliconSeq test on the CIT data" has stated an intention no keyword table
+    recognises.
 
-    Three outcomes:
+    What survives is the part that was never a guess: parsing a pipeline, a
+    protocol, a directory or a filename out of a sentence that plainly contains
+    one, and remembering it across turns. `state` persists for the whole
+    conversation and is never unset -- a value resolved stays resolved unless a
+    later turn gives a different one.
 
-      already preparing   Stay in it. Learn whatever this line settled --
-                          pipeline, protocol, and now readset/design/pairs
-                          too -- and say what is still needed, from
-                          prep.missing(), not from the model's own judgement.
-      ambiguous           One short clarification, asked before a model call is
-                          spent either way. Not a guess in either direction:
-                          guessing "question" wastes their time, guessing "run"
-                          starts spending it.
-      a run               Enter it, and tell the model what the scientific
-                          description was understood to mean so it does not ask
-                          again for something already said in other words.
+    Files are learned only if they resolve on disk (see _learned_files). A name
+    that is not there is left unlearned so the model finds out and asks, rather
+    than carrying a filename genpipes will reject.
     """
-    intent = prep.intent(line)
+    # A directory named right now wins: they are telling us where today's data
+    # is. Otherwise whatever was established earlier stands. Neither ever falls
+    # back to the process's own cwd -- see AGENT-FIXES.md defect 1.
+    named_dirs = intake.find_directories(line)
+    if named_dirs:
+        state.learn(project_dir=named_dirs[0])
+    directory = state.project_dir
+
     found = prep.goal(line)
-    directory = os.getcwd()
-
-    if state.active:
-        if found:
-            state.learn(pipeline=found.pipeline, protocol=found.protocol,
-                        described=found.described)
-        state.learn(**_learned_files(line, directory))
-        return state, _gap_note(state, directory)
-
-    if intent == prep.QUESTION:
-        return state, None
-
-    if intent == prep.AMBIGUOUS:
-        answer = ui.choose(
-            prep.CLARIFY,
-            [slots.Option("talk", "help me choose the analysis"),
-             slots.Option("run", "prepare the run")],
-            free_text=False)
-        if answer != "run":
-            return state, None
-
-    state.active = True
     if found:
         state.learn(pipeline=found.pipeline, protocol=found.protocol,
                     described=found.described)
+    state.learn(pipeline=intake.find_pipeline(line))
+    state.learn(protocol=intake.find_protocol(line, state.pipeline))
     state.learn(**_learned_files(line, directory))
-
-    print(f"  {display.GREEN}●{display.RESET} {display.BOLD}Preparing run…"
-          f"{display.RESET}")
-    summary = prep.summary(state)
-    if summary:
-        print(f"    {display.DIM}{summary}{display.RESET}")
-    print()
-
-    return state, _gap_note(state, directory)
+    return state, _settled(state, directory)
 
 
-def _briefed(line, already_sent):
+def _briefed(line, already_sent, directory=None):
     """The line to send the agent, plus the directory brief that went with it.
 
     Every turn is briefed now, not just the opening one, and the change came from
     a real failure. The request "run rnaseq_light on readset.rnaseq.txt" arrived
     third in a conversation, so it carried no brief; the model had never been told
-    what was in the working directory, took the filename on trust, and got
+    what was in the project directory, took the filename on trust, and got
     `can't open 'readset.rnaseq.txt'` back. Its next move was `find / -iname
     readset.rnaseq.txt`, which is the wrong answer to the right question.
 
@@ -2186,8 +2238,14 @@ def _briefed(line, already_sent):
     brief is deduplicated instead of rationed: an unchanged context block is
     dropped and only the line is sent, and a readset that appears in the directory
     an hour into the conversation is mentioned once, when it appears.
+
+    `directory` is the project directory established so far in this
+    conversation (`prep.Preparation.project_dir`), or None. Never the process's
+    cwd -- intake.brief() discovers nothing when it has nowhere established to
+    look, rather than describing whatever happens to be on the floor where the
+    app was launched (AGENT-FIXES.md defect 1).
     """
-    briefed = intake.brief(line, os.getcwd())
+    briefed = intake.brief(line, directory)
     if intake.CONTEXT_MARK not in briefed:
         return line, already_sent
     context = briefed.split(intake.CONTEXT_MARK, 1)[1].strip()
@@ -2250,7 +2308,7 @@ def _repl(agent):
             parts = line[1:].split()
             if not parts:
                 continue
-            cmd, args = _resolve(parts[0].lower()), parts[1:]
+            cmd = _resolve(parts[0].lower())
             if cmd in ("exit", "quit"):
                 break
             if cmd == "new":
@@ -2259,35 +2317,24 @@ def _repl(agent):
                 preparation = prep.Preparation()
                 display.fresh(agent.pending())
                 continue
-            handler = COMMANDS.get(cmd)
-            if handler is None:
-                print(f"  {display.RED}No such command: {line.split()[0]}{display.RESET}"
-                      f"  {display.GREY}(try /help){display.RESET}\n")
-                continue
-            try:
-                handler(agent, args)
-            except KeyboardInterrupt:
-                # A command interrupted mid-flight -- a panel escaped, a monitor
-                # stopped -- returns to the prompt. Without this it propagates
-                # out of _repl and ends the session, which is how Ctrl+C came to
-                # mean two different things depending on when you pressed it.
-                print()
-                display.nothing("Stopped.")
-            except Exception as e:
-                print(f"  {display.RED}{type(e).__name__}: {e}{display.RESET}\n")
+            # Ctrl+C inside a command -- a panel escaped, a monitor stopped --
+            # returns to the prompt rather than ending the session; that is
+            # _dispatch_line's doing, and without it Ctrl+C would mean two
+            # different things depending on when it was pressed.
+            _dispatch_line(agent, line)
             continue
 
         try:
             # A conversation parked at the gate is not preparing anything: the
-            # run is already built and this line is a decision about it. Asking
-            # "would you like help choosing the analysis, or should I prepare
-            # the run?" in front of a HOLD box would be absurd, and the brief
-            # would be a wasted directory listing.
+            # run is already built and this line is a decision about it. The
+            # brief would be a wasted directory listing, and _at_the_gate --
+            # reached through _turn -- resumes the graph rather than starting a
+            # fresh one.
             if agent.registry.held_for_thread(thread):
                 extra = None
                 _turn(agent, thread, line, raw=line)
                 continue
-            preparation, extra = _preparing(agent, preparation, line)
+            preparation, extra = _track(preparation, line)
         except (EOFError, KeyboardInterrupt):
             print()
             continue
@@ -2296,18 +2343,17 @@ def _repl(agent):
             extra = None
 
         try:
-            text, context = _briefed(line, context)
+            text, context = _briefed(line, context, preparation.project_dir)
         except Exception as e:
             display.problem(f"{type(e).__name__}: {e}")
             text = line
         if extra:
             text = f"{text}\n\n{intake.CONTEXT_MARK}\n{extra}\n"
 
-        _turn(agent, thread, text, raw=line,
-              label="preparing the run" if preparation.active else "thinking")
-        # A run reaching the gate is the end of preparing it. Leaving the state
-        # set would make the next question in the same conversation arrive under
-        # a "Preparing run…" heading that no longer means anything.
+        _turn(agent, thread, text, raw=line)
+        # A run reaching the gate is the end of preparing it: what was settled
+        # belongs to that run, and carrying it into the next question would have
+        # the following turn briefed with a finished run's readset.
         if agent.registry.held_for_thread(thread):
             preparation = prep.Preparation()
 
@@ -2361,18 +2407,27 @@ def main(argv=None):
     agent = build_agent()
     if fake_llm:
         agent.llm = fakecluster.DevLLM()
-    # Confirm readiness right before the command loop takes over -- see
-    # display.ready()'s docstring for why this matters.
-    display.ready(os.environ.get("GENPIPE_LLM_SOURCE", DEFAULT_SOURCE),
-                  os.environ.get("GENPIPE_LLM_MODEL", DEFAULT_MODEL),
-                  fake=" + ".join(notes) if notes else None)
-    # A run left parked at the gate in an earlier session is the one thing that
-    # must not wait to be asked about: its name lived only in that session's
-    # scrollback, and without this the decision is simply lost.
-    # Read before it is written, or the session would always report "nothing
-    # since you were last here" -- the mark being set on the way in.
-    _seen = agent.registry.seen_at()
-    display.pending(agent.pending(), since=agent.registry.unseen(), seen=_seen)
+    # The readiness line printed here. It existed because the prompt used to
+    # follow a banner and nothing else, and looked like a dead end; welcome()
+    # now does that job, and the banner already states the model.
+    #
+    # It also carried the dev-mode warning, and that is the part with teeth:
+    # `notes` says the cluster, or the model, or both, are simulated. Nothing on
+    # screen says so any more. The banner is still the honest record of which
+    # model is configured, but a fake CLUSTER is now invisible -- a submission
+    # that touched nothing looks exactly like one that did. Restore this call to
+    # get it back.
+    _ = notes
+    # The startup status block used to print here -- held runs, and runs whose
+    # outcome nobody had looked at. It is gone from the opening screen: the
+    # counts were of accumulated testing rather than of anything anybody was
+    # about to act on, and they sat between the banner and the prompt, which is
+    # the most expensive space on the screen. /list and /check all answer both
+    # questions on demand, and the welcome block below names them.
+    #
+    # display.pending still exists and is still tested; nothing calls it at
+    # startup. The visit is still recorded, so "unseen since you were last
+    # here" stays meaningful for whatever asks later.
     agent.registry.mark_seen()
     # Environment problems that only surface at submit time, surfaced now --
     # blockers only.
