@@ -110,7 +110,7 @@ class App:
             self.stream.feed(text)
             self.scrollback += text
 
-    def wait_for(self, needle, timeout=90):
+    def wait_for(self, needle, timeout=90, since=None):
         """Pump until `needle` has been emitted. Returns whether it was.
 
         Everything here is timing-dependent by nature, so waiting on content is
@@ -118,11 +118,20 @@ class App:
         the suite slow, and usually both. Matched against the scrollback rather
         than the viewport, so a marker that has already scrolled past still
         counts as having appeared.
+
+        `since` is a mark taken from len(emitted()), and only output after it
+        counts. Pass one whenever the needle is something the app could have
+        said before, which is any exchange this suite performs twice. Without
+        it the wait is satisfied instantly by the FIRST occurrence, and every
+        keystroke meant for the second exchange is typed into whatever is
+        actually on screen at the time -- which is how a request that reached
+        the gate perfectly well the first time appeared to hang the second.
         """
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             self.pump(0.3)
-            if needle in self.emitted():
+            seen = self.emitted()
+            if needle in (seen if since is None else seen[since:]):
                 return True
         return False
 
@@ -165,6 +174,35 @@ class App:
                 os.close(self.master)
             except OSError:
                 pass
+
+
+# The slot questions this suite's request can provoke, in the order the agent
+# asks them, with the wording owned by slots.py. Kept as a pair rather than
+# inlined twice, because the same request is made twice and the two copies had
+# already drifted once.
+SLOT_PANELS = ("Which readset file", "needs a design file")
+
+
+def _answer_slot_panels(app, since, timeout=45):
+    """Answer whatever slot panels the agent opens, and say how many it did.
+
+    Conditional on purpose. Which questions get asked is the model's decision
+    now -- there is no panel loop putting them on screen on a schedule -- so a
+    suite that REQUIRES a particular question is asserting the old
+    deterministic behaviour under a new name. What the caller checks is the
+    outcome: the run reaches the gate, and its name does not collide.
+
+    Answered with a digit and no Enter: with nine or fewer rows a digit selects
+    immediately, so a trailing newline would leak into whatever prompt comes
+    next.
+    """
+    answered = 0
+    for needle in SLOT_PANELS:
+        if not app.wait_for(needle, timeout=timeout, since=since):
+            break
+        app.send("1")
+        answered += 1
+    return answered
 
 
 def main():
@@ -267,20 +305,24 @@ def main():
         # looks where the request points, never at cwd on its own -- so the
         # seeded readset/design here have to be pointed at the same way a real
         # request would point at them.
+        asked = len(app.emitted())
         app.line(f"run rnaseq stringtie steps 1-5, everything is in {workdir}")
-        # Two panels stand between the request and the name prompt now: the
-        # readset and the design, neither of which this request names by
-        # FILENAME. Answering them with the seeded files keeps the run name --
-        # and therefore every assertion below -- the same as before intake
-        # existed.
+        # The request names a directory but no FILENAMES, so the agent has a
+        # real question to ask about the readset and the design -- see
+        # slots.py, which supplies the wording, and agent.py's resolution
+        # table, which decides that two candidates is a question and one is
+        # not. Answering with the seeded files keeps the run name, and
+        # therefore every assertion below, the same.
+        #
+        # Whether it asks at all is the model's call now, not a panel loop's,
+        # so the answers are conditional. What is asserted is the gate, which
+        # it must reach either way.
         # send(), not line(): with nine or fewer rows a digit selects
         # immediately, so a trailing Enter would leak into whatever prompt comes
         # next -- which is the name prompt, whose suggestion is pre-filled.
-        app.wait_for("Which readset file", timeout=30)
-        app.send("1")
-        app.wait_for("needs a design file", timeout=30)
-        app.send("1")
-        r.check("reaches the gate", app.wait_for("HOLD", timeout=120),
+        _answer_slot_panels(app, since=asked)
+        r.check("reaches the gate", app.wait_for("HOLD", timeout=120,
+                                                 since=asked),
                 app.text()[-800:])
         # Named here and only here, from what the run turned out to BE. Nobody
         # is asked: a name is invented before anyone has seen what they are
@@ -427,26 +469,20 @@ def main():
         # A fresh Preparation started for this run (the previous one reached
         # the gate, which resets it -- see cli._repl), so the project
         # directory has to be named again; it is never picked up from cwd.
-        app.line(f"run rnaseq stringtie steps 1-5, everything is in {workdir}")
-        # Two panels stand between the request and the name prompt now: the
-        # readset and the design, neither of which this request names by
-        # FILENAME. Answering them with the seeded files keeps the run name --
-        # and therefore every assertion below -- the same as before intake
-        # existed.
-        # send(), not line(): with nine or fewer rows a digit selects
-        # immediately, so a trailing Enter would leak into the next prompt.
-        app.wait_for("Which readset file", timeout=30)
-        app.send("1")
-        app.wait_for("needs a design file", timeout=30)
-        app.send("1")
+        #
+        # Every wait below is marked, and that is the whole reason this section
+        # used to fail. It is the SAME request as the one above, so every
+        # needle in it -- the readset question, the design question, HOLD --
+        # was already sitting in the scrollback from the first time round. An
+        # unmarked wait_for matched those instantly and returned without
+        # waiting for anything, so the two answering keystrokes were typed at
+        # an empty prompt while the agent was still working, and the run they
+        # were meant for never got them.
         mark = len(app.emitted())
-        reached = False
-        for _ in range(60):
-            app.pump(2.0)
-            if "HOLD" in app.emitted()[mark:]:
-                reached = True
-                break
-        r.check("the second run also reaches the gate", reached,
+        app.line(f"run rnaseq stringtie steps 1-5, everything is in {workdir}")
+        _answer_slot_panels(app, since=mark)
+        r.check("the second run also reaches the gate",
+                app.wait_for("HOLD", timeout=120, since=mark),
                 app.text()[-800:])
         # A name has to identify exactly one run, because it is what /approve,
         # /check and /diagnose are given. The name is derived from the command, so a
