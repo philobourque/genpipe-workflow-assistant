@@ -1625,6 +1625,9 @@ _CAUSE_NAME_W = 34
 # and runs.BROKE_STATES, which is two literals that have to be edited together
 # forever and will not be. runs.py is stdlib-only, so this costs nothing.
 from .runs import BAD_STATES as _BAD, BROKE_STATES as _BROKE  # noqa: E402
+from .runs import (HELD_BUCKET, ACTIVE_BUCKET, ATTENTION_BUCKET,           # noqa: E402
+                   FINISHED_BUCKET, UNAVAILABLE_BUCKET, CANCELLED_TAG,
+                   list_bucket, list_line, list_tag)
 
 _ORDER = ["COMPLETED", "RUNNING", "PENDING", "FAILED", "TIMEOUT",
           "CANCELLED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED",
@@ -1960,54 +1963,126 @@ def _tag(record):
     return _STATUS_TAG.get(record.get("status"), lambda: f"{DIM}?{RESET}")()
 
 
-def _snapshot(record):
-    """The cached result of the last /check, if there was one.
+_TAG_COLOUR = {
+    HELD_BUCKET: RED,
+    ACTIVE_BUCKET: GREEN,
+    ATTENTION_BUCKET: RED,
+    FINISHED_BUCKET: DIM,
+    UNAVAILABLE_BUCKET: GREY,
+}
 
-    Explicitly labelled with when it was taken. A stale number presented as
-    current is worse than no number, and this one is deliberately not refreshed
-    on every /list -- see Registry.remember_check.
+# Held first -- it is the one state waiting on a person to make a decision.
+# Live and needs attention next, because they describe something actually
+# happening right now; completed and status unavailable are, in different
+# ways, both "nothing to do here". The rows are one flat list, so this is a
+# sort order rather than a set of headings: a run's state is on its own row,
+# where the name is, and you never have to look up the screen to find out
+# which section you are reading.
+_SECTION_ORDER = [HELD_BUCKET, ACTIVE_BUCKET, ATTENTION_BUCKET,
+                  FINISHED_BUCKET, UNAVAILABLE_BUCKET]
+
+
+def _finished_line(status):
+    """What a terminal run's row says after its tag.
+
+    Never a completion timestamp. sacct is asked for Start, not End, so the
+    moment a run actually finished is not a thing this tool knows -- and a
+    listing that prints today's date next to a run that ended on Sunday has
+    invented the one fact somebody would quote back. The job tally is what we
+    genuinely resolved, so the job tally is what is shown.
+    """
+    if status is None:
+        return "no jobs — everything was already up to date"
+    if not status.total and not status.counts:
+        return "no jobs in the list"
+    return list_line(status)
+
+
+def _unavailable_line(record):
+    """The last thing that WAS known about a run we could not resolve, or
+    nothing at all.
+
+    The row's tag already says the status is unavailable, so this line owes
+    the one thing the tag cannot carry: what the scheduler said the last time
+    it answered. See Registry.remember_check -- a failed query never
+    overwrites a valid cached verdict, so there is usually something here.
     """
     last = record.get("last_check")
     if not last:
-        return None
+        return "nothing known about it yet"
     at = (last.get("at") or "").replace("T", " ")[5:16]
-    return f"{last.get('verdict', '?')}  {GREY}(as of {at}){RESET}"
+    return f"last known: {last.get('verdict', '?')} (as of {at})"
 
 
-def run_list(records):
-    """/list -- runs still worth acting on, held ones first.
+def run_list(rows):
+    """/list -- every run still worth acting on, one row each, tagged.
 
-    Held runs sort to the top because they are the only entries that are waiting
-    on the person reading the list.
+    `rows` is runs_store.resolve_all()'s own shape -- [(record, RunStatus or
+    None), ...] -- so the caller (agent.submissions()) makes the one batched
+    scheduler call and this function only renders what it found.
+    list_bucket()/list_tag() are the single source of truth for what a run's
+    state is; this function never re-derives that from a record's raw fields.
+    In particular the tag is never the registry's own `status`, which says
+    "submitted" about a run that failed three days ago.
+
+    One flat list, sorted by state rather than broken into headed sections.
+    Every row carries its own tag, so a name and its state are read together
+    in one line instead of a name here and a heading somewhere above it. At
+    most one secondary line (the job_list filename), and the actions stated
+    ONCE at the bottom rather than repeated under every row.
     """
-    order = {"held": 0, "submitted": 1}
-    records = sorted(records, key=lambda r: (order.get(r.get("status"), 2),
-                                            r.get("submitted_at") or r.get("held_at") or ""))
+    buckets = {b: [] for b in _SECTION_ORDER}
+    for record, status in rows:
+        buckets[list_bucket(record, status)].append((record, status))
+    for entries in buckets.values():
+        entries.sort(key=lambda rs: rs[0].get("submitted_at")
+                                    or rs[0].get("held_at") or "")
+
     print()
-    for r in records:
-        print(f"  {DIM}\u258c{RESET} {BOLD}{r['name']}{RESET}  {DIM}\u00b7{RESET}  {_tag(r)}")
-        if r["status"] == "held":
-            cmd = ((r.get("proposal") or {}).get("command") or "").strip()
-            if cmd:
-                print(f"  {DIM}\u258c{RESET}   {WHITE}{cmd}{RESET}")
-            print(f"  {DIM}\u258c{RESET}   {GREY}awaiting your approval{RESET}"
-                  f"   {DIM}/approve \u00b7 /modify \u00b7 /reject{RESET}")
-        else:
-            snap = _snapshot(r)
-            if snap:
-                print(f"  {DIM}\u258c{RESET}   {snap}")
-            if r.get("job_list"):
-                print(f"  {DIM}\u258c   {os.path.basename(r['job_list'])}{RESET}")
-            else:
-                # A submission where every step was already up to date. Said
-                # plainly, because "no jobs" reads as a failure otherwise.
-                print(f"  {DIM}\u258c{RESET}   {GREY}no jobs \u2014 everything was already "
-                      f"up to date{RESET}")
-    print(f"  {DIM}\u258c{RESET}")
-    print(f"  {DIM}\u258c   /check all \u00b7 /check <name> \u00b7 /jobs <name> \u00b7 "
-          f"/diagnose <name>{RESET}")
-    print(f"  {DIM}\u258c   /sort to hide rows \u00b7 /scan <path> to adopt runs "
-          f"already on disk{RESET}")
+    for bucket in _SECTION_ORDER:
+        for record, status in buckets[bucket]:
+            tag = list_tag(record, status)
+            colour = _TAG_COLOUR[bucket]
+            # Only the tag is coloured, and only red where a person is
+            # actually needed -- held and needs attention. A listing where
+            # every row is lit up says nothing about which row to read first.
+            emphasis = BOLD if bucket in (HELD_BUCKET, ATTENTION_BUCKET) else ""
+            print(f"  {DIM}\u258c{RESET} {BOLD}{record['name']}{RESET}"
+                  f"  {DIM}\u00b7{RESET}  {colour}{emphasis}{tag}{RESET}")
+            detail = (None if bucket == HELD_BUCKET else
+                      _unavailable_line(record) if bucket == UNAVAILABLE_BUCKET else
+                      _finished_line(status) if bucket == FINISHED_BUCKET else
+                      list_line(status))
+            if detail:
+                print(f"  {DIM}\u2502{RESET}   {GREY}{detail}{RESET}")
+            # Never for a held run -- nothing has been launched, so there is
+            # no job_list yet. For everything else, preserved whenever one
+            # exists: it is what connects this name back to the actual
+            # GenPipes execution on disk.
+            if bucket != HELD_BUCKET and record.get("job_list"):
+                print(f"  {DIM}\u2502   {os.path.basename(record['job_list'])}{RESET}")
+
+    # Provenance for the whole listing rather than a timestamp per row: every
+    # row above was resolved by the same batched scheduler call, a moment ago.
+    at = next((s.at for _, s in rows if s is not None and s.at), None)
+    if at:
+        print(f"  {DIM}\u258c{RESET}")
+        print(f"  {DIM}\u258c{RESET}   {GREY}states read from the scheduler at "
+              f"{at}{RESET}")
+
+    print()
+    print(f"  {BOLD}Actions{RESET}")
+    print()
+    for cmd, args, note in (
+        ("/approve", "<name>", "launch a run awaiting approval"),
+        ("/modify", "<name>", "edit a run before launch"),
+        ("/reject", "<name>", "discard a run before launch"),
+        ("/check", "<name>", "refresh a launched run"),
+        ("/jobs", "<name>", "inspect its jobs"),
+        ("/diagnose", "<name>", "investigate a problem"),
+        ("/scan", "<path>", "adopt runs already on disk"),
+    ):
+        print(f"    {DIM}{cmd} {args:<10}{RESET}  {GREY}{note}{RESET}")
     print()
 
 
@@ -2506,19 +2581,27 @@ def no_step_list(pipeline, protocol):
     print()
 
 
-def forking_from(name, status):
+def forking_from(name, phrase):
     """Said before a /modify on a run that is not held, so the fork is expected.
 
     Somebody typing `/modify pouletrun` on a finished run is asking to change
     that run, and what they are about to get is a different one. Saying so
     first turns a surprise into an answer -- and it is the honest framing
     anyway: the original is not being edited, it is being copied from.
+
+    `phrase` is the run's actual lifecycle state -- "live", "needs attention",
+    "completed", "status unavailable" -- the same words /list uses (see
+    runs.list_bucket()), never the raw registry status. "submitted" is true of
+    every launched run whatever it is doing right now, so printing it here
+    says nothing a person could act on.
     """
     print()
     print(f"  {DIM}▌{RESET} {BOLD}{name}{RESET}  {DIM}·{RESET}  "
-          f"{DIM}{status}, so this makes a new run{RESET}")
-    print(f"  {DIM}▌{RESET}   {GREY}its name is tied to a job list and cannot "
-          f"be rewritten{RESET}")
+          f"{DIM}{phrase}{RESET}")
+    print(f"  {DIM}▌{RESET}   {GREY}already launched — changes will create a "
+          f"new run{RESET}")
+    print(f"  {DIM}▌{RESET}   {GREY}the original run and job list will remain "
+          f"unchanged{RESET}")
     print()
 
 

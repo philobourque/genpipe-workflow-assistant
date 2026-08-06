@@ -685,13 +685,35 @@ class GenpipeA1(A1):
         A run whose job_list has vanished is pruned first, silently -- see
         history() to find it anyway. Held runs are listed even though nothing of
         theirs is on the scheduler yet, because a pending approval is the most
-        actionable thing this tool can be holding."""
+        actionable thing this tool can be holding.
+
+        One batched scheduler round-trip (runs_store.resolve_all(), the same
+        call /check all makes) covers every launched run, so LIVE means
+        "queued or running right now" rather than whatever a stale cached
+        verdict happened to say last time somebody typed /check. Held runs
+        cost nothing here -- resolve_all() never builds a manifest for one, so
+        there is nothing of theirs for the scheduler query to include.
+
+        A successful resolution is cached the same way /check all caches one,
+        so /check <name> benefits too. A run the scheduler could not be
+        reached for is NOT cached over top of whatever was there before --
+        losing a real, still-valid last known verdict to a transient query
+        failure would be a worse outcome than the query failing in the first
+        place.
+        """
         records = self.registry.live()
         if not records:
             display.nothing("No runs recorded yet.",
                             "Describe a pipeline in plain English to start one.")
             return
-        display.run_list(records)
+        rows = runs_store.resolve_all(records)
+        for record, status in rows:
+            if (status is not None and status.total
+                    and status.source != "unavailable"):
+                self.registry.remember_check(record["name"], status.counts,
+                                             status.total, status.verdict)
+                self.registry.remember_reasons(record["name"], status.reasons)
+        display.run_list(rows)
 
     def history(self):
         """List every recorded run, live and gone, newest first. Unlike

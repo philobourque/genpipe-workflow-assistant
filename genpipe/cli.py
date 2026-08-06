@@ -697,7 +697,13 @@ def _modify_past(agent, name, record, change=""):
     restricted: applying to the original is not on the table.
     """
     proposal = record.get("proposal") or {}
-    display.forking_from(name, record["status"])
+    # The run's ACTUAL lifecycle state, not the raw registry status -- "live"
+    # is reserved for a run that currently has queued or running jobs (see
+    # runs.list_tag(), the same words /list tags its rows with), and a launched
+    # run sitting here is exactly as likely to be finished, failing, or
+    # unreachable as it is to still be running.
+    status = runs_store.resolve(record) if record.get("job_list") else None
+    display.forking_from(name, runs_store.list_tag(record, status))
     if not change:
         _modify_guided(agent, name, record, fork_only=True)
         return

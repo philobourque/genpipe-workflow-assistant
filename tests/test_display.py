@@ -162,31 +162,120 @@ def main():
         r.contains(f"offering {cmd}", out, cmd)
 
     # ---------------------------------------------------------------- #
-    r.section("/list distinguishes held from live")
-    records = [
-        {"name": "waiting", "status": "held", "held_at": "2026-07-25T09:00:00",
-         "submitted_at": None, "job_list": None,
-         "proposal": {"command": "bash cmd.sh"}},
-        {"name": "running-one", "status": "submitted", "held_at": None,
-         "submitted_at": "2026-07-25T10:00:00",
-         "job_list": "/s/job_output/RnaSeq.stringtie.job_list.T1",
-         "proposal": None,
-         "last_check": {"at": "2026-07-25T10:30:00", "verdict": "6 running",
-                        "counts": {}, "total": 15}},
-        {"name": "nothing-to-do", "status": "submitted", "held_at": None,
-         "submitted_at": "2026-07-25T11:00:00", "job_list": None,
-         "proposal": None},
-    ]
-    out = drawn(display.run_list, records)
-    r.contains("the held run is marked held", out, "held")
-    r.contains("with what it is waiting for", out, "awaiting your approval")
-    r.check("and it sorts first, because it needs a person",
-            out.index("waiting") < out.index("running-one"))
-    r.contains("a live run is marked live", out, "live")
-    r.contains("with its cached verdict", out, "6 running")
-    r.contains("labelled as a snapshot, not live truth", out, "as of")
-    r.contains("a zero-job run says so plainly", out, "already")
-    r.contains("and the next commands are offered", out, "/diagnose")
+    r.section("/list tags each row with its lifecycle state, not its raw status")
+    # rows mirrors runs_store.resolve_all()'s own shape -- [(record, RunStatus
+    # or None), ...] -- since that is what agent.submissions() now hands to
+    # display.run_list() after its one batched scheduler call.
+    held = {"name": "waiting", "status": "held", "held_at": "2026-07-25T09:00:00",
+            "submitted_at": None, "job_list": None,
+            "proposal": {"command": "bash cmd.sh"}}
+    running_record = {"name": "running-one", "status": "submitted", "held_at": None,
+                      "submitted_at": "2026-07-25T10:00:00",
+                      "job_list": "/s/job_output/RnaSeq.stringtie.job_list.T1"}
+    running_status = runs.RunStatus(
+        counts={"RUNNING": 6, "COMPLETED": 9}, total=15, resolved=15,
+        unknown=0, finished=False, verdict="6 running", doomed=0,
+        source="sacct", at="09:15")
+    mixed_record = {"name": "half-broken", "status": "submitted", "held_at": None,
+                    "submitted_at": "2026-07-25T09:30:00",
+                    "job_list": "/s/job_output/DnaSeq.job_list.T2"}
+    mixed_status = runs.RunStatus(
+        counts={"FAILED": 3, "RUNNING": 2}, total=5, resolved=5, unknown=0,
+        finished=False, verdict="3 need attention", doomed=0, source="sacct")
+    dead_record = {"name": "fully-dead", "status": "submitted", "held_at": None,
+                   "submitted_at": "2026-07-24T09:00:00",
+                   "job_list": "/s/job_output/DnaSeq.job_list.T3"}
+    dead_status = runs.RunStatus(
+        counts={"FAILED": 2}, total=2, resolved=2, unknown=0, finished=True,
+        verdict="failed, nothing still running", doomed=0, source="sacct")
+    finished_record = {"name": "all-done", "status": "submitted", "held_at": None,
+                       "submitted_at": "2026-07-23T09:00:00",
+                       "job_list": "/s/job_output/RnaSeq.job_list.T4"}
+    finished_status = runs.RunStatus(
+        counts={"COMPLETED": 10}, total=10, resolved=10, unknown=0,
+        finished=True, verdict="complete", doomed=0, source="sacct")
+    up_to_date = {"name": "nothing-to-do", "status": "submitted", "held_at": None,
+                  "submitted_at": "2026-07-25T11:00:00", "job_list": None}
+    stopped_record = {"name": "i-stopped-it", "status": "submitted", "held_at": None,
+                      "submitted_at": "2026-07-22T09:00:00",
+                      "job_list": "/s/job_output/DnaSeq.job_list.T6"}
+    stopped_status = runs.RunStatus(
+        counts={"COMPLETED": 4, "CANCELLED": 6}, total=10, resolved=10,
+        unknown=0, finished=True, verdict="cancelled", doomed=0, source="sacct")
+    unreachable_record = {"name": "cant-tell", "status": "submitted", "held_at": None,
+                          "submitted_at": "2026-07-25T08:00:00",
+                          "job_list": "/s/job_output/RnaSeq.job_list.T5",
+                          "last_check": {"at": "2026-07-25T07:00:00",
+                                        "verdict": "6 running", "counts": {},
+                                        "total": 15}}
+    unreachable_status = runs.RunStatus(
+        counts={}, total=15, resolved=0, unknown=15, finished=False,
+        verdict="scheduler unreachable", doomed=0, source="unavailable")
+
+    rows = [(held, None), (running_record, running_status),
+            (mixed_record, mixed_status), (dead_record, dead_status),
+            (finished_record, finished_status), (up_to_date, None),
+            (stopped_record, stopped_status),
+            (unreachable_record, unreachable_status)]
+    out = drawn(display.run_list, rows)
+
+    def row(name):
+        """The name's own line, so a tag is asserted against ITS run rather
+        than against anything else that happens to be on screen."""
+        return next(l for l in out.splitlines() if name in l)
+
+    r.check("one flat list, no section headings",
+            "Awaiting approval" not in out and "Needs attention" not in out)
+
+    r.contains("a held run is tagged on its own row", row("waiting"), "held")
+    r.check("and shows only the name and the tag, no command",
+            "bash cmd.sh" not in out)
+    r.check("with no repeated per-row actions",
+            out.count("/approve") == 1 and out.count("/modify") == 1
+            and out.count("/reject") == 1)
+
+    r.contains("a truly active run is tagged live", row("running-one"), "live")
+    r.contains("with a running/completed tally under it", out, "6 running")
+
+    r.contains("a mixed active+failed run needs attention, it is not live",
+               row("half-broken"), "needs attention")
+    r.check("and 'live' is not what its row says",
+            "live" not in row("half-broken"))
+    r.contains("its still-running jobs are named too, not just the failures",
+               out, "still running")
+    r.contains("a fully dead run says so, and that nothing is left of it",
+               out, "2 failed  ·  nothing still running")
+
+    r.contains("a cleanly finished run is tagged completed",
+               row("all-done"), "completed")
+    r.check("and no completion time is invented for it",
+            "completed Aug" not in out and " at " not in row("all-done"))
+    r.contains("a zero-job run says so plainly", out, "already up to date")
+
+    r.contains("a run somebody stopped is tagged cancelled, never completed",
+               row("i-stopped-it"), "cancelled")
+    r.check("its tag does not claim success",
+            "completed" not in row("i-stopped-it"))
+
+    r.contains("an unresolvable run is tagged as such",
+               row("cant-tell"), "status unavailable")
+    r.check("it is not tagged as needing attention",
+            "needs attention" not in row("cant-tell"))
+    r.contains("and offers the last known verdict instead of silence",
+               out, "last known")
+
+    r.check("held sorts above everything else",
+            out.index("waiting") < out.index("running-one")
+            and out.index("running-one") < out.index("half-broken"))
+
+    r.contains("the job_list filename is preserved for launched runs",
+               out, "RnaSeq.stringtie.job_list.T1")
+    r.check("but never shown for an awaiting-approval run",
+            "job_list" not in out.split("running-one")[0])
+
+    r.contains("the listing says when the states were read", out, "09:15")
+    r.contains("actions are offered once, at the bottom", out, "Actions")
+    r.contains("and cover diagnosis too", out, "/diagnose")
 
     # ---------------------------------------------------------------- #
     r.section("/history keeps gone runs and their findings")

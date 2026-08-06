@@ -1342,6 +1342,134 @@ def resolve_all(records):
     return out
 
 
+# ===========================================================================
+#  /list's grouping: one classification, shared so /check all and /list
+#  cannot drift on what "needs attention" means. Stdlib-only, no colour, no
+#  printing -- display.py owns rendering.
+# ===========================================================================
+
+HELD_BUCKET = "held"
+ACTIVE_BUCKET = "active"
+ATTENTION_BUCKET = "attention"
+FINISHED_BUCKET = "finished"
+UNAVAILABLE_BUCKET = "unavailable"
+
+
+def list_bucket(record, status):
+    """held / active / attention / finished / unavailable for one /list row.
+
+    `status` is what resolve_all() returned for this record: a RunStatus, or
+    None for a held run or one whose submission created no jobs at all (every
+    step was already up to date).
+
+    Order is the whole design:
+
+      1. held is checked first and unconditionally -- an awaiting-approval
+         run has no jobs to have an opinion about.
+      2. unavailable is checked before anything job-shaped. A scheduler that
+         could not be reached tells us nothing about this run's jobs, and
+         must never be read as though it did -- not as a failure, not as
+         "needs attention", not as anything but "we don't know right now".
+      3. a broken, doomed or UNKNOWN job puts the run in ATTENTION even when
+         something else in it is still queued or running. A run that is half
+         failed and half active already needs a person; it is not LIVE just
+         because part of it has not caught up to the bad news yet.
+      4. only after all of that does "still has active jobs" mean LIVE.
+    """
+    if record.get("status") == HELD:
+        return HELD_BUCKET
+    if status is None:
+        return FINISHED_BUCKET
+    if status.source == "unavailable":
+        return UNAVAILABLE_BUCKET
+    # A manifest with nothing in it is not a run that is still going. resolve()
+    # already words this "no jobs"; without this line the tallies below are all
+    # zero, nothing matches, and the run falls through to LIVE -- a listing
+    # claiming something is queued when there is not a single job to queue.
+    if not status.total and not status.counts:
+        return FINISHED_BUCKET
+    broke = sum(n for s, n in status.counts.items() if s in BROKE_STATES)
+    if broke or status.doomed or status.unknown:
+        return ATTENTION_BUCKET
+    if status.finished:
+        return FINISHED_BUCKET
+    return ACTIVE_BUCKET
+
+
+def list_line(status):
+    """The plain-text (no colour) one-line job tally for a /list row. None
+    when there is no status to tally -- a held run, or a submission that
+    created no jobs at all.
+
+    ATTENTION is worded from the SAME cause check_all() already uses
+    (failed, then doomed, then unaccounted-for) rather than a second
+    vocabulary for the same finding -- see resolve()'s BROKE_STATES comment
+    for why a downstream cancellation is not itself the cause.
+    """
+    if status is None:
+        return None
+    tally = status.counts
+    broke = sum(n for s, n in tally.items() if s in BROKE_STATES)
+    active = sum(n for s, n in tally.items() if s in ACTIVE_STATES)
+    if broke or status.doomed or status.unknown:
+        cause = (f"{broke} failed" if broke else
+                 f"{status.doomed} will never run" if status.doomed else
+                 f"{status.unknown} unaccounted for")
+        # Still-active jobs are named rather than left implicit: a run that is
+        # half broken and half still burning allocation is a different
+        # decision from one that is simply over, and the difference is the
+        # whole reason to look at this row now rather than later. The cause is
+        # kept in both cases -- the row's tag already says something is wrong,
+        # so what this line owes is the number, not the adjective again.
+        return (f"{cause}  ·  {active} still running" if active
+                else f"{cause}  ·  nothing still running")
+    running = tally.get("RUNNING", 0)
+    queued = tally.get("PENDING", 0)
+    done = tally.get("COMPLETED", 0)
+    # Counted here, not folded into "failed" above: a cancellation with
+    # nothing broken behind it is somebody's decision, not a fault, and it is
+    # the only thing separating a run that finished from one that was stopped.
+    cancelled = tally.get("CANCELLED", 0)
+    parts = [p for p in (
+        f"{running} running" if running else None,
+        f"{queued} queued" if queued else None,
+        f"{done} completed" if done else None,
+        f"{cancelled} cancelled" if cancelled else None,
+    ) if p]
+    return "  ·  ".join(parts) if parts else "queued"
+
+
+# The one word each row is tagged with. Same vocabulary everywhere a run's
+# lifecycle state is named -- /list's rows and /modify's fork notice both read
+# from here, so the two can never end up calling the same run different things.
+LIST_TAG = {
+    HELD_BUCKET: "held",
+    ACTIVE_BUCKET: "live",
+    ATTENTION_BUCKET: "needs attention",
+    FINISHED_BUCKET: "completed",
+    UNAVAILABLE_BUCKET: "status unavailable",
+}
+
+CANCELLED_TAG = "cancelled"
+
+
+def list_tag(record, status):
+    """The tag word for one /list row: held, live, needs attention, completed,
+    cancelled, or status unavailable.
+
+    Everything comes from list_bucket() except the one distinction a bucket
+    cannot carry: a run that ended because somebody stopped it. Nothing in it
+    broke, so it is not ATTENTION, and it is terminal, so it lands in
+    FINISHED -- but tagging it "completed" would report a cancellation as a
+    success, which is the one thing a status line must never do.
+    """
+    bucket = list_bucket(record, status)
+    if (bucket == FINISHED_BUCKET and status is not None
+            and status.counts.get("CANCELLED")):
+        return CANCELLED_TAG
+    return LIST_TAG[bucket]
+
+
 def resolve_log(job, record):
     """Find a job's log file on disk, returning a path or None.
 

@@ -103,6 +103,125 @@ def _since_checks(r):
         r.check("and writing one cannot crash the launch", True)
 
 
+def _status(**kw):
+    """A RunStatus with sensible defaults, so each test only states the
+    fields it actually cares about."""
+    defaults = dict(counts={}, total=0, resolved=0, unknown=0,
+                    finished=False, verdict="", doomed=0, source="sacct")
+    defaults.update(kw)
+    return runs.RunStatus(**defaults)
+
+
+def _list_bucket_checks(r):
+    """/list's classification: one function, five buckets, shared with
+    /check all so the two can never disagree about what "needs attention"
+    means. See runs.list_bucket()'s docstring for the ordering this asserts.
+    """
+    r.section("list_bucket(): which of /list's five sections a run lands in")
+
+    held = {"status": "held"}
+    r.equal("a held run is HELD, whatever status happens to be passed",
+            runs.list_bucket(held, _status(finished=True)), runs.HELD_BUCKET)
+    r.equal("HELD is checked before status is even looked at",
+            runs.list_bucket(held, None), runs.HELD_BUCKET)
+
+    submitted = {"status": "submitted"}
+    r.equal("no status and a submitted record: every step was up to date",
+            runs.list_bucket(submitted, None), runs.FINISHED_BUCKET)
+
+    r.equal("a scheduler that could not be reached is UNAVAILABLE, not a "
+            "verdict about the run",
+            runs.list_bucket(submitted, _status(source="unavailable")),
+            runs.UNAVAILABLE_BUCKET)
+
+    r.equal("purely active jobs are LIVE",
+            runs.list_bucket(submitted,
+                             _status(counts={"RUNNING": 3, "PENDING": 2})),
+            runs.ACTIVE_BUCKET)
+
+    r.equal("a broken job is ATTENTION even with nothing else wrong",
+            runs.list_bucket(submitted, _status(counts={"FAILED": 1})),
+            runs.ATTENTION_BUCKET)
+
+    r.equal("a doomed (DependencyNeverSatisfied) job is ATTENTION",
+            runs.list_bucket(submitted, _status(counts={"PENDING": 1}, doomed=1)),
+            runs.ATTENTION_BUCKET)
+
+    r.equal("an UNKNOWN job is ATTENTION, never read as healthy",
+            runs.list_bucket(submitted, _status(counts={"RUNNING": 1}, unknown=1)),
+            runs.ATTENTION_BUCKET)
+
+    # The exact case the redesign was asked to fix: some jobs failed, others
+    # are still running. This must not be LIVE -- it already needs a person.
+    r.equal("mixed active + failed is ATTENTION, never LIVE",
+            runs.list_bucket(submitted,
+                             _status(counts={"FAILED": 3, "RUNNING": 2})),
+            runs.ATTENTION_BUCKET)
+
+    r.equal("cleanly finished, nothing broken, is FINISHED",
+            runs.list_bucket(submitted,
+                             _status(counts={"COMPLETED": 4}, finished=True)),
+            runs.FINISHED_BUCKET)
+
+    # A job list that parsed to nothing. Every tally below is zero, so without
+    # its own check this falls through to LIVE and the listing claims work is
+    # queued that does not exist.
+    r.equal("an empty manifest is FINISHED, never LIVE",
+            runs.list_bucket(submitted, _status(counts={}, total=0)),
+            runs.FINISHED_BUCKET)
+
+    r.section("list_tag(): the word each /list row is tagged with")
+
+    r.equal("held", runs.list_tag(held, None), "held")
+    r.equal("live", runs.list_tag(submitted,
+                                  _status(counts={"RUNNING": 2})), "live")
+    r.equal("needs attention",
+            runs.list_tag(submitted, _status(counts={"FAILED": 1})),
+            "needs attention")
+    r.equal("completed",
+            runs.list_tag(submitted,
+                          _status(counts={"COMPLETED": 4}, finished=True)),
+            "completed")
+    # Nothing broke, so it is not ATTENTION, and it is over, so it lands in
+    # FINISHED -- but a run somebody stopped must never be reported as a
+    # success.
+    r.equal("a stopped run is tagged cancelled, not completed",
+            runs.list_tag(submitted,
+                          _status(counts={"COMPLETED": 4, "CANCELLED": 6},
+                                  finished=True)),
+            "cancelled")
+    r.equal("status unavailable",
+            runs.list_tag(submitted, _status(source="unavailable")),
+            "status unavailable")
+
+    r.section("list_line(): the one-line summary for LIVE and ATTENTION rows")
+
+    r.equal("None for anything with no status",
+            runs.list_line(None), None)
+    r.contains("a live run reports running/queued/completed",
+               runs.list_line(_status(counts={"RUNNING": 6, "COMPLETED": 9})),
+               "6 running")
+    r.contains("and completed counts, together",
+               runs.list_line(_status(counts={"RUNNING": 6, "COMPLETED": 9})),
+               "9 completed")
+    r.contains("a fully dead run keeps the count and says nothing is left",
+               runs.list_line(_status(counts={"FAILED": 2})),
+               "2 failed  ·  nothing still running")
+    r.contains("a mixed run names the cause instead of just 'failed'",
+               runs.list_line(_status(counts={"FAILED": 3, "RUNNING": 2})),
+               "3 failed")
+    r.contains("and says what of it is still burning allocation",
+               runs.list_line(_status(counts={"FAILED": 3, "RUNNING": 2})),
+               "2 still running")
+    r.contains("a stopped run counts its cancellations",
+               runs.list_line(_status(counts={"COMPLETED": 4, "CANCELLED": 6},
+                                      finished=True)),
+               "6 cancelled")
+    r.contains("a doomed run says so, not just 'failed'",
+               runs.list_line(_status(counts={"PENDING": 1}, doomed=2)),
+               "will never run")
+
+
 def main():
     r = Report("runs and jobs")
     workdir = tempfile.mkdtemp(prefix="genpipe_runs_test_")
@@ -411,6 +530,7 @@ Human time spent on this pipeline: 0:41:02
                 "run-0725")
 
         _since_checks(r)
+        _list_bucket_checks(r)
 
         return r.finish()
     finally:
