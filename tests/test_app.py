@@ -183,8 +183,19 @@ def main():
 
         # ================================================================== #
         r.section("it launches, and says what it is")
-        ok = app.wait_for("ready", timeout=120)
-        r.check("reaches 'ready'", ok, app.text()[-600:] if not ok else "")
+        # Synchronise on the prompt's own hint line, which ui.Prompt draws when
+        # it is actually ready to take input. That is the property every
+        # assertion below depends on, and it is the last thing startup prints.
+        #
+        # It used to synchronise on the readiness line, which no longer exists
+        # -- welcome() does that job now. Worth knowing why that mattered more
+        # than a rename: "ready" was never being printed, so every wait for it
+        # ran the full 120-second timeout and returned False. The suite passed
+        # anyway, because two minutes of pumping is an extremely effective
+        # sleep. Anything that waits on content the app does not emit is not a
+        # synchronisation, it is a delay with an assertion attached.
+        ok = app.wait_for("type a task", timeout=120)
+        r.check("reaches the prompt", ok, app.text()[-600:] if not ok else "")
         screen = app.visible()
         r.contains("names the tool", screen, "GenPipes")
         r.contains("shows the version", screen, "v0")
@@ -205,6 +216,10 @@ def main():
         # ================================================================== #
         r.section("the completion menu appears as you type")
         app.send("/")
+        # The menu is drawn in response to the keystroke, so wait for it rather
+        # than reading the screen on the next line and hoping. send() returns as
+        # soon as the byte is written.
+        app.wait_for("start a fresh conversation", timeout=20)
         screen = app.visible()
         # The menu is capped to what fits above the prompt, and the command
         # list has grown past a screenful, so assert that it opened and is
@@ -469,11 +484,14 @@ def main():
         # convenience; the persistence is the guarantee.
         again = App(workdir, state="failed-oom")
         try:
-            r.check("relaunches", again.wait_for("ready", timeout=120))
+            r.check("relaunches", again.wait_for("type a task", timeout=120))
             r.check("and the opening screen stays quiet about what is held",
                     "waiting on you" not in again.emitted())
             again.line("/list")
-            again.pump(1.0)
+            # /list resolves every launched run against the scheduler before it
+            # prints anything, so wait for the listing to arrive rather than
+            # pumping for a second and reading whatever happens to be there.
+            again.wait_for("Actions", timeout=60)
             listed = again.emitted()
             r.contains("but /list still has the held run", listed,
                        second or f"{name}-2")

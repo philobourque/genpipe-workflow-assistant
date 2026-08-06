@@ -2407,17 +2407,14 @@ def main(argv=None):
     agent = build_agent()
     if fake_llm:
         agent.llm = fakecluster.DevLLM()
-    # The readiness line printed here. It existed because the prompt used to
-    # follow a banner and nothing else, and looked like a dead end; welcome()
-    # now does that job, and the banner already states the model.
+    # The readiness line printed here, and does not any more: it existed
+    # because the prompt used to follow a banner and nothing else, and looked
+    # like a dead end. welcome() is the last thing before the prompt now, and
+    # the banner already states which model is configured.
     #
-    # It also carried the dev-mode warning, and that is the part with teeth:
-    # `notes` says the cluster, or the model, or both, are simulated. Nothing on
-    # screen says so any more. The banner is still the honest record of which
-    # model is configured, but a fake CLUSTER is now invisible -- a submission
-    # that touched nothing looks exactly like one that did. Restore this call to
-    # get it back.
-    _ = notes
+    # What it also carried is the part with teeth, and that stays -- see below
+    # welcome(), which is where it goes now.
+    #
     # The startup status block used to print here -- held runs, and runs whose
     # outcome nobody had looked at. It is gone from the opening screen: the
     # counts were of accumulated testing rather than of anything anybody was
@@ -2443,6 +2440,16 @@ def main(argv=None):
     # Last thing before the prompt, so the question it asks is the nearest line
     # above the cursor rather than three screens up behind the status lines.
     display.welcome()
+    # Under the welcome block rather than above it. `notes` says the cluster,
+    # or the model, or both, are simulated, and above the block it is the first
+    # thing to scroll off a short terminal -- which is the one warning here
+    # that must survive being ignored. A fake cluster is otherwise invisible:
+    # a submission that touched nothing looks exactly like one that did.
+    #
+    # Outside welcome() because it is a fact about this session, not part of
+    # the introduction, and it has to read the same on the hundredth launch as
+    # on the first -- welcome() shortens itself once you have been introduced.
+    display.simulated(" + ".join(notes) if notes else None)
     try:
         _repl(agent)
     except KeyboardInterrupt:

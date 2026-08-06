@@ -1566,24 +1566,36 @@ def run_view(proposal, name, status, resources="", blockers=()):
     print()
 
 
+def simulated(what):
+    """The dev-mode warning, on its own so it can outlive the readiness line
+    that used to carry it. `what` names what is being faked -- the cluster,
+    the model, or both.
+
+    Said loudly and on every single launch, never once and never folded away.
+    A tool whose whole purpose is to be trusted with a cluster allocation must
+    not leave you working out for yourself whether what you just watched was
+    real: a submission that touched nothing looks exactly like one that did,
+    right up until somebody goes looking for the jobs.
+
+    Silent when nothing is simulated, so the caller can hand it whatever it
+    has without asking first.
+    """
+    if not what:
+        return
+    print(f"  {AMBER}▌{RESET} {AMBER}{BOLD}dev mode{RESET}  {DIM}·{RESET}  "
+          f"{GREY}{what} — nothing here touches a real cluster{RESET}")
+
+
 def ready(source=None, model=None, fake=None):
-    """Printed right before the command loop takes over. Without this, the
-    prompt that follows looks like a dead end rather than the normal, working
-    state of the app -- especially once the banner has scrolled out of view
-    behind a key prompt.
+    """The readiness line. No longer printed at startup -- welcome() is the
+    last thing before the prompt now, and it says which model is configured --
+    but kept whole for whatever wants to restate both facts in one line.
 
     It restates the model on purpose: on a first launch the banner printed
     before a key existed, so this is the first point at which the answer is
     actually known.
-
-    `fake` names what is being simulated in dev mode. It is stated loudly and
-    every single launch: a tool whose whole purpose is to be trusted with a
-    cluster allocation must never leave you guessing whether what you are
-    looking at was real.
     """
-    if fake:
-        print(f"  {AMBER}▌{RESET} {AMBER}{BOLD}dev mode{RESET}  {DIM}·{RESET}  "
-              f"{GREY}{fake} — nothing here touches a real cluster{RESET}")
+    simulated(fake)
     print(f"  {GREEN}▌{RESET} {BOLD}ready{RESET}  {DIM}·{RESET}  "
           f"{GREY}{_identity(source, model)}{RESET}")
 
@@ -2027,9 +2039,10 @@ def run_list(rows):
 
     One flat list, sorted by state rather than broken into headed sections.
     Every row carries its own tag, so a name and its state are read together
-    in one line instead of a name here and a heading somewhere above it. At
-    most one secondary line (the job_list filename), and the actions stated
-    ONCE at the bottom rather than repeated under every row.
+    in one line instead of a name here and a heading somewhere above it. One
+    line of detail under each, saying what the tag means, plus the job_list
+    filename where there is one -- and the actions stated ONCE at the bottom
+    rather than repeated under every row.
     """
     buckets = {b: [] for b in _SECTION_ORDER}
     for record, status in rows:
@@ -2049,7 +2062,13 @@ def run_list(rows):
             emphasis = BOLD if bucket in (HELD_BUCKET, ATTENTION_BUCKET) else ""
             print(f"  {DIM}\u258c{RESET} {BOLD}{record['name']}{RESET}"
                   f"  {DIM}\u00b7{RESET}  {colour}{emphasis}{tag}{RESET}")
-            detail = (None if bucket == HELD_BUCKET else
+            # Every row says what its state means, held included. "held" is
+            # this tool's word for it; "awaiting your approval" is what it
+            # means, and the held row is the last one that should be answering
+            # in jargon -- it is the only state on the list that is waiting on
+            # the person reading it. The verbs are still stated once at the
+            # bottom rather than repeated under every held row.
+            detail = ("awaiting your approval" if bucket == HELD_BUCKET else
                       _unavailable_line(record) if bucket == UNAVAILABLE_BUCKET else
                       _finished_line(status) if bucket == FINISHED_BUCKET else
                       list_line(status))
