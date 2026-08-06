@@ -44,7 +44,7 @@ checkable in CI without installing biomni.
 import re
 import shlex
 
-from .gate import LONG_FORM
+from .gate import LONG_FORM, invocation
 from .modify import FLAG_OF, ROWS, SLOT_OF
 
 # Flags that carry no /modify row but are still part of what is about to run.
@@ -74,19 +74,18 @@ for _row, _flag in FLAG_OF.items():
     if LONG_FORM.get(_flag):
         _ROW_OF[LONG_FORM[_flag]] = _row
 
-# `genpipes rnaseq`, the invocation itself. The pipeline is a bare word, so the
-# match has to be anchored on the program name to avoid finding the word inside
-# a path like /home/x/genpipes/inis.
-_START = re.compile(r"\bgenpipes\s+([a-z][a-z0-9_]*)\b")
-
-# Where a joined-up code block stops being the genpipes call. `generated` is a
-# whole <execute> block collapsed onto one line, so it routinely carries a
-# `module load` before the command and sometimes a `&& echo` after it.
-_SEPARATOR = re.compile(r"\s(?:&&|\|\||;|\|)\s")
-
 # A token that opens a flag rather than being one's value. `-1` and a bare `-`
 # are values; `-t` and `--steps` are flags.
 _FLAG = re.compile(r"^--?[A-Za-z]")
+
+# Shell redirection, not a GenPipes argument. A model that writes its
+# generation and its `2>&1` capture in the same block leaves this trailing
+# the last real flag -- `-g cmd.sh 2>&1` -- and because `2>&1` starts with a
+# digit rather than a dash, _FLAG never matches it either, so without this
+# filter it becomes an extra, wrong VALUE on whatever flag preceded it
+# (`script` reading "cmd.sh 2>&1", say). Covers every shape genpipes.md's own
+# examples use: `>`, `>>`, `2>`, `2>&1`, `&>`, `<`.
+_REDIRECTION = re.compile(r"^\d*>>?&?\d*$|^\d*<$")
 
 
 class Line:
@@ -210,31 +209,33 @@ class Mirror:
         return Mirror(self.head, _ordered(self.lines + extra))
 
 
-def invocation(generated):
-    """The bare genpipes call, cut out of whatever block it arrived in.
-
-    Returns '' when there is no genpipes call in the text, which is the honest
-    answer for a proposal whose generation step was never captured -- the caller
-    draws no mirror rather than an empty frame.
-    """
-    text = " ".join((generated or "").split())
-    m = _START.search(text)
-    if not m:
-        return ""
-    return _SEPARATOR.split(text[m.start():])[0].strip()
-
-
 def _tokens(text):
     """Split a command into words, tolerating a quote the model left open.
 
     shlex is used for the quoted paths that turn up in `-o` and `-c`, and its
     failure mode on unbalanced quotes is an exception. A mirror is a display;
     it degrades to a rougher split rather than taking the gate down with it.
+
+    Shell redirection (`2>&1`, `>`, ...) is dropped here, unconditionally --
+    see _REDIRECTION's comment. It is plumbing the model added around the
+    genpipes call, never a GenPipes argument, and the one thing worse than
+    not showing it is showing it as though it were a flag's value.
     """
     try:
-        return shlex.split(text)
+        tokens = shlex.split(text)
     except ValueError:
-        return text.split()
+        tokens = text.split()
+
+    # Everything from the first redirection operator onward is dropped, not just
+    # the operator itself. Filtering only the operator left its TARGET behind as
+    # a loose word, which _groups then appended to the last flag: `> out.log`
+    # became `script -g  cmd.sh / out.log`, which reads as though GenPipes had
+    # been told to write two files. Redirection is the model capturing output
+    # around the call, and it comes last, so the command is over at that point.
+    for i, token in enumerate(tokens):
+        if _REDIRECTION.match(token):
+            return tokens[:i]
+    return tokens
 
 
 def _groups(tokens):
@@ -326,6 +327,28 @@ def read(generated, name="", resources="", missing=()):
     tokens = _tokens(text)
     head = " ".join(tokens[:2]) if len(tokens) > 1 else (tokens[0] if tokens else "")
     groups = _groups(tokens[2:])
+
+    # A value that itself starts with a dash and a letter is, by _FLAG's own
+    # definition, a flag -- so finding one INSIDE another flag's values means
+    # a flag boundary was missed and everything after it collapsed into one
+    # field, the exact shape a stray backslash or an unhandled quoting style
+    # produces. Read this as "this command could not be reliably tokenised"
+    # rather than draw a mirror with `-c`, `-r` and `-s` sitting inside
+    # `protocol`'s value. The caller's `mirror.read(...) or
+    # mirror.from_slots(...)` falls back to the proposal's parsed slots, and
+    # cli.py tells the person that happened rather than showing it silently.
+    # Each value is checked WORD BY WORD, not just at its first character. A
+    # flag can hide inside a quoted value -- `-t 'stringtie -s 1-5'` arrives
+    # from shlex as one token, so matching only its start sees "stringtie" and
+    # judges it sound, and the mirror then shows a protocol of `stringtie -s
+    # 1-5` and no steps row at all. Splitting first means the buried `-s` is
+    # found and the whole parse is refused, which is the point: a mirror that
+    # looks like a faithful reconstruction and is not is worse than no mirror.
+    if any(_FLAG.match(word)
+           for _, values in groups
+           for value in values
+           for word in str(value).split()):
+        return Mirror()
 
     seen = {}
     for flag, values in groups:

@@ -36,10 +36,32 @@ from . import slots
 # Text that means "this really submits". Searched against executable_lines(),
 # never the raw block -- see that function for why.
 _SUBMIT_PATTERNS = [
+    r"\bpropose_submission\s*\(",   # the tool the model is told to call
     r"\b(?:bash|sh)\s+\S+\.sh\b",   # bash <script>.sh -- any generated submission script
     r"\bsubmit_genpipes\b",         # DRAC submit
     r"\bchunk_genpipes\.sh\b",      # DRAC chunk (precedes submit)
 ]
+
+# propose_submission("cmd.sh") is what the prompt tells the model to write when
+# it decides the moment has come, and it exists so that intent is explicit in
+# the transcript rather than inferred from a bare shell line.
+#
+# The other three patterns above are NOT thereby obsolete, and keeping them is a
+# safety property rather than tidiness. The model is not the only thing that can
+# put text in front of this function: it reads readsets, .ini files, job logs and
+# .o files it did not write, and a model that ends up emitting `bash cmd.sh` --
+# confused, or steered by something inside one of those files -- must still be
+# gated rather than executed. The tool is how submission is normally requested;
+# these are the floor under it. A submission recognised by any of them takes the
+# same path to the same approval box.
+_PROPOSE_CALL = re.compile(
+    r"\bpropose_submission\s*\(\s*['\"]?([^'\")\s]+\.sh)['\"]?", re.I)
+
+
+def proposed_script(code):
+    """The script named in a propose_submission() call, or None."""
+    m = _PROPOSE_CALL.search(code or "")
+    return m.group(1) if m else None
 
 
 def extract_pending_code(messages):
@@ -411,17 +433,113 @@ LONG_FORM = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Isolating the genpipes call from the block it arrived in.
+#
+# Lives here rather than in mirror.py, which is where it was written, because
+# gate.build_proposal needs it just as badly and mirror already imports from
+# this module -- the other direction would be a cycle. One implementation, so
+# the approval box and the run record can never disagree about what the
+# command was.
+# ---------------------------------------------------------------------------
+
+# `genpipes rnaseq`, the invocation itself. The pipeline is a bare word, so the
+# match has to be anchored on the program name to avoid finding the word inside
+# a path like /home/x/genpipes/inis.
+_START = re.compile(r"\bgenpipes\s+([a-z][a-z0-9_]*)\b")
+
+# Where a joined-up code block stops being the genpipes call. `generated` is a
+# whole <execute> block collapsed onto one line, so it routinely carries a
+# `module load` before the command and sometimes a `&& echo` after it.
+_SEPARATOR = re.compile(r"\s(?:&&|\|\||;|\|)\s")
+
+# A NEWLINE ends the command too, and this is separate from _SEPARATOR because
+# it has to be applied before whitespace is flattened -- by the time the block
+# is one line, the newline that ended the command is an ordinary space and
+# nothing downstream can tell it from the space before a flag.
+#
+# What that cost, before this existed: a generation written as a short script
+#
+#     genpipes ampliconseq ... -g $OUT/cmd.sh
+#     echo done
+#
+# put `echo` and `done` in -g's value list, because _groups appends every token
+# up to the next flag and there was no next flag. The approval box then read
+# `script -g  $OUT/cmd.sh / echo / done` -- three lines of shell spilling out of
+# the field somebody reads to decide whether to submit.
+#
+# Line continuations are resolved first, so any newline still standing here is a
+# real statement boundary rather than a wrapped line.
+_NEWLINE = re.compile(r"\n+")
+
+# A backslash-newline line continuation, the way a hand-formatted multi-line
+# invocation breaks one long command across several lines for readability:
+#
+#     genpipes dnaseq -t somatic_fastpass \
+#       -c $GENPIPES_INIS/dnaseq/dnaseq.base.ini \
+#       -r ...
+#
+# Collapsed to a single space HERE, before shlex ever sees the text. Left in
+# place, the backslash survives whitespace-flattening as `\ ` (backslash then
+# space), and shlex's POSIX quoting rules read that as an ESCAPED space --
+# not a token boundary -- so the token that follows comes out as `' -c'`,
+# leading space and all. `_FLAG` matches on the first character, so a token
+# starting with a space is never recognised as a flag: it is appended as a
+# VALUE onto whatever flag came before, and every flag after the first line
+# break drags the rest of the command down with it into one field. This is
+# the root cause of a modify screen showing `-c`, `-r`, `-s`, `-j` and `-g`
+# all crammed under `protocol`.
+_CONTINUATION = re.compile(r"\\[ \t]*\n")
+
+def invocation(generated):
+    """The bare genpipes call, cut out of whatever block it arrived in.
+
+    Returns '' when there is no genpipes call in the text, which is the honest
+    answer for a proposal whose generation step was never captured -- the caller
+    draws no mirror rather than an empty frame.
+    """
+    # Line continuations resolved before whitespace is flattened -- see
+    # _CONTINUATION's comment for why the order matters.
+    text = _CONTINUATION.sub(" ", generated or "")
+
+    # Then cut to the LINE holding the call, while newlines still exist to cut
+    # on. A generation is routinely a small script -- an OUT=... assignment, a
+    # mkdir, the genpipes call, an echo -- and only one line of it is the
+    # command. See _NEWLINE.
+    for chunk in _NEWLINE.split(text):
+        if _START.search(chunk):
+            text = chunk
+            break
+    else:
+        return ""
+
+    text = " ".join(text.split())
+    m = _START.search(text)
+    if not m:
+        return ""
+    return _SEPARATOR.split(text[m.start():])[0].strip()
+
+
 def flag_value(cmd, flag):
-    """The argument given to a flag, e.g. flag_value(cmd, '-t') -> 'stringtie'.
+    r"""The argument given to a flag, e.g. flag_value(cmd, '-t') -> 'stringtie'.
 
     Accepts the long form too, and `--flag=value` as well as `--flag value`.
     The long form is tried FIRST: `-o` is a prefix of nothing, but a short-form
     search would happily match the `-o` inside `--output-dir` and return
     `/scratch/out`'s neighbour instead of the value.
+
+    A flag's value is on the flag's own LINE. `\s` matches newlines, so the
+    separator here is spaces and tabs only -- with `\s+` a flag sitting at the
+    end of a line took the first word of the next line as its value, and since
+    the generation command is a whole multi-line shell script, the approval box
+    filled with fragments: `log level -l  $OUT`, an `output` row reading `-g`,
+    `echo`, `exit=$?`, `ls`. Every one of those is a line that merely FOLLOWED a
+    flag. The box is what somebody reads before approving, so a value invented
+    by a regex crossing a newline is exactly the wrong thing to put in it.
     """
     long = LONG_FORM.get(flag)
     for name in ([long] if long else []) + [flag]:
-        m = re.search(rf"(?<![\w-]){re.escape(name)}(?:\s+|=)(\S+)", cmd)
+        m = re.search(rf"(?<![\w-]){re.escape(name)}(?:[ \t]+|=)([^\s]+)", cmd)
         if m:
             return m.group(1)
     return None
@@ -429,9 +547,19 @@ def flag_value(cmd, flag):
 
 def submission_line(code):
     """Pull the real submission command out of a noisy code block, even if
-    the model buried it in a Python script or a string literal."""
+    the model buried it in a Python script or a string literal.
+
+    A propose_submission() call resolves to the command it stands for, because
+    everything downstream -- the approval box, the run record, the thing that
+    actually runs on /approve -- is about `bash cmd.sh`. The tool is how the
+    model asks; it is not what gets executed, and the person approving should be
+    reading the command rather than the request for it.
+    """
     if not code:
         return ""
+    script = proposed_script(code)
+    if script:
+        return f"bash {script}"
     for p in (r"(?:bash|sh)\s+\S+\.sh\b",
               r"chunk_genpipes\.sh\b[^\"'\n]*",
               r"submit_genpipes\b[^\"'\n]*"):
@@ -468,6 +596,9 @@ def script_name(code):
     Recorded on the run so a later analysis knows which script produced the
     jobs, without having to guess at the conventional name.
     """
+    script = proposed_script(code)
+    if script:
+        return script
     m = re.search(r"\b(?:bash|sh)\s+(\S+\.sh)\b", executable_lines(code) or "")
     return m.group(1) if m else None
 
@@ -481,7 +612,25 @@ def build_proposal(messages, code):
     cannot disagree with the box the user approves."""
     cmd = submission_line(code or "")
     gen = generation_command(messages)
-    src = gen or (code or "")
+    block = gen or (code or "")
+
+    # Flags are read from the genpipes CALL, not from the block it arrived in.
+    # A generation is routinely a small script, and the surrounding shell has
+    # flags of its own that mean nothing to GenPipes:
+    #
+    #     mkdir -p $HOME/ampliconseq_cit_run/output
+    #     module load ... && genpipes ampliconseq -r ... -d ... -o ...
+    #
+    # Searching the whole block found `mkdir`'s `-p` and recorded the OUTPUT
+    # DIRECTORY as the pairs file. The approval box then showed a `-d` and a
+    # `-p` together -- which genpipes.md forbids outright -- so a correct
+    # command looked like a broken one, and the bogus path was written into the
+    # run record for /modify to read back later.
+    #
+    # Falls back to the whole block when there is no genpipes call in it, which
+    # is the pre-existing behaviour for a proposal whose generation was never
+    # captured: better a rough parse than an empty box.
+    src = invocation(block) or block
     protocol = flag_value(src, "-t")
     steps = flag_value(src, "-s")
     inis = re.findall(r"\S+/([^/\s]+\.ini)", src) or re.findall(r"\S+\.ini", src)
