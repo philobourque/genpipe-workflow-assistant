@@ -24,7 +24,6 @@ import io
 import glob
 import os
 import select
-import shutil
 import sys
 import termios
 import threading
@@ -55,20 +54,29 @@ _ESCAPES = {
     "[3~": "delete", "[Z": "shift-tab",
 }
 
-def width():
-    """Width of the prompt's rules, in columns, drawn at a one-column indent --
-    deliberately the same arithmetic display.banner() uses for its box, so the
-    rules line up with the banner above them instead of nearly lining up.
+def span_for(cols):
+    """Width of the prompt's rules for a window `cols` wide, drawn at a
+    one-column indent -- deliberately the same arithmetic display.banner() uses
+    for its box, so the rules line up with the banner above them instead of
+    nearly lining up.
 
-    The floor keeps the box from collapsing into nonsense on a tiny window; the
-    ceiling keeps a maximised terminal from stretching one input line across two
-    feet of screen.
+    The ceiling keeps a maximised terminal from stretching one input line across
+    two feet of screen.
+
+    There used to be a floor of 44 here as well, to stop the box collapsing into
+    nonsense on a tiny window, and it did the opposite: below 46 columns it drew
+    a 45-column rule into a 40-column terminal, the rule wrapped, and the box
+    walked down the screen a row per keystroke. A box slightly too narrow to be
+    pretty is a cosmetic problem; a box wider than the window it is in is a
+    broken editor. So the window wins, always, and `cols - 2` is a ceiling
+    rather than a suggestion.
     """
-    try:
-        cols = shutil.get_terminal_size((80, 24)).columns
-    except Exception:
-        cols = 80
-    return max(44, min(cols - 2, 104))
+    return max(1, min(cols - 2, 104))
+
+
+def width():
+    """span_for() against the window we are actually in."""
+    return span_for(display.terminal_cols())
 
 
 # --------------------------------------------------------------------------
@@ -301,11 +309,31 @@ class _Editor:
         self.scroll = 0       # first visible character, for long lines
         self.hist_at = len(history)
         self.stash = ""       # line being typed, parked while browsing history
-        self.span = width()
+        self.cols = 0         # window width the box below was cut to
+        self.span = 0
+        self.rule = ""
+        self.room = 1
+        self._measure()
+
+    def _measure(self):
+        """Re-read the window and re-cut the box to fit it.
+
+        Called before every draw, not once when the prompt opens. A window can
+        change size in the middle of a line -- somebody drags the corner, or a
+        tmux pane splits -- and measuring once meant the box carried on drawing
+        at its original width inside a window that had since got narrower. Every
+        line then wrapped, every redraw walked the cursor up one row short, and
+        the prompt marched down the screen a row per keystroke.
+        """
+        cols = display.terminal_cols()
+        if cols == self.cols:
+            return
+        self.cols = cols
+        self.span = span_for(cols)
         self.rule = " " + display.GREY + display.DIM + "─" * self.span + display.RESET
         # "  ❯ " occupies four columns; leave one at the far end so a full line
         # never touches the rule's last character.
-        self.room = self.span - 5
+        self.room = max(1, self.span - 5)
 
     @property
     def text(self):
@@ -441,11 +469,27 @@ class _Editor:
         return out
 
     def draw(self):
-        below = self._menu_lines()
-        parts = ["\r\033[J", self._input_line(), "\r\n", self.rule]
-        for line in below:
+        self._measure()
+        # Clamped to the window BEFORE anything is counted. The menu rows and
+        # the input line are already cut to self.span, but the hint lines are
+        # fixed strings and the "no command starts with X" line interpolates
+        # whatever has been typed, so neither is bounded by the box on its own.
+        # One line over the edge is all it takes to desynchronise the walk-up.
+        lines = [display.fit(line, self.cols - 1)
+                 for line in (self._input_line(), self.rule, *self._menu_lines())]
+        parts = ["\r\033[J", lines[0]]
+        for line in lines[1:]:
             parts.append("\r\n" + line)
-        parts.append(f"\033[{1 + len(below)}A\r")
+        # Rows advanced, not lines written: each "\r\n" moves down one, and a
+        # line that wrapped anyway costs its extra rows on top. fit() should
+        # have made those equal; going through row_count means a miscounted
+        # character width degrades into a slightly odd redraw rather than into
+        # the marching prompt this replaced.
+        up = (display.row_count(lines[0], self.cols) - 1
+              + sum(display.row_count(line, self.cols) for line in lines[1:]))
+        if up:
+            parts.append(f"\033[{up}A")
+        parts.append("\r")
         col = 4 + (self.cur - self.scroll)
         if col:
             parts.append(f"\033[{col}C")
@@ -470,7 +514,8 @@ class _Editor:
         sys.stdout.flush()
 
     def open(self):
-        sys.stdout.write("\r\n" + self.rule + "\r\n")
+        self._measure()
+        sys.stdout.write("\r\n" + display.fit(self.rule, self.cols - 1) + "\r\n")
         sys.stdout.flush()
         self.draw()
 
@@ -1054,10 +1099,17 @@ def choose(question, options, note="", free_text=True, free_label="Something els
         nonlocal painted
         if painted:
             sys.stdout.write(f"\033[{painted}A")
-        lines = block()
+        # `painted` is a count of ROWS, which is why every line is clamped to
+        # the window first. The note under a panel is prose written at the call
+        # site -- /sort's is 109 columns -- so in any window narrower than that
+        # it wrapped, the walk-up above came back a row short, and the panel
+        # redrew its header one row lower on every keypress. The visible result
+        # was the question stacked four deep above the rows.
+        cols = display.terminal_cols()
+        lines = [display.fit(line, cols - 1) for line in block()]
         for line in lines:
             sys.stdout.write(f"\r{line}\033[K\r\n")
-        painted = len(lines)
+        painted = sum(display.row_count(line, cols) for line in lines)
         sys.stdout.flush()
 
     chosen = None

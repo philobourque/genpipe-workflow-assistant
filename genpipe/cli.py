@@ -1587,9 +1587,8 @@ def _cmd_sort(agent, args):
     # this list is one you tick rather than one you pick a single row from.
     picked = ui.choose("Which rows should /list stop showing?", options,
                        free_text=False, multi=True,
-                       note="tick as many as you like — nothing is deleted, "
-                            "/history keeps everything and /sort show brings "
-                            "rows back")
+                       note="tick as many as you like — nothing is deleted; "
+                            "/sort show brings rows back")
     if not picked:
         display.nothing("Left alone.")
         return

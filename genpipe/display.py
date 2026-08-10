@@ -60,6 +60,7 @@ import re
 import shutil
 import sys
 import textwrap
+import unicodedata
 
 from . import mirror
 from . import modify
@@ -80,6 +81,107 @@ REVERSE = "\033[7m"
 UNDER = "\033[4m"
 
 WIDTH = 74
+
+# ---------------------------------------------------------------------------
+# How wide a line is, and how many rows it will really take.
+#
+# Three places in this app repaint a block in place: the prompt box, the choice
+# panel, and the plan checklist. All three worked the same way and were wrong
+# the same way -- they counted the LINES they had printed and walked the cursor
+# back up that many ROWS. Those are only the same number while every line fits
+# the window. One line too long wraps onto a second row, the walk-up comes up
+# short, and the block drifts a row further down the screen on every repaint:
+# the reported symptom was a prompt that printed `> /m`, `> /mo`, `> /mod` down
+# the screen instead of editing one line in place.
+#
+# So the arithmetic is done here, once, and the three callers share it:
+# cells() is what a string costs on screen, fit() guarantees a line cannot
+# wrap, and rows() is the honest row count if one does anyway.
+# ---------------------------------------------------------------------------
+
+_ANSI = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
+
+
+def cells(text):
+    """Columns `text` occupies when printed.
+
+    Not len(): colour codes are bytes that take no space, a combining mark
+    hangs off the character before it, and the box-drawing and CJK ranges are
+    two columns wide. len() over-counts the first two and under-counts the
+    last, and each error is a wrapped line somebody has to debug from a
+    screenshot.
+    """
+    n = 0
+    for ch in _ANSI.sub("", text):
+        if unicodedata.combining(ch) or unicodedata.category(ch)[0] == "C":
+            continue
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def fit(text, cols):
+    """`text` cut to at most `cols` columns, colour preserved, ellipsis added.
+
+    Escape sequences are copied through rather than counted, so a truncated
+    line keeps the colour it was written in -- and a RESET is appended, because
+    cutting a string mid-colour leaves the rest of the screen tinted.
+    """
+    if cols <= 0:
+        return ""
+    if cells(text) <= cols:
+        return text
+    out, n, i = [], 0, 0
+    while i < len(text):
+        m = _ANSI.match(text, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        ch = text[i]
+        i += 1
+        if unicodedata.combining(ch) or unicodedata.category(ch)[0] == "C":
+            out.append(ch)
+            continue
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if n + w > cols - 1:          # one column held back for the ellipsis
+            break
+        out.append(ch)
+        n += w
+    return "".join(out) + "…" + RESET
+
+
+def row_count(text, cols):
+    """Terminal rows a printed line occupies, wrapping included.
+
+    Not named rows(): several functions in this module already use `rows` as a
+    local for a list of runs, and a helper that silently disappears behind a
+    local in half the file is worse than a longer name.
+    """
+    if cols <= 0:
+        return 1
+    return max(1, -(-cells(text) // cols))
+
+
+def terminal_cols():
+    """The real width of the window, in columns.
+
+    Deliberately not shutil.get_terminal_size, which consults $COLUMNS first
+    and only falls back to asking the terminal. A stale COLUMNS -- exported
+    once by a shell that never updated it, which is ordinary on a login node --
+    then makes every box in this app draw wider than the window it is drawn in,
+    and every one of them wrap. The terminal is asked directly; $COLUMNS is a
+    last resort for when there is no terminal to ask.
+    """
+    for stream in (sys.__stdout__, sys.__stderr__, sys.__stdin__):
+        try:
+            return os.get_terminal_size(stream.fileno()).columns
+        except (AttributeError, ValueError, OSError):
+            continue
+    try:
+        return max(1, int(os.environ.get("COLUMNS", "80")))
+    except ValueError:
+        return 80
+
 
 # ---------------------------------------------------------------------------
 # The startup banner. Written for a GenPipes user, not a builder: it answers
@@ -727,7 +829,18 @@ def _draw_plan(items):
     """Draw or update the plan block."""
     global _plan, _plan_lines
     texts = [t for t, _ in items]
-    body = _plan_body(items)
+    # Clamped to the window before anything is counted. A plan step is the
+    # model's own wording, so its length is not ours to predict -- and a step
+    # that wrapped used two rows while _plan_lines recorded one, so the walk-up
+    # below landed a row short and the block marched down the screen, printing
+    # a fresh "Plan" header on every tick.
+    # Only against a real terminal. Redirected to a file or a CI log there is
+    # no width to overflow and nothing repaints, so clipping the model's own
+    # wording there would lose information to solve a problem that does not
+    # exist off-screen.
+    cols = terminal_cols() if _tty() else 0
+    body = ([fit(line, cols - 1) for line in _plan_body(items)] if cols
+            else _plan_body(items))
 
     same = _plan == texts
     if same and _plan_lines and _tty():
@@ -748,7 +861,12 @@ def _draw_plan(items):
         print(line)
     print()
     _plan = texts
-    _plan_lines = len(body) + 1
+    # Rows, not lines. fit() above means these are the same number today; going
+    # through row_count anyway keeps them the same number if a future line
+    # escapes the clamp, which is exactly how this drifted in the first place.
+    # The +1 is the trailing blank print().
+    _plan_lines = (sum(row_count(line, cols) for line in body) if cols
+                   else len(body)) + 1
 
 
 def _tty():
@@ -2101,7 +2219,12 @@ def run_list(rows):
         ("/diagnose", "<name>", "investigate a problem"),
         ("/scan", "<path>", "adopt runs already on disk"),
     ):
-        print(f"    {DIM}{cmd} {args:<10}{RESET}  {GREY}{note}{RESET}")
+        # Both columns padded, not just the second. Padding `args` alone left
+        # the descriptions starting wherever the command name happened to end,
+        # so /approve and /modify -- one character apart -- put their notes in
+        # different columns and the block read as ragged. /help gets this right
+        # and this is the same list; it should look the same.
+        print(f"    {DIM}{cmd:<9} {args:<8}{RESET}  {GREY}{note}{RESET}")
     print()
 
 
