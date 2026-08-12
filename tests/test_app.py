@@ -110,7 +110,7 @@ class App:
             self.stream.feed(text)
             self.scrollback += text
 
-    def wait_for(self, needle, timeout=90, since=None):
+    def wait_for(self, needle, timeout=90, since=None, quiet=6.0):
         """Pump until `needle` has been emitted. Returns whether it was.
 
         Everything here is timing-dependent by nature, so waiting on content is
@@ -126,13 +126,35 @@ class App:
         keystroke meant for the second exchange is typed into whatever is
         actually on screen at the time -- which is how a request that reached
         the gate perfectly well the first time appeared to hang the second.
+
+        IT GIVES UP WHEN THE APP HAS STOPPED TALKING, which is what `quiet` is
+        for, and it exists because of a real hour lost. The gate's banner was
+        renamed and this suite still waited on the old word: the app had
+        finished, drawn the box and gone back to the prompt within a second,
+        and the wait sat there for the full 120 anyway. Two stale needles, four
+        minutes, and a suite that looked like it had hung rather than one that
+        had a wrong string in it.
+
+        An app that has emitted nothing for `quiet` seconds is not about to
+        produce the needle -- it is idle at the prompt. So the timeout stops
+        being the normal cost of a wrong expectation and goes back to being
+        what it was meant for: a ceiling on a genuinely slow operation, where
+        output arrives in bursts with real work between them. Any wait that
+        must survive a longer silence says so at the call site.
         """
         end = time.monotonic() + timeout
+        last_change = time.monotonic()
+        size = len(self.scrollback)
         while time.monotonic() < end:
             self.pump(0.3)
             seen = self.emitted()
             if needle in (seen if since is None else seen[since:]):
                 return True
+            if len(self.scrollback) != size:
+                size = len(self.scrollback)
+                last_change = time.monotonic()
+            elif time.monotonic() - last_change >= quiet:
+                return False
         return False
 
     def emitted(self):
@@ -232,7 +254,13 @@ def main():
         # anyway, because two minutes of pumping is an extremely effective
         # sleep. Anything that waits on content the app does not emit is not a
         # synchronisation, it is a delay with an assertion attached.
-        ok = app.wait_for("type a task", timeout=120)
+        # quiet= is raised for this one wait only. Launching the app imports
+        # biomni and langgraph and builds the agent BEFORE it prints anything,
+        # so a long silence here is the operation working, not a stale needle.
+        # Everywhere else the default applies: once the banner is on screen the
+        # app talks as it works, and six seconds of nothing means it is idle at
+        # the prompt.
+        ok = app.wait_for("type a task", timeout=120, quiet=60)
         r.check("reaches the prompt", ok, app.text()[-600:] if not ok else "")
         screen = app.visible()
         r.contains("names the tool", screen, "GenPipes")
@@ -527,7 +555,9 @@ def main():
         # convenience; the persistence is the guarantee.
         again = App(workdir, state="failed-oom")
         try:
-            r.check("relaunches", again.wait_for("type a task", timeout=120))
+            # Same silent construction as the first launch -- see above.
+            r.check("relaunches",
+                    again.wait_for("type a task", timeout=120, quiet=60))
             r.check("and the opening screen stays quiet about what is held",
                     "waiting on you" not in again.emitted())
             again.line("/list")
