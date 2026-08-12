@@ -37,6 +37,90 @@ CONTINUED = (
 )
 
 
+def _continuation_checks(r):
+    """A hand-formatted multi-line command must reach the gate box intact.
+
+    The bug this pins: gate.build_proposal flattened the generation command's
+    whitespace before resolving `\\`-continuations, so the backslashes survived
+    as `\\ ` and shlex read each one as an escaped space rather than a token
+    boundary. Every flag after the first continuation collapsed into the
+    previous flag's value.
+
+    What it looked like was worse than a parse error. The slots were parsed
+    correctly the whole time -- readset, design, three inis, `missing` empty --
+    so /approve was offered for a HOLD box that listed the run's name and
+    nothing else. Approving what you were not shown is the one failure the gate
+    exists to prevent.
+    """
+    from genpipe import gate
+
+    class M:
+        def __init__(self, content):
+            self.content = content
+
+    # `genpipes` on its own line after `&& \`, which is how the model formats a
+    # long call. The other shape -- everything up to the first flag on one line
+    # -- failed differently, tripping _groups' dash-inside-a-value guard, and so
+    # happened to fall through to from_slots and look fine. Both are checked.
+    shapes = {
+        "genpipes on its own line": (
+            "<execute>\n#!BASH\nmodule load mugqic/genpipes/6.1.1 && \\\n"
+            "genpipes ampliconseq \\\n  -c a.ini b.ini \\\n"
+            "  -r readset.txt \\\n  -d design.txt \\\n  -g cmd.sh\n</execute>"),
+        "genpipes on the module-load line": (
+            "<execute>\n#!BASH\nmodule load mugqic/genpipes/6.1.1 && genpipes dnaseq "
+            "-t somatic_fastpass \\\n  -c a.ini b.ini \\\n"
+            "  -r readset.txt \\\n  -s 1-23 \\\n  -g cmd.sh\n</execute>"),
+    }
+    for shape, block in shapes.items():
+        p = gate.build_proposal([M(block)], 'propose_submission("cmd.sh")')
+        r.check(f"{shape}: no stray backslash survives into the mirror text",
+                "\\" not in (p.get("generated") or ""))
+        m = mirror.read(p.get("generated"), name="run-0811")
+        rows = [l.row for l in m.lines]
+        r.check(f"{shape}: the readset reaches the box", "readset" in rows)
+        r.check(f"{shape}: and so does the config stack", "config" in rows)
+
+    # THE SAME BUG, ALREADY ON DISK. Every run recorded before build_proposal
+    # learned to resolve continuations first was stored pre-flattened, with the
+    # newline gone and the backslash stranded between two spaces. Those records
+    # do not get rewritten, so /modify on any of them showed "the original
+    # command could not be read back reliably" and fell back to slots -- which
+    # is exactly the degraded view the warning describes, forever.
+    #
+    # The repair is on the READ side for that reason: what fixes it at write
+    # time cannot reach a record written a fortnight ago.
+    stale = ("genpipes dnaseq -t somatic_fastpass \\ -c a.ini b.ini "
+             "\\ -r readset.txt \\ -p pairs.csv \\ -s 1-23 \\ -g cmd.sh")
+    m = mirror.read(stale, name="old-0729")
+    rows = [l.row for l in m.lines]
+    for row in ("protocol", "readset", "pairs", "steps", "config"):
+        r.check(f"a pre-flattened record still reads back its {row}", row in rows)
+    r.equal("and the flags do not collapse into one field",
+            [str(v) for l in m.lines if l.row == "protocol" for v in l.values],
+            ["somatic_fastpass"])
+
+    # The discriminator, and the reason it is sound. A backslash meaning an
+    # ESCAPED SPACE always has a non-space character to its left; one with
+    # whitespace on both sides escapes nothing and no shell writes it on
+    # purpose. Only the second is collapsed, so a real path keeps its space.
+    spaced = mirror.read(r"genpipes rnaseq -r /my\ docs/readset.tsv -c a.ini")
+    r.equal("an escaped space in a path is still one token",
+            [str(v) for l in spaced.lines if l.row == "readset" for v in l.values],
+            ["/my docs/readset.tsv"])
+
+    # The safety net, independent of the parse. A mirror carrying only a head
+    # is not a usable mirror: callers write `read(...) or from_slots(...)`, so
+    # a head-only result has to be falsy or the fallback never fires and a
+    # near-empty box is drawn over slots that would have filled it.
+    head_only = mirror.Mirror(head="genpipes rnaseq")
+    r.check("a mirror with only a head is falsy, so the fallback fires",
+            not head_only)
+    r.check("but it still knows its head", head_only.head == "genpipes rnaseq")
+    r.check("and one with a real row is truthy",
+            bool(mirror.read("genpipes rnaseq -r readset.txt")))
+
+
 def main():
     r = Report("mirror.read(): tokenising a generated command")
 
@@ -127,6 +211,9 @@ def main():
     by_row = {line.row: line for line in m.lines}
     r.equal("from_slots still recovers what the slots parser found",
             by_row["protocol"].values, ["stringtie"])
+
+    r.section("a multi-line command survives the trip to the gate box")
+    _continuation_checks(r)
 
     return r.finish()
 

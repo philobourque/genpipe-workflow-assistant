@@ -168,7 +168,24 @@ class Mirror:
         return ""
 
     def __bool__(self):
-        return bool(self.lines)
+        """True only when there is a FLAG line, not merely a head.
+
+        Callers write `mirror.read(...) or mirror.from_slots(...)`: read() is
+        preferred because it quotes the command, and from_slots() is the
+        fallback that reconstructs from the parsed slots. That fallback only
+        fires when read()'s result is falsy, so "read produced a head and
+        nothing else" has to count as failure -- otherwise a command that
+        tokenised badly draws an approval box naming the pipeline and the run
+        and hiding every flag, while the slots that would have filled it sit
+        unused on the same proposal.
+
+        That is not hypothetical: it is what a `\\`-continued command did. The
+        two failure shapes differed only by luck -- one tripped _groups' own
+        dash-inside-a-value guard and returned nothing (so the fallback fired
+        and the box was right), the other did not (so a near-empty box was
+        drawn over a perfectly good set of slots). Both now take the fallback.
+        """
+        return any(not line.head for line in self.lines)
 
     def __repr__(self):
         return f"<Mirror {self.head!r} {len(self.lines)} lines>"

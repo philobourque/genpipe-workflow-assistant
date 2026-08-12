@@ -491,6 +491,27 @@ _NEWLINE = re.compile(r"\n+")
 # all crammed under `protocol`.
 _CONTINUATION = re.compile(r"\\[ \t]*\n")
 
+# The same continuation AFTER somebody else already flattened it -- the newline
+# gone, the backslash left stranded between two spaces. _CONTINUATION cannot
+# match it, because the newline it anchors on no longer exists.
+#
+# This is not hypothetical tidiness. Every run recorded before build_proposal()
+# learned to resolve continuations first was stored in exactly this shape, and
+# those records are on disk forever: `/modify` on any of them tokenises the
+# stranded backslash as an escaped space and refuses the parse. Healing it here
+# rather than in build_proposal() is what makes the repair retroactive -- this
+# is the one funnel both the gate and the mirror read through, so an old record
+# is repaired when it is READ instead of staying broken because it was WRITTEN
+# a fortnight ago.
+#
+# Surrounded by whitespace is the whole discriminator, and it is a sound one. A
+# backslash that means an escaped space -- `/my\ documents/readset.tsv`, which
+# is legal and which shlex must go on honouring -- always has a non-space
+# character to its left. One with whitespace on BOTH sides escapes nothing: no
+# shell writes it deliberately, and the only thing that produces it is a
+# continuation whose newline has been flattened away.
+_STRANDED = re.compile(r"(?:^|(?<=\s))\\(?=\s|$)")
+
 def invocation(generated):
     """The bare genpipes call, cut out of whatever block it arrived in.
 
@@ -499,8 +520,9 @@ def invocation(generated):
     draws no mirror rather than an empty frame.
     """
     # Line continuations resolved before whitespace is flattened -- see
-    # _CONTINUATION's comment for why the order matters.
-    text = _CONTINUATION.sub(" ", generated or "")
+    # _CONTINUATION's comment for why the order matters -- and then again in
+    # their already-flattened form, for commands that reached us pre-flattened.
+    text = _STRANDED.sub(" ", _CONTINUATION.sub(" ", generated or ""))
 
     # Then cut to the LINE holding the call, while newlines still exist to cut
     # on. A generation is routinely a small script -- an OUT=... assignment, a
@@ -685,7 +707,20 @@ def build_proposal(messages, code):
         # working away by default -- without this, the generation would scroll
         # past unseen and the approval box would be the first and only place the
         # command appeared, reading `bash cmd.sh`.
-        "generated": " ".join((gen or "").split()) or None,
+        # Continuations resolved BEFORE the whitespace is flattened, for the
+        # reason spelled out above _CONTINUATION: a `\` survives flattening as
+        # `\ `, and shlex reads that as an escaped space rather than a token
+        # boundary, so every flag after the first continuation collapses into
+        # the previous flag's value.
+        #
+        # Flattening first destroyed the newline _CONTINUATION needs to match,
+        # so mirror.read() -- which tokenises this string -- silently failed on
+        # every hand-formatted multi-line command. What that looked like: a
+        # HOLD box listing the run's name and nothing else, with /approve still
+        # offered, for a command that had a readset, a design file and three
+        # inis in it. The slots were parsed correctly the whole time; only the
+        # string kept for the mirror was mangled.
+        "generated": " ".join(_CONTINUATION.sub(" ", gen or "").split()) or None,
         "explanation": "\n".join(lines),
         "script": script_name(code or ""),
         "slots": {"pipeline": pipeline, "protocol": protocol, "steps": steps,
