@@ -1707,7 +1707,22 @@ def modify_panel(entries_of, changes=None, notes=None, required=None,
                 continue
 
             body, more = _mirror_body(line, tint, strong)
-            if open_here:
+            if open_here and row == modify.CONFIG:
+                # `-c` open. The `old  →  new` header every other row uses is a
+                # lie here twice over: there is no single old value (the row is
+                # a stack, and that header can only show its first line), and
+                # Enter is not about to replace anything -- it moves one ini on
+                # or off. So the header states the stack's SIZE and what the
+                # keys do, and keeps only the caret, because typing still
+                # narrows the list underneath.
+                stack = now[row] if row in now else line.values
+                body = (f"{tint}{line.label:<{_MIRROR_LABEL}}{RESET}"
+                        f"{tint}{line.flag:<{_MIRROR_FLAG}}{RESET}"
+                        f"{DIM}{len(stack)} on the stack, applied in order — "
+                        f"later wins{RESET}"
+                        f"  {BOLD}{WHITE}{narrowing}{RESET}{GREEN}█{RESET}")
+                more = []
+            elif open_here:
                 # The row becomes the question while its choices are showing:
                 # the old value, an arrow, and a live caret. Without the caret
                 # the row reads as a label rather than as something typing
@@ -1719,6 +1734,19 @@ def modify_panel(entries_of, changes=None, notes=None, required=None,
                         f"{DIM}  →  {RESET}"
                         f"{BOLD}{WHITE}{narrowing}{RESET}{GREEN}█{RESET}")
                 more = []
+            elif moved and isinstance(now[row], (list, tuple)):
+                # The `-c` stack, the one row whose new value is plural. Drawn
+                # as the stack it will become, one ini per line and in order,
+                # because that IS the value: `-c` is applied left to right and
+                # later inis overrule earlier ones. Flattened onto the single
+                # `old  →  new` line the other rows use, four inis run past the
+                # width of the panel and the ordering that decides the run's
+                # parameters is the first thing off the edge.
+                new = list(now[row])
+                body = (f"{GREEN}{line.label:<{_MIRROR_LABEL}}{RESET}"
+                        f"{GREEN}{line.flag:<{_MIRROR_FLAG}}{RESET}"
+                        f"{GREEN}{BOLD}{new[0] if new else '—'}{RESET}")
+                more = [f"{GREEN}{BOLD}{ini}{RESET}" for ini in new[1:]]
             elif moved:
                 body = (f"{tint}{line.label:<{_MIRROR_LABEL}}{RESET}"
                         f"{tint}{line.flag:<{_MIRROR_FLAG}}{RESET}"
@@ -3388,6 +3416,27 @@ def change_plan(deltas, notes=()):
     print()
     width = max((len(d[0]) for d in deltas), default=8) + 4
     for slot, old, new in deltas:
+        if isinstance(new, (list, tuple)):
+            # The `-c` stack. Shown as the stack it will BECOME, in order, with
+            # each line marked by what happened to it -- the untouched inis dim
+            # so the eye goes to the `+`, and the dropped ones listed after it
+            # struck through in red, because an ini leaving is a change nobody
+            # can see by reading the result.
+            was, now = list(old or ()), list(new)
+            bases = {os.path.basename(str(x)) for x in was}
+            for ini in now:
+                fresh = os.path.basename(str(ini)) not in bases
+                mark = f"{GREEN}+{RESET}" if fresh else f"{DIM}·{RESET}"
+                body = f"{GREEN}{BOLD}{ini}{RESET}" if fresh else f"{DIM}{ini}{RESET}"
+                print(f"    {WHITE}{slot:<{width}}{RESET}{mark}  {body}")
+                slot = ""
+            keep = {os.path.basename(str(x)) for x in now}
+            for ini in was:
+                if os.path.basename(str(ini)) not in keep:
+                    print(f"    {WHITE}{slot:<{width}}{RESET}{RED}−{RESET}"
+                          f"  {RED}{ini}{RESET}")
+                    slot = ""
+            continue
         old_text = old if old not in (None, "") else "—"
         print(f"    {WHITE}{slot:<{width}}{RESET}{DIM}{old_text}{RESET}"
               f"  {DIM}→{RESET}  {BOLD}{new}{RESET}")

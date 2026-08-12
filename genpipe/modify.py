@@ -132,6 +132,91 @@ _CONSEQUENCE = {
 }
 
 
+CONFIG = "config"
+
+
+def config_stack(proposal, changes=None):
+    """The `-c` stack as it stands right now: the run's inis, plus whatever
+    toggling has done to them this pass.
+
+    Returned as a LIST, in order, because `-c` is the one row whose value is
+    plural and whose order carries meaning -- later inis overrule earlier ones,
+    so "dnaseq.base.ini then rorqual.ini" and its reverse are two different
+    runs. Every other row is a scalar and gets to be a string.
+    """
+    changed = (changes or {}).get(CONFIG)
+    if changed is not None:
+        return list(changed)
+    inis = ((proposal or {}).get("slots") or {}).get("inis") or ()
+    return list(dict.fromkeys(str(ini) for ini in inis))
+
+
+def toggle_config(proposal, changes, ini):
+    """The stack with `ini` taken off it if it was on, or put on if it was not.
+
+    This is why `config` opens differently from every other row. The other nine
+    ask "what should this BE", and one answer replaces one value. `-c` is a
+    stack of four or five inis where the intended edit is nearly always "the
+    same stack, plus a genome ini" or "the same stack, minus cit.ini" -- and a
+    row that can only be replaced wholesale forces that edit to be retyped as a
+    whole list, which is both tedious and the easiest possible way to silently
+    drop the base ini.
+
+    An ini is matched by BASENAME, not by the path written. The stack routinely
+    holds `$GENPIPES_INIS/dnaseq/dnaseq.cancer.ini` while the options list --
+    built from slots.expected_inis() -- knows it only as `dnaseq.cancer.ini`.
+    Comparing the strings would show it as absent and offer to add a second
+    copy under a different spelling, which GenPipes would then read twice.
+
+    Where a NEW ini belongs in the layering is a question this module
+    deliberately does not answer -- see _deltas(), which hands it to the model
+    along with the layer rule it already has from genpipes.md, rather than
+    encoding a layer table here that would go stale against GenPipes. So a new
+    ini goes on the end and the model places it.
+
+    Putting BACK one this run already had is the opposite case, and it is not
+    an addition at all: it is an undo, and an undo that moved cit.ini from the
+    middle of the stack to the end would change which ini wins while claiming
+    to restore. Those go back among the originals, in their original order.
+    """
+    stack = config_stack(proposal, changes)
+    base = os.path.basename(str(ini))
+    kept = [x for x in stack if os.path.basename(x) != base]
+    if len(kept) != len(stack):
+        return kept
+
+    was = config_stack(proposal)
+    rank = {os.path.basename(x): i for i, x in enumerate(was)}
+    if base not in rank:
+        return stack + [str(ini)]
+    # Before the first ini that outranked it originally -- or, failing that,
+    # before the first ini that was never in the original stack at all. The
+    # second half is what puts back the LAST original: nothing outranks it, so
+    # without that clause it lands after an override ini added since, and an
+    # override that is no longer last is an override that is silently overruled.
+    for at, x in enumerate(stack):
+        other = rank.get(os.path.basename(x))
+        if other is None or other > rank[base]:
+            return stack[:at] + [str(ini)] + stack[at:]
+    return stack + [str(ini)]
+
+
+def config_delta(proposal, changes):
+    """What toggling actually did, as (added, dropped) lists of inis.
+
+    Compared against the PROPOSAL rather than reported as the whole new stack,
+    because the model is being told to edit a `-c` line it can already see. A
+    full stack would read as "replace -c with this", and replacing is how the
+    order of the inis nobody touched gets rewritten.
+    """
+    was = config_stack(proposal)
+    now = config_stack(proposal, changes)
+    before = {os.path.basename(x) for x in was}
+    after = {os.path.basename(x) for x in now}
+    return ([x for x in now if os.path.basename(x) not in before],
+            [x for x in was if os.path.basename(x) not in after])
+
+
 def current(proposal, row):
     """What this row says now, as a display string, or '' if it says nothing."""
     if row == "name":
@@ -206,11 +291,47 @@ def options_for(row, proposal, candidates=None, pending=None):
                 for p in slots.protocols(pipeline)]
     if row in _FILE_ROWS:
         return [slots.Option(path, path) for path in candidates.get(row) or ()]
-    if row == "config" and pipeline:
-        protocol = values.get("protocol") or slots.DEFAULTS.get(pipeline)
-        expected = slots.expected_inis(pipeline, protocol)
-        return [slots.Option(ini, ini, "feature ini for this protocol")
-                for ini in expected or ()]
+    if row == "config":
+        # Every ini worth naming, each already knowing which way Enter will
+        # move it. The order is deliberate: what is ON the stack comes first,
+        # because removing something requires seeing it, and a list that led
+        # with suggestions would bury the four inis the run actually has under
+        # the one it might want.
+        stack = config_stack(proposal, pending)
+        on = {os.path.basename(x) for x in stack}
+        # The tick is in the LABEL, not only in the description, for the reason
+        # the panel states about its own rows: a description is the first thing
+        # a narrow terminal drops (details_on) and the first thing a screenshot
+        # loses. Whether an ini is on the stack decides which way Enter moves
+        # it, so it cannot live only in the column that disappears.
+        out = [slots.Option(ini, f"✓ {ini}", "on the stack — enter takes it off")
+               for ini in stack]
+        # Inis this run HAD and toggling has taken off. Listed straight after
+        # the survivors, because a removal nobody can undo is a trap: cit.ini
+        # is neither a feature ini for any protocol nor a file in the project
+        # directory, so once it left the stack nothing else here would ever
+        # offer it again and the only way back would be to abandon the whole
+        # change set.
+        for ini in config_stack(proposal):
+            if os.path.basename(ini) not in on:
+                on.add(os.path.basename(ini))
+                out.append(slots.Option(ini, f"✗ {ini}",
+                                        "taken off — enter puts it back"))
+        protocol = (pending or {}).get("protocol") or values.get("protocol")
+        if pipeline:
+            protocol = protocol or slots.DEFAULTS.get(pipeline)
+            for ini in slots.expected_inis(pipeline, protocol) or ():
+                if os.path.basename(ini) not in on:
+                    on.add(os.path.basename(ini))
+                    out.append(slots.Option(
+                        ini, f"  {ini}",
+                        f"feature ini {protocol} wants — enter adds it"))
+        for ini in candidates.get("config") or ():
+            if os.path.basename(ini) not in on:
+                on.add(os.path.basename(ini))
+                out.append(slots.Option(ini, f"  {ini}",
+                                        "found here — enter adds it"))
+        return out
     # name, steps and output are free text. A step range is a range, not a list,
     # and a path is a path -- inventing options for either would be inventing.
     return []
@@ -231,7 +352,9 @@ def question_for(row, proposal, pending=None):
     if row == "output":
         return "Which output directory?"
     if row == "config":
-        return "Which config ini should be added?"
+        # Phrased as a stack rather than a question with one answer, because
+        # this row does not close on the first Enter -- see toggle_config().
+        return "Which inis? enter puts one on the -c stack or takes it off"
     return f"Which {row} file?"
 
 
@@ -328,6 +451,16 @@ def check(row, value, proposal, directory=".", registry=None, name=None,
     leaving the person to guess -- "'germline_snv' is a dnaseq protocol; this
     run is chipseq. chipseq takes:" and then the two real ones.
     """
+    if row == CONFIG:
+        # The one row whose value is a list, and the one whose emptiness is a
+        # legitimate answer rather than a slip: taking every ini off `-c` is a
+        # strange thing to want, but it is a thing somebody can mean, and it is
+        # reached by removing them one at a time with the consequences visible
+        # the whole way. There is nothing to validate here that the loop that
+        # produced the list has not already constrained -- every entry came off
+        # an offered option, never off the keyboard.
+        return Verdict(True)
+
     value = (value or "").strip()
     if not value:
         return Verdict(False, "Nothing entered.")
@@ -655,9 +788,19 @@ def sentence(proposal, changes):
         return ""
 
     parts = _deltas(proposal, substantive)
+    # A change set can survive the emptiness check above and still describe
+    # nothing -- a -c stack toggled back to itself is the case. Regenerating
+    # for a diff with no lines in it is a chance for the command to drift with
+    # nothing asked for, which is the failure this module exists to prevent.
+    if not parts:
+        return ""
     untouched = [FLAG_OF[r] for r in FLAG_OF
                  if r not in substantive and current(proposal, r)]
-    tail = (f"; leave {', '.join(untouched)} exactly as they are"
+    # "leave -t exactly as they are" for a single flag. The instruction is read
+    # by a model that is being asked to change one thing and nothing else, and
+    # an instruction that does not parse is one it has licence to interpret.
+    tail = (f"; leave {', '.join(untouched)} exactly as "
+            f"{'it is' if len(untouched) == 1 else 'they are'}"
             if untouched else "")
     return "; ".join(parts) + tail + ". Regenerate the command and stop at the gate again."
 
@@ -738,6 +881,29 @@ def _deltas(proposal, substantive):
             out.append(f"append {new} to the very END of the -c stack, after "
                        f"every other ini, and change nothing else about -c "
                        f"(it is a private override ini and has to win)")
+            continue
+        if row == CONFIG and isinstance(new, (list, tuple)):
+            # Said as a diff, never as a replacement. "change -c from a,b,c,d
+            # to a,b,d" is the same information and the wrong instruction: it
+            # invites the model to rewrite the whole -c line, and a rewritten
+            # -c line is one whose surviving inis can come back in a different
+            # order. Order is the entire semantics of this flag.
+            added, dropped = config_delta(proposal, {CONFIG: new})
+            parts = ([f"add {', '.join(added)} to the -c stack"] if added else [])
+            parts += ([f"drop {', '.join(dropped)} from the -c stack"]
+                      if dropped else [])
+            if not parts:
+                continue
+            note = ("leave every other ini on -c exactly where it is")
+            if added:
+                # The layer rule lives in genpipes.md, which the model is
+                # already given as its grammar. Pointing at it beats restating
+                # it: a layer table copied into this module is a table that can
+                # disagree with the one the model is reading.
+                note += ("; place what you add by the -c layering rule "
+                         "(base, feature ini, data-type overlay, cluster ini, "
+                         "genome ini, private overrides last)")
+            out.append(" and ".join(parts) + ", " + note)
             continue
         flag = FLAG_OF.get(row, row)
         old = current(proposal, row)

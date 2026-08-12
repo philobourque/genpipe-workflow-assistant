@@ -428,6 +428,105 @@ def main():
             ["pipeline", "protocol"])
 
     # ------------------------------------------------------------------ #
+    r.section("-c is a stack, so config is edited by toggling")
+
+    # Every other row answers "what should this BE" and one Enter replaces one
+    # value. `-c` is a list whose ORDER decides the run's parameters, and the
+    # edit people actually want is "the same stack, plus one" or "minus one".
+    STACKED = {"slots": dict(PROPOSAL["slots"],
+                             inis=["$GENPIPES_INIS/dnaseq/dnaseq.base.ini",
+                                   "$GENPIPES_INIS/common_ini/rorqual.ini",
+                                   "$GENPIPES_INIS/dnaseq/cit.ini"],
+                             pipeline="dnaseq", protocol="somatic_fastpass")}
+
+    r.equal("the stack reads back in order",
+            [os.path.basename(x) for x in modify.config_stack(STACKED)],
+            ["dnaseq.base.ini", "rorqual.ini", "cit.ini"])
+
+    # Matched by BASENAME. The stack holds full $GENPIPES_INIS paths while the
+    # options list knows the feature ini as a bare filename, so comparing the
+    # strings would offer to add a second copy of an ini already there.
+    dropped = modify.toggle_config(STACKED, {}, "cit.ini")
+    r.equal("toggling a bare name takes the full path off the stack",
+            [os.path.basename(x) for x in dropped],
+            ["dnaseq.base.ini", "rorqual.ini"])
+
+    added = modify.toggle_config(STACKED, {"config": dropped},
+                                 "dnaseq.cancer.ini")
+    r.equal("and one that is not on it goes on the end",
+            [os.path.basename(x) for x in added],
+            ["dnaseq.base.ini", "rorqual.ini", "dnaseq.cancer.ini"])
+
+    r.equal("the delta is add-and-drop, never the whole stack",
+            modify.config_delta(STACKED, {"config": added}),
+            (["dnaseq.cancer.ini"], ["$GENPIPES_INIS/dnaseq/cit.ini"]))
+
+    # The instruction the model gets. It must be a DIFF: told "change -c from
+    # a,b,c to a,b,d" a model rewrites the whole -c line, and a rewritten -c
+    # line is one whose surviving inis can come back in a different order --
+    # which silently changes which ini wins.
+    said = modify.sentence(STACKED, {"config": added})
+    r.check("the model is told what to add", "add dnaseq.cancer.ini" in said)
+    r.check("and what to drop", "drop $GENPIPES_INIS/dnaseq/cit.ini" in said)
+    r.check("and to leave the rest where they are",
+            "leave every other ini on -c exactly where it is" in said)
+    r.check("never as a replacement", "change -c from" not in said)
+
+    # Toggled on and straight back off. The change set is then equal to what
+    # the run already has, and a regeneration for a diff with no lines in it is
+    # a chance for the command to drift with nothing asked for.
+    back = modify.toggle_config(STACKED, {"config":
+                                          modify.toggle_config(STACKED, {}, "x.ini")},
+                                "x.ini")
+    r.equal("a stack toggled back to itself is the original",
+            back, modify.config_stack(STACKED))
+    r.equal("and buys no model call", modify.sentence(STACKED, {"config": back}), "")
+
+    # check() must not treat the list as a string to be stripped, and an empty
+    # stack is a strange thing to want rather than a slip -- it is reached one
+    # visible removal at a time.
+    r.check("a list value passes check", bool(modify.check("config", added, STACKED)))
+    r.check("so does an empty one", bool(modify.check("config", [], STACKED)))
+
+    # The options list leads with what is ON the stack: removing something
+    # requires seeing it, and suggestions first would bury the real inis.
+    offered = modify.options_for("config", STACKED, {"config": ["mine.override.ini"]})
+    r.equal("the current stack comes first",
+            [o.value for o in offered][:3], STACKED["slots"]["inis"])
+    r.check("each says which way enter moves it",
+            all("enter" in o.description for o in offered))
+    r.check("a local ini is offered to add",
+            "mine.override.ini" in [o.value for o in offered])
+    r.equal("and nothing is offered twice",
+            len({o.value for o in offered}), len(offered))
+
+    # Whether an ini is on the stack decides which way Enter moves it, so it
+    # is marked in the LABEL and not only in the description column, which is
+    # what a narrow terminal drops first.
+    r.check("what is on the stack is ticked in the label",
+            all(o.label.startswith("✓") for o in offered[:3]))
+
+    # A REMOVAL HAS TO BE UNDOABLE. cit.ini is no protocol's feature ini and no
+    # file in the project directory, so once it is off the stack nothing else
+    # in this list would ever offer it again -- and the only way back would be
+    # to throw away the whole change set.
+    after = modify.options_for("config", STACKED, {}, pending={"config": dropped})
+    gone = [o for o in after if o.value.endswith("cit.ini")]
+    r.equal("an ini taken off is still listed", len(gone), 1)
+    r.contains("and says enter puts it back", gone[0].description, "puts it back")
+
+    # And putting it back is an UNDO, not an addition. Restoring it to the end
+    # of the stack would change which ini wins while claiming to restore.
+    mixed = modify.toggle_config(STACKED, {"config": dropped}, "mine.override.ini")
+    restored = modify.toggle_config(STACKED, {"config": mixed},
+                                    "$GENPIPES_INIS/dnaseq/cit.ini")
+    r.equal("an ini put back lands where it was, not on the end",
+            [os.path.basename(x) for x in restored],
+            ["dnaseq.base.ini", "rorqual.ini", "cit.ini", "mine.override.ini"])
+    r.equal("and the override ini stays last, where it has to be",
+            os.path.basename(restored[-1]), "mine.override.ini")
+
+    # ------------------------------------------------------------------ #
     r.section("/sort hides rows without losing them")
 
     with tempfile.TemporaryDirectory() as tmp:

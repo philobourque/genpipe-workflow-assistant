@@ -371,11 +371,15 @@ try:
 
     # candidates()/context_for() must never guess a directory: None in means
     # nothing discovered, not "whatever the caller happened to be standing in".
+    # Asserted as "every bucket is empty" rather than against a literal dict:
+    # the property is that nothing was DISCOVERED, and pinning the key set made
+    # adding a bucket look like a regression in a test about guessing.
     r.equal("candidates(None) discovers nothing",
-            intake.candidates(None), {"readset": [], "design": [], "pairs": []})
+            sorted(p for paths in intake.candidates(None).values()
+                   for p in paths), [])
     stated2, found2 = intake.context_for("hello")
     r.equal("context_for with no directory established finds nothing",
-            found2, {"readset": [], "design": [], "pairs": []})
+            sorted(p for paths in found2.values() for p in paths), [])
 
     # _resolves must not silently join a relative name against nothing.
     r.check("an absolute path can still resolve with no directory established",

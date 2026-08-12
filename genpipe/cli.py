@@ -871,6 +871,31 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
 
     def settle(row, picked):
         """Take `picked` for `row`, or leave the row open saying why not."""
+        if row == modify.CONFIG:
+            # `-c` is a stack, so Enter moves ONE ini on or off it and the row
+            # stays open for the next one. Everywhere else Enter is an answer
+            # and closing the row is the acknowledgement; here it would mean a
+            # person adding a genome ini and dropping cit.ini has to find the
+            # row, open it, and re-read a four-line list twice.
+            #
+            # The stack is recomputed from the proposal every time rather than
+            # mutated in place, so toggling something on and back off leaves
+            # `changes` holding a list equal to what the run already has --
+            # which sentence() then correctly reports as no change at all,
+            # rather than as a -c edit that happens to be a no-op.
+            state["typed"] = ""
+            stack = modify.toggle_config(proposal, changes, picked)
+            if stack == modify.config_stack(proposal):
+                # Toggled back to where it started. Dropping the entry rather
+                # than storing a list that equals the original is what keeps
+                # the row from going green, the count from saying "1 change",
+                # and sentence() from spending a regeneration on a diff with
+                # nothing in it.
+                changes.pop(row, None)
+            else:
+                changes[row] = stack
+            required.pop(row, None)
+            return True
         verdict = modify.check(row, picked, proposal, registry=agent.registry,
                                name=name, pending=changes)
         if not verdict:
@@ -1059,7 +1084,14 @@ def _modify_guided(agent, name, record, fork_only=False):
                 display.nothing("Nothing changed.", f"'{name}' is still held.")
             return
 
-        deltas = [(row, modify.current(proposal, row) if row != "name" else name,
+        # `config` hands change_plan the OLD STACK AS A LIST rather than
+        # modify.current()'s joined string, because that is what makes the two
+        # sides comparable: change_plan diffs them by basename to mark what was
+        # added and what left. Every other row is a scalar and stays one.
+        deltas = [(row,
+                   modify.config_stack(proposal) if row == modify.CONFIG
+                   else name if row == "name"
+                   else modify.current(proposal, row),
                    new) for row, new in changes.items()]
         notes = modify.cross_check(proposal, changes)
         display.change_plan(deltas, notes)

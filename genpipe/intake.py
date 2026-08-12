@@ -38,6 +38,17 @@ _FILE_SUFFIXES = (".tsv", ".txt", ".csv")
 # The slots whose value is a path, and so can be checked against the disk.
 _FILE_SLOTS = ("readset", "design", "pairs")
 
+# Buckets candidates() fills for the /modify panel and brief() must NOT pass to
+# the model. The panel offers an ini to somebody who can see the whole -c stack
+# and is deciding where it goes; brief() offers candidates under the standing
+# instruction "exactly one candidate for a role means use it and say so", which
+# is right for a readset and dangerous for an ini. A project directory
+# accumulates `*.override.ini` files belonging to other runs and GenPipes'
+# own `<Pipeline>.<protocol>.<TIMESTAMP>.config.trace.ini` artefacts, and a run
+# that quietly inherits one of those generates cleanly, submits cleanly, and
+# runs with somebody else's walltimes.
+_NOT_A_CANDIDATE = ("config",)
+
 _ROLE_HINTS = (
     ("readset", ("readset", "readsets", "samplesheet", "sample_sheet")),
     ("design", ("design", "contrast", "contrasts")),
@@ -142,7 +153,7 @@ def candidates(directory=None, limit=8):
     buckets rather than falling back to the process's current directory. The
     caller decides what counts as "established"; this function never guesses.
     """
-    buckets = {"readset": [], "design": [], "pairs": []}
+    buckets = {"readset": [], "design": [], "pairs": [], "config": []}
     if directory is None:
         return buckets
     try:
@@ -150,12 +161,24 @@ def candidates(directory=None, limit=8):
     except OSError:
         return buckets
     for name in names:
+        path = os.path.join(directory, name) if directory != "." else name
+        # An ini is recognised by its SUFFIX, not by a name hint, because
+        # unlike the other three roles there is nothing to hint at: an ini is
+        # whatever somebody wrote sections into, and the ones worth offering
+        # here -- a private override, a hand-written overlay -- are named after
+        # whatever they tune. Deliberately kept out of _ROLE_HINTS, which
+        # find_files() also reads: that function parses prose, and teaching it
+        # that every `.ini` mentioned in a sentence is a slot value would have
+        # it filling `-c` from a message that merely explained the layering.
+        if name.lower().endswith(".ini"):
+            if len(buckets["config"]) < limit:
+                buckets["config"].append(path)
+            continue
         if not name.lower().endswith(_FILE_SUFFIXES):
             continue
         stem = name.lower()
         for role, hints in _ROLE_HINTS:
             if any(h in stem for h in hints) and len(buckets[role]) < limit:
-                path = os.path.join(directory, name) if directory != "." else name
                 buckets[role].append(path)
                 break
     return buckets
@@ -320,7 +343,8 @@ def brief(text, directory=None):
     # on wandering, and following a path somebody handed over is the opposite.
     named = {}
     for where in find_directories(text):
-        hits = {role: paths for role, paths in candidates(where).items() if paths}
+        hits = {role: paths for role, paths in candidates(where).items()
+                if paths and role not in _NOT_A_CANDIDATE}
         if hits:
             named[where] = hits
 
@@ -330,7 +354,8 @@ def brief(text, directory=None):
     seen = []
     if established and established not in named:
         found = candidates(established)
-        seen = [(role, paths) for role, paths in found.items() if paths]
+        seen = [(role, paths) for role, paths in found.items()
+                if paths and role not in _NOT_A_CANDIDATE]
 
     if not known and not seen and not missing and not named:
         return text

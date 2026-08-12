@@ -1070,6 +1070,21 @@ def main():
     r.contains("the second one too", text, "1-8")
     r.contains("and the cross-field consequence", text, "atac")
 
+    # `-c` is the one row whose value is plural, so it is reviewed as a stack
+    # rather than as one `old → new` line: four inis flattened onto that line
+    # run past the panel, and the ordering that decides which ini wins is the
+    # first thing to go off the edge. An ini that LEAVES has to be visible too
+    # -- nothing in the resulting stack shows that it used to be there.
+    text = drawn(display.change_plan,
+                 [("config", ["base.ini", "rorqual.ini", "cit.ini"],
+                   ["base.ini", "rorqual.ini", "mine.override.ini"])])
+    r.contains("an ini that was added is marked", text, "+  mine.override.ini")
+    r.contains("an ini that was dropped is still shown", text, "−  cit.ini")
+    r.contains("and the ones that stayed are listed in order",
+               text, "·  base.ini")
+    r.check("the label is printed once, not on every ini",
+            text.count("config") == 1)
+
     text = drawn(display.reading_as, "chipseq-0728", "steps 1-5 → 1-8")
     r.contains("prose states its interpretation", text, "Reading that as")
 
