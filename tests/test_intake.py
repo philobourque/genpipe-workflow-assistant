@@ -196,7 +196,11 @@ r.section("brief(): facts for the agent, not questions for the user")
 
 text = intake.brief("run rnaseq stringtie with readset.tsv", ".")
 r.contains("the original words survive verbatim", text, "run rnaseq stringtie")
-r.contains("what was stated is marked settled", text, "do not ask again")
+# It used to say "do not ask again" here. It reports what was FOUND in the
+# sentence now and leaves the reading to the agent -- a name in a question
+# ("a.tsv or b.tsv?") parses identically to a name in an instruction.
+r.contains("what was stated is reported as parsed, not as decided",
+           text, "Names found in the request above")
 r.contains("including the pipeline", text, "pipeline: rnaseq")
 r.contains("and the file named in the sentence", text, "readset: readset.tsv")
 
@@ -209,9 +213,14 @@ try:
         open(os.path.join(tmp, name), "w").close()
     text = intake.brief("do the usual rnaseq thing", tmp)
     r.contains("files on disk are offered", text, "readset.rnaseq.txt")
-    r.contains("as candidates", text, "candidates, not")
-    r.truthy("and are never presented as settled",
-             "do not ask again" not in text.split("candidates")[1])
+    r.contains("as candidates", text, "Candidates only")
+    r.contains("with the trap named", text, "not thereby the right readset")
+    # Nothing in the brief forbids a question any more. It used to say "do not
+    # ask again" of names merely PARSED out of a sentence, which is the same
+    # overreach prep.goal() was deleted for: a filename in "should I use a.tsv
+    # or b.tsv?" parses fine and is not an answer.
+    r.truthy("and nothing in the brief forbids asking",
+             "do not ask" not in text.lower())
     r.truthy("an irrelevant file is left out", "notes.md" not in text)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
@@ -434,7 +443,11 @@ try:
     text = intake.brief(f"mouse rna-seq fastq on Rorqual (9 samples): {data}",
                         directory=launch)
     r.contains("the readset in it is offered", text, "myReadset.tsv")
-    r.contains("labelled as the directory the request points at", text, "POINTS AT")
+    # No longer "the directory the request POINTS AT. This is where their data
+    # is" -- one of several directories a conversation may have named, any of
+    # which could be an output path or one that was ruled out.
+    r.contains("labelled as a directory that was named", text,
+               "directories that have been named")
 
     # ----------------------------------------------------------------- #
     r.section("a file that is named but misspelled is corrected, not dropped")

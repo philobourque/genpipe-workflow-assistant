@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""cli._track()/_settled()/_briefed()/_at_the_gate(), with no model involved.
+"""prep.track()/context() and cli._briefed()/_at_the_gate(), with no model.
 
 Everything exercised here is deterministic Python: intake parsing, the carried
 prep.Preparation, and the text assembled for the agent. No LLM is invoked and no
@@ -14,9 +14,16 @@ filename, could not see a dataset named in words rather than as a path, and
 preempted the agent on every turn of a run being prepared -- so the model never
 got to lead the conversation it was supposed to be leading.
 
-What is left is memory, not control: parse what a sentence plainly states,
-remember it across turns, and hand it over as facts. Every turn reaches the
-model now, and the assertions below are written that way round.
+What is left is narrower still. The pipeline/protocol/filename memory this
+suite used to assert is gone too: matching a name proves it was TYPED, not
+chosen ("should I use rnaseq or chipseq?" settled chipseq), and the model is
+replayed the whole thread anyway, so nothing needed remembering for it. See
+tests/test_prep.py, which is the offline guard on that.
+
+What survives is PROVENANCE -- the directories somebody actually named, so
+intake has somewhere to look other than the process's own cwd -- and the brief
+assembled from them. Every turn reaches the model, and the assertions below are
+written that way round.
 
 Needs biomni importable, purely because cli.py imports `biomni.llm.get_llm` at
 module scope -- nothing here calls it. Run in the biomni venv:
@@ -63,23 +70,19 @@ def main():
         os.chdir(launch_dir)
 
         state = prep.Preparation()
-        state, extra = cli._track(state, "I want to run an rnaseq pipeline on mouse data")
+        state, extra = prep.track(state, "I want to run an rnaseq pipeline on mouse data")
 
-        r.equal("pipeline is recognised", state.pipeline, "rnaseq")
-        r.equal("project_dir stays missing -- nothing was named",
-                state.project_dir, None)
-        r.truthy("what is settled is stated", extra and "rnaseq" in extra)
-        r.truthy("the unrelated design.tsv is never surfaced",
-                 extra is None or "design.tsv" not in extra)
-
-        # The note is memory, not a script. It must not tell the model which
-        # question to ask next: the model may have resolved the readset itself.
-        r.truthy("no next question is dictated",
-                 extra is None or "ONLY thing to ask" not in extra)
+        # The pipeline is NOT recorded any more, even though "rnaseq" is right
+        # there as a whole word. The same match fires on "should I use rnaseq
+        # or chipseq?", and deciding which of those is a choice is a reading
+        # the agent makes -- it has the sentence.
+        r.equal("nothing is recorded from a sentence alone",
+                state.as_dict(), {"directories": []})
+        r.equal("and nothing is asserted to the model", extra, None)
 
         text, context = cli._briefed(
             "I want to run an rnaseq pipeline on mouse data", None,
-            state.project_dir)
+            state.directory)
         r.truthy("the briefed text never mentions the unrelated design.tsv",
                  "design.tsv" not in text)
     finally:
@@ -101,16 +104,18 @@ def main():
 
         line = f"run ampliconseq, the readset is in {data_dir}"
         state = prep.Preparation()
-        state, extra = cli._track(state, line)
+        state, extra = prep.track(state, line)
 
-        r.equal("the named directory becomes project_dir", state.project_dir, data_dir)
-        r.equal("pipeline recognised too", state.pipeline, "ampliconseq")
+        r.equal("the named directory is remembered", state.directories, [data_dir])
+        r.contains("as provenance, not as a verdict", extra, "mentioned so far")
+        r.check("with no claim about what it contains",
+                "readset" not in (extra or "").lower(), extra)
 
-        found = intake.candidates(state.project_dir)
+        found = intake.candidates(state.directory)
         r.truthy("candidate discovery is rooted at the named directory",
                  any("myReadset.tsv" in p for p in found["readset"]))
 
-        text, context = cli._briefed(line, None, state.project_dir)
+        text, context = cli._briefed(line, None, state.directory)
         r.truthy("the readset in the named directory is offered",
                  "myReadset.tsv" in text)
         r.truthy("the unrelated design.tsv from the launch cwd never appears",
@@ -128,25 +133,29 @@ def main():
         readset = os.path.join(work, "readset.tsv")
         open(readset, "w").close()
 
+        second = os.path.join(work, "more")
+        os.makedirs(second, exist_ok=True)
+
         state = prep.Preparation()
-        state, _ = cli._track(state, "I want to find inherited SNVs and small indels")
-        r.equal("a scientific goal resolves the pipeline", state.pipeline, "dnaseq")
-        r.equal("and the protocol, where it is unambiguous",
-                state.protocol, "germline_snv")
+        state, _ = prep.track(state, "I want to find inherited SNVs and small indels")
+        # A scientific goal used to resolve dnaseq AND germline_snv from a
+        # regex table, then tell the model not to ask about either. A guessed
+        # protocol produces a run that completes successfully and answers a
+        # different question -- which is exactly what agent.py's own prompt
+        # forbids the MODEL from doing.
+        r.equal("a scientific goal resolves nothing deterministically",
+                state.as_dict(), {"directories": []})
 
-        state, _ = cli._track(state, f"the data is in {work}")
-        r.equal("a later turn adds the directory", state.project_dir, work)
-        r.equal("without forgetting the pipeline", state.pipeline, "dnaseq")
+        state, _ = prep.track(state, f"the data is in {work}")
+        r.equal("a named directory is remembered", state.directories, [work])
 
-        state, extra = cli._track(state, f"use {readset}")
-        r.equal("and then the readset", state.readset, readset)
-        r.equal("pipeline still remembered three turns later",
-                state.pipeline, "dnaseq")
-        r.truthy("all of it is handed over as settled",
-                 extra and "dnaseq" in extra and "germline_snv" in extra
-                 and readset in extra)
-        r.truthy("and marked as not-to-be-asked-again",
-                 extra and "not ask" in extra.lower())
+        state, extra = prep.track(state, f"and some more in {second}")
+        r.equal("directories accumulate rather than overwrite",
+                state.directories, [work, second])
+        r.equal("the first mentioned stays primary", state.directory, work)
+        r.contains("both are handed over", extra, second)
+        r.check("with nothing marked not-to-be-asked-again",
+                "not ask" not in extra.lower(), extra)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -163,18 +172,16 @@ def main():
     # There is no classifier to fool now: a typed line is a message to the
     # model. What this asserts is the property underneath -- a filename is
     # learned only if it is really there.
+    # There is nothing left to fool: no line records a slot value at all now,
+    # so the property holds for every input rather than for the ones a
+    # classifier happened to reject.
     for non_answer in ("idk", "i dont know", "not sure", "dunno", "no idea",
-                       "you pick", "help", "skip", "whatever the test data uses"):
-        state = prep.Preparation()
-        state.learn(pipeline="ampliconseq")
-        state, _ = cli._track(state, non_answer)
-        r.equal(f"{non_answer!r} is not learned as a readset", state.readset, None)
-
-    state = prep.Preparation()
-    state.learn(pipeline="rnaseq")
-    state, _ = cli._track(state, "use missing_readset.tsv")
-    r.equal("a filename that is not on disk is not learned either",
-            state.readset, None)
+                       "you pick", "help", "skip", "whatever the test data uses",
+                       "use missing_readset.tsv", "readset.tsv"):
+        state, extra = prep.track(prep.Preparation(), non_answer)
+        r.equal(f"{non_answer!r} records nothing",
+                state.as_dict(), {"directories": []})
+        r.equal(f"and asserts nothing: {non_answer!r}", extra, None)
 
     # ------------------------------------------------------------------ #
     r.section("at the gate: a question reaches the model instead of a refusal")

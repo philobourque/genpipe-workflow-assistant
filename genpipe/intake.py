@@ -141,6 +141,24 @@ def _resolves(name, directory):
         return False
 
 
+# holds_candidates() lived here. It answered "does this directory contain a
+# readset, design or pairs file?" and was used to decide whether a path
+# somebody MENTIONED became a directory this tool would search.
+#
+# It was the same mistake as prep.goal(), one layer down. Swapping a regex over
+# the sentence for a rule over the filesystem does not stop it being a
+# classifier deciding what the user meant -- it just makes the misclassification
+# harder to see. And it was wrong about real layouts: a project directory whose
+# readsets sit in raw_reads/, a run assembled from files in three places, a
+# readset that has not been written yet. Each of those is a valid setup this
+# would have silently refused to look at.
+#
+# What replaced it is not a better rule. Directories somebody named are
+# remembered as PROVENANCE -- "these were mentioned" -- and which of them is a
+# data root is left to the agent, which can see the sentence, list the tree,
+# and ask. See prep.track().
+
+
 def candidates(directory=None, limit=8):
     """Files in `directory` that could fill each role, or nothing if no
     directory has been established.
@@ -229,12 +247,21 @@ def find_directories(text):
         token = token.strip("'\"`,;()[]").rstrip(":")
         if "/" not in token and not token.startswith("~"):
             continue
-        path = os.path.expanduser(token)
-        try:
-            if os.path.isdir(path) and path not in out:
-                out.append(path)
-        except (OSError, ValueError):
-            continue
+        # Sentence punctuation is stripped as a SECOND attempt rather than up
+        # front, so a directory whose name really does end in one of these is
+        # still found first. "is it ~/proj/a or ~/proj/b?" used to yield only
+        # the first path, because the second arrived as `b?` and failed
+        # isdir() -- which mattered the moment a question naming two candidate
+        # directories stopped being read as a choice of one of them.
+        for candidate in (token, token.rstrip("?!.,;")):
+            path = os.path.expanduser(candidate)
+            try:
+                if os.path.isdir(path):
+                    if path not in out:
+                        out.append(path)
+                    break
+            except (OSError, ValueError):
+                break
     return out
 
 
@@ -315,7 +342,15 @@ def brief(text, directory=None):
     re-read stale filenames.
     """
     stated = read(text)
-    established = stated.get("project_dir") or directory
+    # `directory` may be one path or several: prep.Preparation now remembers
+    # every directory a conversation has named, because deciding which of them
+    # is "the" project directory is a reading, not a lookup. The first is used
+    # where a single root is needed to resolve a relative filename -- it is the
+    # one somebody led with.
+    carried = ([directory] if isinstance(directory, str)
+               else list(directory or ()))
+    here = stated.get("project_dir")
+    established = here or (carried[0] if carried else None)
 
     known, missing, corrected = [], [], []
     for slot, value in stated.items():
@@ -352,17 +387,27 @@ def brief(text, directory=None):
     # carried over from an earlier turn, or set by /project -- gets the same
     # one-listing treatment, never the process's cwd.
     seen = []
-    if established and established not in named:
-        found = candidates(established)
-        seen = [(role, paths) for role, paths in found.items()
-                if paths and role not in _NOT_A_CANDIDATE]
+    for where in ([here] if here else []) + carried:
+        if not where or where in named:
+            continue
+        hits = {role: paths for role, paths in candidates(where).items()
+                if paths and role not in _NOT_A_CANDIDATE}
+        if hits:
+            named[where] = hits
 
     if not known and not seen and not missing and not named:
         return text
 
     lines = [text, "", CONTEXT_MARK]
     if known:
-        lines.append("Already settled by the request above -- do not ask again:")
+        # PARSED, NOT CHOSEN. This used to read "Already settled by the request
+        # above -- do not ask again", which is the same overreach that was
+        # removed from prep: a filename in "should I use readset_a.tsv or
+        # readset_b.tsv?" parses perfectly and is not an answer. What the
+        # sentence MEANT is the model's to read; this only says what was found
+        # in it.
+        lines.append("Names found in the request above, already resolved "
+                     "against the filesystem:")
         lines += [f"- {slot}: {value}" for slot, value in known]
         lines.append("")
     if corrected:
@@ -372,9 +417,11 @@ def brief(text, directory=None):
         lines += [f"- {slot}: {was} -> {now}" for slot, was, now in corrected]
         lines.append("")
     if named:
-        lines.append("In the directory the request POINTS AT. This is where their "
-                     "data is, so prefer these over anything found elsewhere. "
-                     "Exactly one candidate for a role means use it and say so; "
+        lines.append("In the directories that have been named. Candidates "
+                     "only -- a file called readset.txt is not thereby the "
+                     "right readset, and one of these directories may be an "
+                     "output path or one that was ruled out. Exactly one "
+                     "plausible candidate for a role means use it and say so; "
                      "several means ask which:")
         for where, hits in named.items():
             for role, paths in hits.items():

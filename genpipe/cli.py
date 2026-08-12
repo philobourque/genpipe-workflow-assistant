@@ -2320,106 +2320,12 @@ def _run_note(record):
     return f"{what}  {check.get('verdict', '')}".strip()
 
 
-def _learned_files(line, directory):
-    """Readset, design and pairs this line names, kept only if they resolve on
-    disk.
-
-    A name that is not there must not be "learned" -- prep.ready() would then
-    believe the run is complete when genpipes will reject the argument. Uses
-    the same resolution intake.brief() already applies to the same line, so
-    the two never disagree about whether a named file exists.
-
-    `directory` is the project directory established for this conversation, or
-    None -- never the process's cwd. With no project directory established, an
-    absolute path can still resolve; a bare relative filename cannot, and is
-    correctly left unlearned rather than guessed against wherever the app
-    happens to have been launched from.
-    """
-    parsed = intake.read(line)
-    return {slot: parsed[slot] for slot in ("readset", "design", "pairs")
-            if parsed.get(slot) and intake._resolves(parsed[slot], directory)}
-
-
-def _settled(state, directory):
-    """What earlier turns established, as facts for the model -- or None.
-
-    This is memory, not instruction. It exists because `intake.brief()` parses
-    only the line in front of it, so a protocol named three turns ago is
-    invisible by the time the readset arrives, and being asked twice for
-    something you already said is what makes people go back to writing the
-    command by hand.
-
-    It used to do more: it also computed the single next gap from
-    prep.missing() and told the model that this was "the ONLY thing to ask
-    about right now". That is gone. Which question comes next depends on what
-    the model has already worked out for itself -- it may have resolved the
-    readset from a directory the request named, in which case the gap table's
-    next question is one nobody needs answered. Stating the settled facts and
-    leaving the asking to the model is the whole point of the change; a note
-    that dictated the next question would put the questionnaire back, one
-    indirection further away.
-
-    `directory` is the project directory established so far, or None -- never
-    the process's cwd. See AGENT-FIXES.md defect 1.
-    """
-    lines = []
-    if state.pipeline:
-        lines.append(f"Pipeline: {state.pipeline}.")
-    if state.described:
-        lines.append(f"Understood as: {state.described}.")
-    if state.project_dir:
-        lines.append(f"Project directory: {state.project_dir}. Their data is "
-                     f"here; do not look anywhere else for it.")
-    if state.protocol:
-        lines.append(f"Protocol: -t {state.protocol}.")
-    for label, value in (("readset", state.readset), ("design", state.design),
-                         ("pairs", state.pairs)):
-        if value:
-            lines.append(f"{label.capitalize()}: {value}.")
-    if not lines:
-        return None
-    return ("Settled earlier in this conversation. Do not ask about any of it "
-            "again:\n" + "\n".join(f"- {line}" for line in lines))
-
-
-def _track(state, line):
-    """Record what this line settles, and return (state, facts-for-the-model).
-
-    All that is left of what used to be _preparing(). The classification it did
-    -- run, question, or ambiguous, decided by keyword tables over the line --
-    is gone, along with the choice panel it raised when it could not tell and
-    the `Preparing run...` header it printed when it could. Reading intent is
-    the model's job now, and it is better at it than a list of opening words:
-    "run" appears in "how do I run dnaseq?", and a person who says "a quick
-    AmpliconSeq test on the CIT data" has stated an intention no keyword table
-    recognises.
-
-    What survives is the part that was never a guess: parsing a pipeline, a
-    protocol, a directory or a filename out of a sentence that plainly contains
-    one, and remembering it across turns. `state` persists for the whole
-    conversation and is never unset -- a value resolved stays resolved unless a
-    later turn gives a different one.
-
-    Files are learned only if they resolve on disk (see _learned_files). A name
-    that is not there is left unlearned so the model finds out and asks, rather
-    than carrying a filename genpipes will reject.
-    """
-    # A directory named right now wins: they are telling us where today's data
-    # is. Otherwise whatever was established earlier stands. Neither ever falls
-    # back to the process's own cwd -- see AGENT-FIXES.md defect 1.
-    named_dirs = intake.find_directories(line)
-    if named_dirs:
-        state.learn(project_dir=named_dirs[0])
-    directory = state.project_dir
-
-    found = prep.goal(line)
-    if found:
-        state.learn(pipeline=found.pipeline, protocol=found.protocol,
-                    described=found.described)
-    state.learn(pipeline=intake.find_pipeline(line))
-    state.learn(protocol=intake.find_protocol(line, state.pipeline))
-    state.learn(**_learned_files(line, directory))
-    return state, _settled(state, directory)
+# _learned_files() lived here. It pulled a readset, design or pairs file out of
+# a sentence and remembered it, keeping only names that resolved on disk -- the
+# disk check being sound, and the remembering being the problem. A filename in
+# "should I use readset_a.tsv or readset_b.tsv?" resolves perfectly well and was
+# recorded as the answer to a question the person was still asking. It went with
+# the rest of _settled()'s fact list; the model reads the sentence.
 
 
 def _briefed(line, already_sent, directory=None):
@@ -2439,7 +2345,7 @@ def _briefed(line, already_sent, directory=None):
     an hour into the conversation is mentioned once, when it appears.
 
     `directory` is the project directory established so far in this
-    conversation (`prep.Preparation.project_dir`), or None. Never the process's
+    conversation (`prep.Preparation.directory`), or None. Never the process's
     cwd -- intake.brief() discovers nothing when it has nowhere established to
     look, rather than describing whatever happens to be on the floor where the
     app was launched (AGENT-FIXES.md defect 1).
@@ -2533,7 +2439,7 @@ def _repl(agent):
                 extra = None
                 _turn(agent, thread, line, raw=line)
                 continue
-            preparation, extra = _track(preparation, line)
+            preparation, extra = prep.track(preparation, line)
         except (EOFError, KeyboardInterrupt):
             print()
             continue
@@ -2542,7 +2448,7 @@ def _repl(agent):
             extra = None
 
         try:
-            text, context = _briefed(line, context, preparation.project_dir)
+            text, context = _briefed(line, context, preparation.directory)
         except Exception as e:
             display.problem(f"{type(e).__name__}: {e}")
             text = line

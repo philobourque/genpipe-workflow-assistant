@@ -1,213 +1,161 @@
 #!/usr/bin/env python
-"""Recognising a run request, and knowing what to ask next.
+"""Mention is not selection: what deterministic memory is allowed to keep.
 
-The distinction under test is not "did they use a launch keyword". It is whether
-the person wants the assistant to PERFORM an analysis or to EXPLAIN one. Both
-sentences below name a protocol and only one of them should start preparing
-anything:
+THIS SUITE USED TO TEST THE OPPOSITE THING. It checked an intent classifier
+(run / question / ambiguous, from opening words) and a table that mapped a
+scientific description to a pipeline and a protocol. Both are gone, and this is
+the guard that stops them coming back in another form.
 
-    what's the difference between somatic_fastpass and somatic_ensemble?
-    run somatic_fastpass on these
+The reason they went is measurable, and the first section below is exactly the
+measurement. Matching a whole word proves the word was TYPED. It does not prove
+it was CHOSEN:
 
-The failure modes this is written against are asymmetric, so the tests are too.
-Reading a question as a run wastes the person's allocation and their attention;
-reading a run as a question wastes a sentence. And guessing a PROTOCOL from a
-vague description is worse than either, because a wrong protocol produces a run
-that completes successfully and answers a different question.
+    "should I use rnaseq or chipseq?"   a comparison, not a decision
+    "I do NOT want chipseq"             a refusal, recorded as a selection
+    "does dnaseq need a pairs file?"    a question about a pipeline, not a
+                                        request to run one
+
+Telling those apart is a reading task. It belongs to the agent, which is
+replayed the whole conversation and can see the question mark, the "or" and the
+"not". A regex here would only relocate the mistake -- so what is tested is
+that deterministic code KEEPS NOTHING from any of them, not that it classifies
+them correctly.
+
+What deterministic code may still keep is the directories to search, because
+intake needs a root and must never fall back to the process's own working
+directory. Whether a mentioned path qualifies is decided from the filesystem
+(does it hold anything that could be an input?), never from the wording.
 
 Run:  python tests/test_prep.py
 """
+import os
+import shutil
 import sys
+import tempfile
 
 from harness import Report
 
-from genpipe import prep
+from genpipe import intake, prep
 
 
 def main():
-    r = Report("prep")
+    r = Report("mention is not selection")
 
     # ------------------------------------------------------------------ #
-    r.section("a question is a question, even when it names a pipeline")
-
-    for line in ("what is a design file?",
-                 "what does stringtie do",
-                 "how do I run dnaseq?",
-                 "which protocol should I use for tumour-normal?",
-                 "explain the -c stack",
-                 "compare somatic_fastpass and somatic_ensemble",
-                 "why did that fail"):
-        r.equal(f"question: {line!r}", prep.intent(line), prep.QUESTION)
-
-    # ------------------------------------------------------------------ #
-    r.section("an instruction is an instruction, however it is phrased")
-
-    for line in ("run dnaseq germline_snv on my readset",
-                 "can you run rnaseq on this?",
-                 "launch the chipseq pipeline",
-                 "prepare a chipseq run on these",
-                 "please submit dnaseq for these samples",
-                 # Case 3: the goal described as a RESULT rather than in
-                 # GenPipes terminology. Nobody should have to name a pipeline
-                 # they have already described.
-                 "Find inherited SNVs and small indels",
-                 "Compare gene expression between treatment and control",
-                 "Analyze paired tumor-normal variants"):
-        r.equal(f"run: {line!r}", prep.intent(line), prep.RUN)
+    r.section("a mentioned name is never recorded as a chosen one")
+    # Each of these contains a real pipeline or protocol name as a whole word,
+    # which is precisely what the deleted matcher keyed on. None of them is a
+    # decision, and the test is that nothing at all is kept -- no pipeline, no
+    # protocol, and no note handed to the model claiming otherwise.
+    for line in ("should I use rnaseq or chipseq?",
+                 "why stringtie instead of kallisto?",
+                 "what is the difference between somatic_fastpass and "
+                 "somatic_ensemble?",
+                 "does dnaseq need a pairs file?",
+                 "I do NOT want chipseq",
+                 "is somatic variant calling affected by tumour purity?",
+                 "I want to compare gene expression between my two conditions",
+                 "find inherited variants in these samples"):
+        state, note = prep.track(prep.Preparation(), line)
+        r.check(f"nothing settled: {line[:44]!r}",
+                note is None and state.as_dict() == {"directories": []},
+                f"note={note!r} state={state.as_dict()!r}")
 
     # ------------------------------------------------------------------ #
-    r.section("ambiguity is answered with a question, not a guess")
-
-    # Case 1. Mentions data or an analysis without saying which is wanted.
-    # Guessing "question" wastes their time; guessing "run" starts spending it.
-    for line in ("I have tumor-normal data",
-                 "we have nine mouse rnaseq fastqs",
-                 "rnaseq"):
-        r.equal(f"ambiguous: {line!r}", prep.intent(line), prep.AMBIGUOUS)
-    r.contains("and the clarification offers both", prep.CLARIFY, "or should I")
-
-    # ------------------------------------------------------------------ #
-    r.section("the pipeline is inferred readily; the protocol is not")
-
-    strong = prep.goal("find inherited SNVs and small indels")
-    r.equal("germline SNVs is one pipeline", strong.pipeline, "dnaseq")
-    r.equal("and exactly one protocol", strong.protocol, "germline_snv")
-
-    strong = prep.goal("compare gene expression between treatment and control")
-    r.equal("differential expression is rnaseq", strong.pipeline, "rnaseq")
-    r.equal("and stringtie", strong.protocol, "stringtie")
-
-    # The asymmetry, and the point of the whole table. "Tumour versus normal" is
-    # three somatic protocols that differ in cost and thoroughness. Inferring
-    # one produces a run that finishes cleanly and answers a different question,
-    # so the pipeline is taken and the protocol is left to be asked.
-    weak = prep.goal("analyse paired tumour-normal variants")
-    r.equal("the pipeline is clear", weak.pipeline, "dnaseq")
-    r.equal("the protocol is not, and is not guessed", weak.protocol, None)
-
-    weak = prep.goal("look for structural variants")
-    r.equal("same again", weak.pipeline, "dnaseq")
-    r.equal("still not guessed", weak.protocol, None)
-
-    r.equal("a description this table does not know maps to nothing",
-            prep.goal("do the usual thing with Marie's samples"), None)
+    r.section("nor is an explicit one — the model reads the transcript")
+    # The unambiguous case settles nothing either, and that is deliberate
+    # rather than a gap. agent.run() replays the entire thread, so a pipeline
+    # named three turns ago is already in front of the model; re-asserting it
+    # here bought nothing and cost the cases above.
+    state, note = prep.track(prep.Preparation(),
+                             "run dnaseq somatic_fastpass on these samples")
+    r.equal("an explicit request stores no pipeline", state.as_dict(),
+            {"directories": []})
+    r.equal("and asserts nothing to the model", note, None)
 
     # ------------------------------------------------------------------ #
-    r.section("what to ask next depends on what was already said")
-
-    # Case 5: pipeline and protocol known, readset missing. The next question is
-    # the readset -- not the pipeline again, and not a design file whose
-    # necessity the protocol has already settled.
-    state = prep.Preparation(pipeline="rnaseq", protocol="stringtie")
-    gap = prep.missing(state)
-    r.equal("the readset is next", gap.slot, "readset")
-
-    # Case 6: readset supplied, a protocol-specific document missing. It must
-    # ask only for the missing one, and must not restart the intake.
-    state.learn(readset="readset.tsv")
-    gap = prep.missing(state)
-    r.equal("now the design", gap.slot, "design")
-    r.contains("with the format explained", gap.note, "contrast")
-
-    state.learn(design="design.tsv")
-    r.equal("and then nothing is missing", prep.missing(state), None)
-    r.check("so it is ready to generate", prep.ready(state))
-
-    # Case 4: the pipeline is named and the protocol is not. The ORDERING rule
-    # this pins is unchanged -- the protocol is what decides which documents
-    # are required, so it can never be asked after them. What changed is that
-    # dnaseq no longer has to ask: GenPipes' own `-t` carries
-    # default="germline_snv", so the default settles it and the first real
-    # question is the readset. The default still governs what comes next, which
-    # is the property that matters: germline_snv wants neither -d nor -p, so
-    # neither is asked for.
-    state = prep.Preparation(pipeline="dnaseq")
-    r.equal("a defaulted protocol asks nothing about itself",
-            prep.missing(state).slot, "readset")
-    state.learn(readset="readset.tsv")
-    r.equal("and its default demands no document", prep.missing(state), None)
-
-    # A protocol that is NOT the default still governs the documents.
-    state = prep.Preparation(pipeline="dnaseq", protocol="somatic_ensemble")
-    r.equal("a somatic protocol asks for its readset first",
-            prep.missing(state).slot, "readset")
-    state.learn(readset="readset.tsv")
-    r.equal("and then its pairs file", prep.missing(state).slot, "pairs")
-
-    state = prep.Preparation(pipeline="dnaseq", protocol="somatic_fastpass",
-                             readset="readset.tsv")
-    r.equal("a somatic run asks for pairs, not a design",
-            prep.missing(state).slot, "pairs")
-
-    # Nothing at all: the pipeline is the only decidable question.
-    r.equal("with nothing said, ask the pipeline",
-            prep.missing(prep.Preparation()).slot, "pipeline")
+    r.section("Preparation holds directories, and only directories")
+    p = prep.Preparation()
+    r.equal("empty to begin with", p.directories, [])
+    r.equal("no directory yet", p.directory, None)
+    p.remember_dir("/data/one").remember_dir("/data/two").remember_dir("/data/one")
+    r.equal("they accumulate, in order, without duplicates",
+            p.directories, ["/data/one", "/data/two"])
+    # First rather than last. The old single project_dir was last-one-wins, so
+    # a path mentioned in passing displaced the one somebody led with.
+    r.equal("the first mentioned is the primary", p.directory, "/data/one")
+    r.check("the old run-state fields are gone",
+            not any(hasattr(p, f) for f in
+                    ("pipeline", "protocol", "readset", "design", "pairs",
+                     "described", "active", "project_dir")))
 
     # ------------------------------------------------------------------ #
-    r.section("nothing already resolved is ever asked about again")
-
-    state = prep.Preparation(pipeline="rnaseq", protocol="stringtie",
-                             readset="readset.tsv")
-    # learn() must never unset. A turn that mentions nothing new must not
-    # dissolve what an earlier one settled -- being asked twice for a readset
-    # you already named is what sends people back to writing the command.
-    state.learn(pipeline=None, protocol=None, readset=None)
-    r.equal("the pipeline survives an empty turn", state.pipeline, "rnaseq")
-    r.equal("so does the readset", state.readset, "readset.tsv")
-    state.learn(protocol="variants")
-    r.equal("but a real correction lands", state.protocol, "variants")
+    r.section("the deleted machinery stays deleted")
+    for gone in ("goal", "intent", "missing", "ready", "CLARIFY", "RUN",
+                 "QUESTION", "AMBIGUOUS"):
+        r.check(f"prep.{gone} no longer exists", not hasattr(prep, gone))
 
     # ------------------------------------------------------------------ #
-    r.section("defaults are never asked about")
+    r.section("directories are remembered as provenance, not classified")
+    work = tempfile.mkdtemp(prefix="genpipe_prep_")
+    try:
+        data = os.path.join(work, "data")
+        output = os.path.join(work, "results")
+        for d in (data, output):
+            os.makedirs(d)
+        with open(os.path.join(data, "readset.tsv"), "w") as f:
+            f.write("Sample\tReadset\n")
 
-    r.check("the step range is assumed", "steps" in prep.ASSUMED)
-    r.check("so is the cluster config", "config" in prep.ASSUMED)
-    r.check("and the output directory", "output" in prep.ASSUMED)
-    # slots.gaps() is the authority on what gets asked, and it must not have
-    # grown any of these.
-    # rnaseq_light takes no -t, so a pipeline and a readset is everything the
-    # COMMAND needs -- but not everything the run needs: step 7 of 8 is
-    # sleuth_differential_expression, which reads the design and raises without
-    # one. The design is asked for; steps, config and output still are not.
-    state = prep.Preparation(pipeline="rnaseq_light", readset="r.tsv")
-    r.equal("a light run is asked for its design and nothing else",
-            prep.missing(state).slot, "design")
-    state.learn(design="d.tsv")
-    r.equal("and then nothing at all", prep.missing(state), None)
+        # THERE IS NO LONGER A TEST FOR WHETHER A DIRECTORY "QUALIFIES", and
+        # that is the point. A filesystem rule (does it hold a readset?) was
+        # tried here and removed: it is still a classifier deciding what the
+        # user meant, and it refused ordinary layouts -- readsets under
+        # raw_reads/, inputs spread over three directories, a readset not
+        # written yet.
+        r.check("the filesystem classifier is gone",
+                not hasattr(intake, "holds_candidates"))
 
-    # ------------------------------------------------------------------ #
-    r.section("the state is summarised so it can be corrected")
+        # An output directory is remembered like any other. The agent reads
+        # the word "output"; this does not try to.
+        state, note = prep.track(prep.Preparation(), f"put the output in {output}")
+        r.equal("an output path is still remembered", state.directories, [output])
+        r.contains("as something that was mentioned", note, "mentioned so far")
+        r.check("with no claim that the data is there",
+                "data is" not in (note or ""), note)
+        r.contains("and the reading is handed over", note, "Work out which is which")
 
-    state = prep.Preparation(pipeline="rnaseq", protocol="stringtie",
-                             readset="readset.tsv")
-    text = prep.summary(state)
-    r.contains("the pipeline", text, "rnaseq")
-    r.contains("the protocol", text, "stringtie")
-    r.contains("and the readset", text, "readset.tsv")
+        state, note = prep.track(prep.Preparation(), f"my data is in {data}")
+        r.equal("a data directory is remembered too", state.directories, [data])
+        r.check("with no 'do not look anywhere else' claim",
+                "do not look anywhere else" not in (note or "").lower(), note)
 
-    # ------------------------------------------------------------------ #
-    r.section("a request that already answers everything is ready at once")
-    # The complaint this guards: a conversation that named pipeline, protocol,
-    # readset AND design together still got interrogated one field at a time.
-    # ready()/missing() are the check cli._preparing() must drive off of --
-    # once every required slot is filled, there is nothing left to ask.
-    state = prep.Preparation(pipeline="rnaseq", protocol="stringtie",
-                             readset="readset.tsv", design="design.tsv")
-    r.equal("nothing left to ask", prep.missing(state), None)
-    r.check("ready() agrees", prep.ready(state))
+        # Both halves of a comparison survive, and neither is picked.
+        other = os.path.join(work, "data2")
+        os.makedirs(other)
+        state, _ = prep.track(prep.Preparation(), f"is it {data} or {other}?")
+        r.equal("a comparison keeps both, and picks neither",
+                sorted(state.directories), sorted([data, other]))
 
-    state = prep.Preparation(pipeline="dnaseq", protocol="somatic_ensemble",
-                             readset="readset.tsv", pairs="pairs.csv")
-    r.equal("a somatic run with its pairs file is ready too",
-            prep.missing(state), None)
-    r.check("ready() agrees", prep.ready(state))
+        # A directory that holds nothing recognisable is still remembered: an
+        # empty project directory is where a run is about to be built.
+        empty = os.path.join(work, "fresh")
+        os.makedirs(empty)
+        state, _ = prep.track(prep.Preparation(), f"set up a run in {empty}")
+        r.equal("an empty directory is not refused", state.directories, [empty])
 
-    state = prep.Preparation(pipeline="dnaseq", protocol="somatic_ensemble",
-                             readset="readset.tsv")
-    r.check("but not ready without the pairs file it needs",
-            not prep.ready(state))
-    r.equal("and pairs is exactly what's asked for",
-            prep.missing(state).slot, "pairs")
+        # Accumulation across turns, which is what makes provenance useful.
+        state = prep.Preparation()
+        state, _ = prep.track(state, f"the fastqs are in {data}")
+        state, note = prep.track(state, f"write results to {output}")
+        r.equal("both turns are kept, in order", state.directories, [data, output])
+        r.equal("and the first mentioned is still primary", state.directory, data)
+
+        # Something that merely looks path-shaped is not a directory.
+        state, note = prep.track(prep.Preparation(), "use the a/b ratio")
+        r.equal("a non-directory token is not remembered", state.directories, [])
+        r.equal("and nothing is asserted", note, None)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
     return r.finish()
 

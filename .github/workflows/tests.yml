@@ -66,7 +66,11 @@ jobs:
         # behaviour: prose at the gate never approves.
         run: python tests/test_modify.py
 
-      - name: Telling a run request from a question
+      - name: Mention is not selection
+        # The guard on the boundary that was moved back to the agent: matching
+        # a pipeline or protocol name proves it was TYPED, not chosen, so
+        # deterministic memory keeps none of it. Asserts the deleted classifier
+        # and goal table stay deleted.
         run: python tests/test_prep.py
 
       - name: Readset files, built from structure alone
