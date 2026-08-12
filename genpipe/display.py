@@ -150,6 +150,17 @@ def fit(text, cols):
     return "".join(out) + "…" + RESET
 
 
+def pad(text, width):
+    """`text` cut to `width` columns and padded out to exactly that many.
+
+    Not f"{text:<width}", which pads by len() -- and len() counts the escape
+    sequences fit() may have just appended, so a truncated cell comes out
+    several columns short and every column to its right steps left.
+    """
+    text = fit(text, width)
+    return text + " " * max(0, width - cells(text))
+
+
 def row_count(text, cols):
     """Terminal rows a printed line occupies, wrapping included.
 
@@ -485,6 +496,31 @@ def help_text(commands):
 # ---------------------------------------------------------------------------
 
 _ASK_ONLY = re.compile(r"^ask\s*\(.*\)$", re.DOTALL)
+_PROPOSE_ONLY = re.compile(r"^propose_submission\s*\(.*\)$", re.DOTALL)
+
+# One checklist line: "1. [ ] do a thing", "2. [x] did a thing".
+#
+# Defined once because two things must agree about it exactly: what the plan
+# block CLAIMS, and what the prose paths REMOVE. When they disagreed -- the
+# solution path kept lines the plan block had already taken -- the checklist
+# printed twice on every turn, which is what parked agent.PLANS. A single
+# pattern is what stops that from being reintroduced by editing one of a pair.
+#
+# Only [ ], [x], [✓] and [v] are marks. A failed step has no mark of its own,
+# so agent.PLAN_PROTOCOL tells the model to describe failures in prose and
+# amend the list -- see the note at agent.py's _MARKS discussion. Adding [✗]
+# here means adding it there in the same change.
+_PLAN_LINE = re.compile(r"^[ \t]*\d+\.\s*\[([ x✓v]?)\]\s*(.+)$", re.M | re.I)
+
+
+def _strip_plan(text):
+    """`text` without its checklist lines.
+
+    The plan block owns those lines: parse() lifts them into a "plan" event
+    that _draw_plan repaints in place, so any path that also prints the text
+    they came from has to take them out or the reader sees the same list twice.
+    """
+    return _PLAN_LINE.sub("", text)
 
 # Fingerprints of the user-role messages nobody typed. Three are written by this
 # codebase (the observation wrapper, the gate's rejection note, agent.py's
@@ -528,6 +564,43 @@ def _is_help_only(code):
     return True
 
 
+# Commands that only look. Deliberately a small, closed list of the ones whose
+# whole purpose is to show you something: nothing here creates, moves, deletes
+# or submits, so a block made only of these cannot have changed anything.
+_READ_ONLY = ("ls", "cat", "head", "tail", "find", "wc", "file", "stat",
+              "readlink", "realpath", "du", "df", "pwd", "hostname", "echo")
+
+
+def _is_read_only(code):
+    """Is this block nothing but looking at the filesystem?
+
+    Same shape as _is_help_only, and for the same reason: the real form is
+    `module load ... && ls /some/path`, a setup command and a look. Every part
+    has to qualify, so an `ls` bolted onto something that writes stays labelled
+    for the thing that writes.
+
+    `grep` is deliberately absent. It reads, but it is also how a block filters
+    the output of something that did not, and the conservative reading of an
+    unrecognised block is the one that leaves it labelled CODE -- see the note
+    in _code_label about not dressing up commands as something familiar.
+    """
+    parts = [p.strip() for p in re.split(r"&&|\|\||;|\n", code) if p.strip()]
+    parts = [p for p in parts if not p.startswith("#")]
+    if not parts:
+        return False
+    for part in parts:
+        if part.startswith(("module load", "module purge", "export ", "set ",
+                            "cd ", "source ")):
+            continue
+        head = part.split()[0] if part.split() else ""
+        # No redirection: `ls > listing.txt` reads and then writes, and the
+        # write is the part worth knowing about.
+        if head in _READ_ONLY and ">" not in part:
+            continue
+        return False
+    return True
+
+
 def _code_label(code):
     """What a block of code is, in the terms this tool is about.
 
@@ -543,9 +616,20 @@ def _code_label(code):
     avoids asserting a step number it half-remembers -- and fifty lines of usage
     text per turn buries the conversation it was in service of.
 
+    READ is the agent looking at your files -- an `ls` of a data directory, a
+    `cat` of a readset. It was the largest thing falling through to CODE, and
+    it is worth its own word for the same reason the others are: "it is reading
+    your data" and "it is running something I do not recognise" are different
+    facts, and CODE covering both is what made the label uninformative.
+
     Anything else is CODE. Deliberately: an unrecognised command is exactly the
     one you want to read closely, and dressing it up as something familiar would
     be the wrong kind of help.
+
+    Order is load-bearing. GENERATE and SUBMIT are tested before READ, so a
+    block that looks at a file AND writes a script is labelled for the write --
+    the conservative direction, since mislabelling a submission as a look is
+    the only error here with consequences.
     """
     low = code.lower()
     if _is_help_only(low):
@@ -559,6 +643,8 @@ def _code_label(code):
     if (re.search(r"\b(?:squeue|sacct|sinfo|scontrol|scancel)\b", low)
             or "log_report" in low):
         return "SCHEDULER"
+    if _is_read_only(low):
+        return "READ"
     return "CODE"
 
 
@@ -640,23 +726,31 @@ def parse(message):
     # The model's checklist. When it re-emits the list each turn with another box
     # ticked, each turn prints a fresh copy and the progression shows up in the
     # scrollback. Matches "1. [ ] do a thing" and "1. [x] did a thing".
-    plan = re.findall(r"^\s*\d+\.\s*\[([ x\u2713v]?)\]\s*(.+)$", body, re.M | re.I)
+    plan = _PLAN_LINE.findall(body)
     if plan:
         events.append({
             "kind": "plan",
             "items": [(text.strip(), mark.strip() != "") for mark, text in plan],
         })
 
-    # Code the model wants to run -- except an <execute> block that only asks
-    # the user a question. That block is not code and never runs; the panel it
-    # opens is its rendering, and printing `RUN ask(slot="protocol")` just above
-    # the panel would show the plumbing instead of the question.
+    # Code the model wants to run -- except the two blocks that never reach an
+    # interpreter. agent.routing_function tests both BEFORE the execute node:
+    # a submission goes to the gate, an ask() goes to the question node, and
+    # neither string is ever handed to Python or bash. propose_submission() in
+    # particular cannot run -- it is not a defined name, which is why the gate
+    # rewrites the approved block into the command it stood for.
     #
-    # This is a rendering rule, not a second copy of ask()'s grammar: it drops a
-    # block that is nothing but a call, and gate.ask_request remains the
-    # only thing that decides what such a call means. A block that mixes an ask
-    # with real code fails this test and is shown in full, which is the right
-    # way round -- the router will not treat it as an ask either.
+    # So drawing either as a CODE block, in the same style as blocks that did
+    # run, tells the reader something untrue: nothing on screen separates "this
+    # executed, here is its output" from "this was intercepted and discarded".
+    # Each one's real rendering is the thing it opens -- the panel for an ask,
+    # the HOLD box for a submission -- and both appear immediately below.
+    #
+    # This is a rendering rule, not a second copy of either grammar: it drops a
+    # block that is nothing but the call, and gate.ask_request / gate.is_submission
+    # remain the only things that decide what such a call means. A block that
+    # mixes one with real code fails this test and is shown in full, which is
+    # the right way round -- the router will not treat it as inert either.
     for block in re.findall(r"<execute>(.*?)</execute>", body, re.DOTALL):
         # Comment lines are dropped before the test, because the model habitually
         # opens a block with "#!BASH" -- which the router ignores when it decides
@@ -664,7 +758,7 @@ def parse(message):
         # disagree about whether this is a question.
         bare = "\n".join(line for line in block.splitlines()
                          if line.strip() and not line.strip().startswith("#"))
-        if _ASK_ONLY.match(bare.strip()):
+        if _ASK_ONLY.match(bare.strip()) or _PROPOSE_ONLY.match(bare.strip()):
             continue
         code = block.strip()
         events.append({"kind": "code", "text": code,
@@ -673,9 +767,26 @@ def parse(message):
     # What the machine said back.
     events += _observations(body)
 
-    # The model's final answer -- always shown in full.
+    # The model's final answer -- always shown in full, minus the checklist.
+    #
+    # _strip_plan is what makes the plan block usable at all. The lines are
+    # lifted into a "plan" event above and drawn as a block that repaints in
+    # place; leaving them in the text they were lifted from printed the same
+    # checklist twice on every turn -- once rendered, once as raw markdown
+    # directly underneath. That double-draw is why the prompt section producing
+    # these lines was switched off (agent.PLANS), so the parser has to claim the
+    # lines it consumes before turning it back on.
+    #
+    # The connective-prose path below has always done this. The solution path
+    # did not, and every reply lands in one or the other -- so with the prompt
+    # requiring exactly one <solution> or one <execute>, a checklist reliably
+    # took the un-stripped route.
     for block in re.findall(r"<solution>(.*?)</solution>", body, re.DOTALL):
-        events.append({"kind": "solution", "text": block.strip()})
+        text = _strip_plan(block).strip()
+        # A turn whose whole answer was the checklist has nothing left to say;
+        # the block above is already saying it.
+        if text:
+            events.append({"kind": "solution", "text": text})
 
     # Whatever text remains once the structured parts are removed is the model's
     # connective prose. It is kept, not dropped, but rendered quietly. It goes
@@ -684,7 +795,7 @@ def parse(message):
     left = re.sub(r"<observation>.*?</observation>", "", left, flags=re.DOTALL)
     left = re.sub(r"<solution>.*?</solution>", "", left, flags=re.DOTALL)
     left = re.sub(r"</?think>", "", left)
-    left = re.sub(r"^\s*\d+\.\s*\[[ x\u2713v]?\].*$", "", left, flags=re.M | re.I)
+    left = _strip_plan(left)
     left = "\n".join(line for line in left.splitlines() if line.strip())
     if left.strip():
         events.insert(0, {"kind": "note", "text": left.strip()})
@@ -696,19 +807,81 @@ def parse(message):
 # Layer 2 -- the terminal renderer.
 # ---------------------------------------------------------------------------
 
-def _rule(colour, mark, label, text, dim_body=False):
-    """Print a block behind a left rule: a bright label, then the body.
+# The two labels worth colouring. Everything else the agent does is looking:
+# reading a file, reading --help, asking the scheduler how a run is going. These
+# two are the ones that changed something -- a script written to disk, a job on
+# the cluster -- and they are what you scan a long transcript for.
+#
+# Colour spent anywhere else is colour spent everywhere, which is the state the
+# marker column was in before: amber code, cyan output, grey prose, three rule
+# glyphs, on every block of every turn. Nothing was emphasised because
+# everything was.
+_CONSEQUENTIAL = ("GENERATE", "SUBMIT")
+_LOUD = AMBER
 
-    dim_body greys the content while leaving the label bright, which is how the
-    long secondary blocks (machine output, connective prose) stay readable
-    without competing with the things that matter.
+# The rule colour of a block whose closing blank line has not been printed yet,
+# or None. A command and the output it produced are one act, but they arrive as
+# two messages -- the block is drawn, the command runs, and the observation
+# turns up on the next call -- so the join cannot be made at parse time. The
+# code block holds its blank open instead, and the observation that follows
+# lands directly underneath it as a continuation rather than as a second
+# labelled block. Anything else closes it first.
+_open_rule = None
+
+
+def _close_open_rule():
+    """Emit the blank line a held-open block still owes, if any."""
+    global _open_rule
+    if _open_rule is not None:
+        _open_rule = None
+        print()
+
+
+def _rule(colour, mark, label, text, dim_body=False, hold=False):
+    """Print a block behind a left rule: a quiet label, then the body.
+
+    One glyph for every kind of block, and the label carries the difference.
+    Three different glyphs said what three words underneath them were already
+    saying, and left the reader learning a private alphabet to get no extra
+    fact out of it.
+
+    The rule stays -- machine output runs to dozens of lines and the left edge
+    is what shows where a block starts and ends when you are scrolling -- but it
+    is one thin mark in one weight, not a bar per line in full colour.
+
+    dim_body greys the content while leaving the label at the rule's own
+    colour, which is how the long secondary blocks stay readable without
+    competing with the reply they are in service of.
+
+    hold leaves the closing blank unprinted so the next block can continue this
+    one -- see _open_rule. An empty label draws no caption line at all, which
+    is what makes an observation read as the output of the command above it
+    rather than as an event with a name of its own.
     """
+    global _open_rule
     shade = DIM if dim_body else ""
+    # The routing directive, not something anybody reads. The model opens
+    # nearly every bash block with it, so left in it is a line of noise per
+    # block; the router strips it too when deciding what the block means.
+    body = "\n".join(line for line in text.splitlines()
+                     if line.strip().lower() != "#!bash")
+    # An <execute> whose output was empty still arrives as an observation, and
+    # a labelled block with nothing under it says only that something happened
+    # that had nothing to report.
+    if not body.strip():
+        return
     if label:
-        print(f"{colour}{mark} {BOLD}{label}{RESET}")
-    for line in text.splitlines():
+        print(f"{colour}{mark} {label}{RESET}")
+    for line in body.splitlines():
         print(f"{colour}{mark}{RESET} {shade}{line}{RESET}")
-    print()
+    # _open_rule is left accurate either way, so a caller never has to clear it
+    # by hand -- doing that at one of two call sites was what printed the gap
+    # twice, once by the block that closed and once by the one that followed.
+    if hold:
+        _open_rule = colour
+    else:
+        _open_rule = None
+        print()
 
 
 def _clipped(text, head=10, tail=4):
@@ -796,8 +969,13 @@ _plan_lines = 0
 def reset_plan():
     """Forget the current plan. Called when a new turn starts, so the next
     task's checklist is a new block rather than an in-place edit of the last
-    task's -- two different jobs must not share one set of lines."""
+    task's -- two different jobs must not share one set of lines.
+
+    Also closes any block still holding its blank open. A turn that ended on a
+    command whose output never arrived would otherwise leave that blank owed,
+    and the next turn's first line would print hard against it."""
     global _plan, _plan_lines
+    _close_open_rule()
     _plan = None
     _plan_lines = 0
 
@@ -809,19 +987,27 @@ def _plan_body(items):
     colour alone does not survive being read at a glance or copied into a bug
     report:
 
-      ✓  done      green
-      ▶  current   the first unticked item, bright
-         pending   no marker, dim -- it has not started, so it gets no ink
+      1. [✓]  done      dim, the tick green
+      2. [ ]  current   the first unticked item, bright
+      3. [ ]  pending   dim -- it has not started, so it gets no ink
+
+    Drawn as the numbered checkbox the model actually wrote, rather than
+    translated into a marker column of its own. The list on screen and the list
+    in the reply are then the same object: what you read back to the model, what
+    it re-emits next turn, and what you see are one notation, so nobody has to
+    hold a mapping between a ▶ and a `2. [ ]` in their head. No header either --
+    the brackets say what the block is.
     """
-    out = [f"  {CYAN}⏺{RESET} {BOLD}Plan{RESET}"]
+    out = []
     current = next((i for i, (_, done) in enumerate(items) if not done), None)
     for i, (text, done) in enumerate(items):
+        n = f"{i + 1}."
         if done:
-            out.append(f"    {GREEN}✓{RESET} {DIM}{text}{RESET}")
+            out.append(f"  {DIM}{n} [{RESET}{GREEN}✓{RESET}{DIM}] {text}{RESET}")
         elif i == current:
-            out.append(f"    {CYAN}▶{RESET} {text}")
+            out.append(f"  {n} [ ] {BOLD}{text}{RESET}")
         else:
-            out.append(f"    {DIM}  {text}{RESET}")
+            out.append(f"  {DIM}{n} [ ] {text}{RESET}")
     return out
 
 
@@ -895,15 +1081,24 @@ def _draw(event):
 
     elif k == "note":
         # Connective prose. No label, thin rule, grey. Present but subordinate.
-        _rule(GREY, "\u2502", "", event["text"], dim_body=True)
+        _rule(GREY, "\u258f", "", event["text"], dim_body=True)
 
     elif k == "code":
-        _rule(AMBER, "\u258c", event.get("label") or "CODE", event["text"])
+        label = event.get("label") or "CODE"
+        # Held open: the output of this command, if there is any, belongs to
+        # the same block and arrives on the next message.
+        _rule(_LOUD if label in _CONSEQUENTIAL else GREY,
+              "\u258f", label.lower(), event["text"], dim_body=True, hold=True)
 
     elif k == "observation":
-        # Bright label so it is easy to find; grey body because machine output is
-        # long and you are usually scanning it, not reading every line.
-        _rule(CYAN, "\u258f", "TERMINAL", _clipped(event["text"]), dim_body=True)
+        # No caption. "terminal" named the channel rather than the event, and
+        # it cost a line on every command the agent ran -- while the thing it
+        # was distinguishing, whose output this is, is already answered by the
+        # command sitting directly above it. When there is no command above
+        # (its block was hidden, or folded) the rule and the indent still mark
+        # it as machine output.
+        _rule(_open_rule or GREY, "\u258f", "",
+              _clipped(event["text"]), dim_body=True)
 
     elif k == "answer":
         # One quiet line. The panel above it is the event; this is the receipt.
@@ -974,17 +1169,28 @@ def set_verbose(on):
 
 
 def replay():
-    """Draw every event folded so far. What /verbose shows for the work that
-    has already happened -- without this, turning verbose on would only affect
-    the next turn, which is never the turn you wanted it for."""
-    if not _folded:
-        nothing("Nothing has been folded away yet.")
-        return
-    print()
-    print(f"  {DIM}│ {len(_folded)} step(s), replayed{RESET}")
-    print()
+    """Draw every event folded so far, and return how many there were.
+
+    What /verbose shows for the work that has already happened -- without this,
+    turning verbose on would only affect the next turn, which is never the turn
+    you wanted it for.
+
+    It reports rather than announces. Nothing folded is not an event: it means
+    the session has not done any working yet, which the person can see, and
+    saying so took a whole block to answer a question nobody asked. The count
+    goes back to the caller so the one confirmation it prints can carry it,
+    instead of a header here and a confirmation there for the same keystroke.
+    """
+    # The same close-before-a-new-block rule render() applies. Replay draws
+    # through _draw directly rather than through render(), so without this the
+    # held-open blank between a command and its output is never paid and every
+    # replayed block runs into the next one.
     for event in _folded:
+        if event["kind"] != "observation":
+            _close_open_rule()
         _draw(event)
+    _close_open_rule()
+    return len(_folded)
 
 
 def _fold(event):
@@ -1029,6 +1235,12 @@ def render(message):
     global _swallowing
     for event in parse(message):
         kind = event["kind"]
+        # An observation continues the block above it; everything else starts a
+        # new one, so the blank that block was holding open is owed now. Done
+        # here rather than in each branch of _draw so that a path added later
+        # cannot forget it and print into somebody else's block.
+        if kind != "observation":
+            _close_open_rule()
         if kind == "plan":
             # Never folded, at any verbosity. The fold's whole cost is that it
             # leaves you unable to tell what the agent is doing; the plan is
@@ -1037,7 +1249,15 @@ def render(message):
             _draw_plan(event["items"])
             continue
         if kind == "code":
-            _swallowing = event.get("label") in _HIDDEN
+            # Hidden when folded, shown when unfolded. The original reason for
+            # dropping a --help outright still holds at the default verbosity:
+            # a competent agent reads one most turns, and fifty lines of usage
+            # text buries the conversation it was in service of. But /verbose is
+            # the person saying they want the working, and the --help lookups
+            # are how the agent avoids asserting a step number it half-
+            # remembers -- which makes them among the most worth reading. The
+            # clip at _clipped keeps even the unfolded copy to a dozen lines.
+            _swallowing = event.get("label") in _HIDDEN and not VERBOSE
             if _swallowing:
                 continue
         elif kind == "observation" and _swallowing:
@@ -1197,9 +1417,18 @@ def _mirror_body(line, tint, strong):
     values = [_tilde(v) for v in line.values]
     body = f"{strong}{values[0]}{RESET}" if values else ""
     if line.note:
-        # A warning keeps its red whatever state the line is in; an observation
-        # takes the line's own tint, so a row nobody has touched stays quiet.
-        aside = RED if line.warn else (tint or DIM)
+        # A caution keeps its colour whatever state the line is in; an
+        # observation takes the line's own tint, so a row nobody has touched
+        # stays quiet.
+        #
+        # AMBER, not RED. Red on this screen means "cannot submit" -- it is
+        # what a preflight blocker uses, and a blocker is the one thing here
+        # that stops the run. An unset `-o` does not stop anything; it means
+        # GenPipes writes into whatever directory you were standing in, which
+        # is worth noticing and is not an error. Spending the same red on both
+        # left the loudest colour on the screen meaning two different things,
+        # and the one that actually blocks lost by being indistinguishable.
+        aside = AMBER if line.warn else (tint or DIM)
         body = (f"{body}  {DIM}{line.note}{RESET}" if body
                 else f"{aside}{line.note}{RESET}")
     # A `-c` stack is the one row that is routinely several values, and stacking
@@ -1208,7 +1437,58 @@ def _mirror_body(line, tint, strong):
     return f"{label}{flag}{body}", [f"{strong or DIM}{v}{RESET}" for v in values[1:]]
 
 
-def mirror_lines(m, active=None, pending=(), changed=(), indent="      "):
+def _count_rows(path):
+    """Data rows in a readset or design file, or None if it cannot be read.
+
+    None rather than 0 on any failure, and every caller treats it as "say
+    nothing". A count is a claim about what is about to run, and a wrong one on
+    the approval screen is worse than an absent one -- the whole point of the
+    line is that somebody can catch `8 samples` when they expected 40.
+    """
+    try:
+        with open(path, errors="replace") as f:
+            rows = [l for l in f.read().splitlines() if l.strip()]
+    except OSError:
+        return None
+    return max(0, len(rows) - 1) or None          # minus the header
+
+
+def _consequences(proposal, name):
+    """The two or three facts somebody actually approves on.
+
+    The mirror below is exact and complete, and neither of these is legible
+    from it: how much data this is about to run on (a readset path does not
+    say 8 samples) and where the output lands (an ABSENT `-o` is the loudest
+    fact on the screen and is written as nothing at all).
+
+    Derived, so everything here is hedged: a count that could not be read is
+    left out rather than guessed, and the flags underneath remain the record.
+    """
+    slots = (proposal or {}).get("slots") or {}
+    pipeline = slots.get("pipeline") or "genpipes"
+    out = []
+
+    what = pipeline
+    if slots.get("protocol"):
+        what += f" {slots['protocol']}"
+    steps = slots.get("steps")
+    detail = [f"steps {steps}" if steps else "all steps"]
+    samples = _count_rows(slots.get("readset") or "")
+    if samples:
+        detail.append(f"{samples} sample{'s' if samples != 1 else ''}")
+    out.append(f"      {BOLD}{WHITE}{what}{RESET}{DIM}, {', '.join(detail)}{RESET}")
+
+    where = slots.get("output_dir")
+    out.append(f"      {DIM}writes into {RESET}{WHITE}{where}{RESET}" if where else
+               f"      {DIM}writes into {RESET}{AMBER}the current directory{RESET}"
+               f"{DIM} — no -o was set{RESET}")
+    if name:
+        out.append(f"      {DIM}named {RESET}{WHITE}{name}{RESET}")
+    return out
+
+
+def mirror_lines(m, active=None, pending=(), changed=(), indent="      ",
+                 hide=()):
     """The command mirror as a list of printable lines, for the gate.
 
     Returned rather than printed because it is drawn in two very different
@@ -1220,10 +1500,20 @@ def mirror_lines(m, active=None, pending=(), changed=(), indent="      "):
     if not m:
         return []
     pending, changed = set(pending or ()), set(changed or ())
+    hide = set(hide or ())
     out = []
     pad = " " * (_MIRROR_LABEL + _MIRROR_FLAG)
 
     for line in m.lines:
+        # Dropped from the drawing only. The line stays on the Mirror, so
+        # /modify's panel -- which passes no `hide` -- still owns and indexes
+        # it, and a row hidden here can never shift a checkbox there.
+        #
+        # Matched on the label as well as the row, because a flag with no
+        # modify row of its own -- `-g` is one -- carries row=None and can only
+        # be named by its label.
+        if not line.head and (line.row in hide or line.label in hide):
+            continue
         tint, strong = _mirror_state(line.row, active, pending, changed)
         mark = (f"{RED}●{RESET}" if line.row in pending else
                 f"{GREEN}●{RESET}" if line.row in changed else
@@ -1572,24 +1862,47 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
 
     print("\n")
     print(f"  {RED}{REVERSE}{BOLD} HOLD {RESET}  {RED}{UNDER}submission requires approval{RESET}")
+
+    # What this run DOES, before what it is spelled as. The flags are exact and
+    # the box would be complete without this, but "8 samples" and "writes into
+    # the current directory" are the two facts somebody actually decides on,
+    # and neither is legible from a path and an absent `-o`. See _consequence.
     print()
-    print(f"      {BOLD}{WHITE}{proposal.get('command', '?')}{RESET}")
+    for line in _consequences(proposal, thread_id):
+        print(line)
+
     # `bash cmd.sh` is what runs and says nothing on its own -- two runs a week
     # apart submit the same three words -- so what that script was BUILT from is
     # the part worth reading, and with the agent's working folded away by
     # default this is the only place it is seen before it is approved. Laid out
     # by mirror.py rather than wrapped as prose: the people this is for know a
     # GenPipes command by its shape, and a paragraph does not have one.
-    missing = proposal.get("missing") or ()
+    #
+    # `missing` is no longer passed: an incomplete proposal does not reach the
+    # gate at all now (see agent.submission_gate), so there is no absent-and-
+    # required row left to draw.
     m = (mirror.read(proposal.get("generated"), name=thread_id,
-                     resources=resources, missing=missing)
+                     resources=resources)
          or mirror.from_slots(proposal, name=thread_id, resources=resources))
-    drawn = mirror_lines(m, changed=changed)
+    # `output` joins them only when it is UNSET, because the consequence line
+    # above has just said where the run writes in words. Left in, the box says
+    # "writes into the current directory" twice, three lines apart, which reads
+    # as two separate findings. When `-o` IS set the row is the record of an
+    # actual choice and stays.
+    hide = mirror._GATE_HIDDEN + (
+        () if (proposal.get("slots") or {}).get("output_dir") else ("output",))
+    drawn = mirror_lines(m, changed=changed, hide=hide)
     if drawn:
         print()
         for line in drawn:
             print(line)
         print()
+    # Labelled and last. Unlabelled and first, it read as a second command to
+    # run alongside the GenPipes call above it, rather than as the one line
+    # that submits what the call built.
+    print(f"      {DIM}{'runs':<{_MIRROR_LABEL}}{RESET}"
+          f"{BOLD}{WHITE}{proposal.get('command', '?')}{RESET}")
+    print()
 
     for text in warnings or ():
         first, _, rest = str(text).partition("\n")
@@ -1605,13 +1918,18 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
                   f"{finding.variable} {finding.problem}")
             print(f"      {DIM}{'fix':<17}{RESET}{WHITE}{finding.fix}{RESET}")
         print()
-    elif missing:
-        # No separate line here -- the mirror above already carries a red
-        # "not set \u2014 required" row per missing slot (see mirror._absent). A
-        # second list saying the same names again would just be noise; what
-        # changes is that /approve is withheld the same way it is for a
-        # blocking environment finding, and for the same reason: offering an
-        # action that cannot work invites trying it anyway.
+    elif proposal.get("missing"):
+        # Unreachable through the graph: agent.submission_gate now sends an
+        # incomplete proposal back to be finished rather than drawing it, so
+        # the gate has one mode and this branch should never run.
+        #
+        # Kept anyway, and deliberately. This is the screen where a wrong
+        # answer puts unapproved work on a cluster, and "the caller guarantees
+        # it" is the assumption that eventually stops being true -- a second
+        # entry point, a replayed record, a future refactor of the node. The
+        # guard costs one comparison and removes the need to be right about
+        # that. What is gone is the red required-row rendering, which was the
+        # part that only made sense when this state was routine.
         pass
     else:
         print(_action("/approve", "submits to Slurm \u2014 cannot be undone"))
@@ -1754,7 +2072,8 @@ _CAUSE_NAME_W = 34
 # Imported, not restated. These lived here as a second copy of runs.BAD_STATES
 # and runs.BROKE_STATES, which is two literals that have to be edited together
 # forever and will not be. runs.py is stdlib-only, so this costs nothing.
-from .runs import BAD_STATES as _BAD, BROKE_STATES as _BROKE  # noqa: E402
+from .runs import (BAD_STATES as _BAD, BROKE_STATES as _BROKE,             # noqa: E402
+                   ACTIVE_STATES)
 from .runs import (HELD_BUCKET, ACTIVE_BUCKET, ATTENTION_BUCKET,           # noqa: E402
                    FINISHED_BUCKET, UNAVAILABLE_BUCKET, CANCELLED_TAG,
                    list_bucket, list_line, list_tag)
@@ -2101,6 +2420,246 @@ _TAG_COLOUR = {
     UNAVAILABLE_BUCKET: GREY,
 }
 
+# The marker column for a /list row: one glyph and one colour per state.
+#
+# Both, not either. Colour is what makes the states separable at a glance, and
+# it is also the half that does not survive -- a screenshot pasted into an
+# email, a colourblind reader, `/list | tee log.txt`. The glyph carries the
+# meaning on its own and the colour makes it fast, which is the same reasoning
+# _plan_body already states about its own marker column.
+#
+# The pair is spent twice per row and nowhere else: on the glyph, and on the
+# STATUS phrase that ends the row. Nothing between them is coloured -- the name
+# is bold, the pipeline grey, the counts plain -- so a row reads as one state
+# stated at both ends rather than as four competing highlights.
+#
+# Six marks for five buckets, because FINISHED holds two outcomes that must
+# never be confused: a run that completed and a run somebody stopped. Tagging a
+# cancellation with a green tick would report it as a success.
+_HELD_MARK = "◇"          # ◇ waiting on you
+_LIVE_MARK = "▶"          # ▶ working
+_BROKE_MARK = "✗"         # ✗ something failed
+_DONE_MARK = "✓"          # ✓ finished cleanly
+_STOPPED_MARK = "⊘"       # ⊘ stopped on purpose
+_NOTHING_MARK = "·"       # · terminal, but nothing happened
+_UNKNOWN_MARK = "?"       # ? the scheduler would not say
+
+_MARKS = {
+    HELD_BUCKET: (_HELD_MARK, AMBER),
+    ACTIVE_BUCKET: (_LIVE_MARK, CYAN),
+    ATTENTION_BUCKET: (_BROKE_MARK, RED),
+    FINISHED_BUCKET: (_DONE_MARK, GREEN),
+    UNAVAILABLE_BUCKET: (_UNKNOWN_MARK, GREY),
+}
+
+
+def _mark(bucket, status):
+    """Glyph and colour for one row.
+
+    Held is amber rather than red. Red is for something that went wrong, and a
+    run waiting for approval has not gone wrong -- it is doing exactly what
+    this tool exists to make it do. Colouring it the same as a failure made
+    every second row on a busy list look like a problem.
+
+    A stopped run and a run that had nothing to do are both DIM: they are
+    terminal and neither is an outcome to celebrate or worry about, and dim is
+    how this table says "nothing further here".
+    """
+    if bucket == FINISHED_BUCKET and status is not None:
+        if status.counts and status.counts.get("CANCELLED"):
+            return _STOPPED_MARK, DIM
+        if not status.counts:
+            return _NOTHING_MARK, DIM
+    if bucket == FINISHED_BUCKET and status is None:
+        return _NOTHING_MARK, DIM
+    return _MARKS[bucket]
+
+
+def _progress(status):
+    """"29/30" -- jobs done out of jobs there are, for the PROGRESS column.
+
+    A fraction rather than the three raw counts it replaced. "29" on its own is
+    unreadable: whether it is nearly finished or barely started depends
+    entirely on a denominator that was never on screen, and "29 1 0" and
+    "1 2 0" hid the difference between a run that died at the finish line and
+    one that died on takeoff.
+
+    A middle dot, not a zero and not a fraction, where there is nothing to
+    count. A held run has not been submitted, so it has no jobs, and "0/0"
+    would state that it has finished all of them.
+    """
+    if status is None or not status.counts or not status.total:
+        return "·"
+    done = status.counts.get("COMPLETED", 0)
+    if status.unknown and not done:
+        # Jobs exist and the scheduler would not account for any of them.
+        # "0/15" says fifteen are outstanding, which is not something we found
+        # out -- the NEEDS column says they went unaccounted for, and this
+        # column has to stop short of contradicting it.
+        return "·"
+    return f"{done}/{status.total}"
+
+
+def _age(record, now):
+    """How long this run has been in the listing: "13d", "3h", "45m", "".
+
+    Measured from the moment it became something you could be ignoring:
+    submitted_at for a launched run, held_at for one still awaiting approval.
+    It is deliberately NOT time since a run finished: nothing records
+    when a run ended (Job has start and elapsed, no end), and deriving a finish
+    time from the last check would report when we happened to look rather than
+    when it happened.
+
+    It is the column the old listing had no equivalent of, and on a real screen
+    it is the loudest thing on it: ten runs held, the oldest for a fortnight,
+    is the actual state of a workspace and used to be invisible.
+    """
+    # submitted_at first and held_at only as the fallback, rather than a test
+    # on the record's status: a run that was held and then approved carries
+    # both, and the age that matters from then on is how long it has been
+    # running, not how long it once sat waiting. A still-held run has no
+    # submitted_at, so it falls through to held_at on its own.
+    stamp = record.get("submitted_at") or record.get("held_at")
+    if not stamp:
+        return ""
+    try:
+        then = datetime.datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return ""
+    seconds = (now - then).total_seconds()
+    if seconds < 0:
+        return ""
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+# Slurm's state names, said the way a person would. The raw names are shouted
+# constants that read as machine output; this column is prose.
+_BROKE_WORD = {
+    "TIMEOUT": "timeout",
+    "OUT_OF_MEMORY": "out of memory",
+    "NODE_FAIL": "node failure",
+    "FAILED": "failed",
+    "PREEMPTED": "preempted",
+    "BOOT_FAIL": "boot failure",
+    "DEADLINE": "deadline",
+}
+
+
+def _what(record):
+    """The pipeline and protocol this run is, or "" if it never said.
+
+    Two places know it and neither knows it always: a held run carries the
+    slots the gate resolved, and a run adopted by /scan carries what was read
+    off its job-list filename. Asking both is what makes the column populated
+    for rows that arrived by different routes.
+    """
+    slots = (record.get("proposal") or {}).get("slots") or {}
+    parts = []
+    for key in ("pipeline", "protocol"):
+        value = slots.get(key) or record.get(key)
+        if value:
+            parts.append(str(value).strip())
+    return " ".join(p for p in parts if p)
+
+
+def _broke_phrase(status):
+    """"timeout in gatk_haplotype", "5× out of memory in sambamba_merge".
+
+    resolve() already worked this out -- root_cause names the earliest job that
+    broke on its own, its step, and how many broke the same way. The old
+    listing computed none of it and printed a "1" in a FAIL column instead,
+    which is the same width and answers a strictly smaller question: a step
+    name and a failure kind tell you whether to reach for /modify or /diagnose,
+    and a count does not.
+
+    The count here is root_cause's -- jobs that broke the same way in the same
+    step -- not the raw total of everything in a bad state. In a GenPipes DAG
+    one failure cancels everything downstream of it, so the raw total reports
+    a dozen casualties as though they were a dozen problems.
+    """
+    cause = status.root_cause if status is not None else None
+    if not cause or not cause.get("step"):
+        return ""
+    state = cause.get("state")
+    count = cause.get("count") or 1
+    lead = f"{count}× " if count > 1 else ""
+    # The generic FAILED contributes no word, because the column has already
+    # said "failed" and "failed · failed in stringtie" says it twice. Every
+    # other state names something the first word does not -- a timeout and an
+    # out-of-memory are different problems with different fixes.
+    if state == "FAILED":
+        return f"{lead}{cause['step']}"
+    kind = _BROKE_WORD.get(state,
+                           str(state or "failed").lower().replace("_", " "))
+    return f"{lead}{kind} in {cause['step']}"
+
+
+def _row_status(bucket, record, status):
+    """The last column: the run's state in a word, then why, if there is a why.
+
+    One vocabulary, said the same way every time -- waiting for approval,
+    running, queued, failed, completed, stopped, nothing to run, unknown -- so
+    the column can be read down rather than parsed row by row. The state word
+    comes first on every row, always in the same place, and anything after the
+    `·` is detail that only some states have.
+
+    What follows `failed` is the part the old FAIL column could not carry.
+    resolve() already worked out which step broke and how (root_cause); the
+    listing used to compute none of it and print a bare count instead, which
+    is the same width and answers a strictly smaller question -- a step name
+    and a failure kind tell you whether to reach for /modify or /diagnose, and
+    a number does not.
+
+    Two details are deliberately absent. `completed` and `stopped` carry no
+    tail: the PROGRESS column beside them already says 17/17 and 4/10, and a
+    cancellation has no error to report. And `queued` is a word of its own
+    rather than a flavour of running, because a run that has been queued for
+    three days is a starving allocation, which the AGE column then dates.
+    """
+    if bucket == HELD_BUCKET:
+        return "waiting for approval"
+    if bucket == UNAVAILABLE_BUCKET:
+        # The ? already says it could not be resolved, so the tail is spent on
+        # the part it cannot carry: what the scheduler said the last time it
+        # answered at all.
+        last = record.get("last_check")
+        if not last:
+            return "unknown · nothing known yet"
+        return f"unknown · last known: {last.get('verdict', '?')}"
+    counts = (status.counts if status is not None and status.counts else {})
+    if bucket == ACTIVE_BUCKET:
+        return "running" if counts.get("RUNNING") else "queued"
+    if bucket == ATTENTION_BUCKET:
+        if status is not None and status.unknown and not status.root_cause:
+            why = f"{status.unknown} unaccounted for"
+        elif (status is not None and status.doomed
+                and not any(s in _BROKE for s in counts)):
+            why = f"{status.doomed} will never run"
+        else:
+            broke = sum(n for s, n in counts.items() if s in _BROKE)
+            why = _broke_phrase(status) or f"{broke} jobs"
+        # Named only when there are any. A run that is half broken and half
+        # still burning allocation is a different decision from one that is
+        # simply over, and that difference is the whole reason to look at this
+        # row now rather than later.
+        active = sum(n for s, n in counts.items() if s in ACTIVE_STATES)
+        if active:
+            why += f" · {active} still running"
+        return f"failed · {why}"
+    # FINISHED, in its three flavours.
+    if counts.get("CANCELLED"):
+        return "stopped"
+    if status is None or not counts:
+        # Never "no jobs". GenPipes creating no jobs means every output it was
+        # asked for is already on disk, which is a successful outcome rather
+        # than an absence of one.
+        return "nothing to run"
+    return "completed"
+
 # Held first -- it is the one state waiting on a person to make a decision.
 # Live and needs attention next, because they describe something actually
 # happening right now; completed and status unavailable are, in different
@@ -2155,12 +2714,34 @@ def run_list(rows):
     In particular the tag is never the registry's own `status`, which says
     "submitted" about a run that failed three days ago.
 
-    One flat list, sorted by state rather than broken into headed sections.
-    Every row carries its own tag, so a name and its state are read together
-    in one line instead of a name here and a heading somewhere above it. One
-    line of detail under each, saying what the tag means, plus the job_list
-    filename where there is one -- and the actions stated ONCE at the bottom
-    rather than repeated under every row.
+    An aligned table, sorted by state rather than broken into headed sections,
+    one row per run:
+
+         NAME               PIPELINE                 PROGRESS  AGE  STATUS
+      \u25c7  rnaseq-0804        rnaseq stringtie                \u00b7  13d  waiting for approval
+      \u25b6  rnaseq-0810        rnaseq stringtie            18/44   3h  running
+      \u2717  Test_walltimefail  dnaseq somatic_fastpass      1/44   9d  failed \u00b7 2\u00d7 timeout in \u2026
+      \u2713  rnaseq-light-0726  rnaseq_light                17/17  16d  completed
+
+    It replaced three stacked lines per run -- name and tag, then a sentence
+    restating the tag, then a bare job-list filename -- which cost forty lines
+    for fifteen runs and still could not be compared down a column.
+
+    Three columns before the status, not the four this started with.
+    OK/FAIL/RUN looked like three facts and carried about one: RUN was 0 or a
+    dash on every row that was not live, OK had no denominator so its number
+    meant nothing on its own, and two thirds of the grid was em dashes -- a
+    column empty for most rows is a footnote rather than a column.
+
+    What replaced them is one fact each, populated on every row: how far along
+    (_progress, a fraction, because "29" without a denominator cannot be read),
+    how long it has been sitting there (_age, which the listing had no
+    equivalent of at all), and what state it is in (_row_status, which names
+    the step that broke rather than counting the casualties).
+
+    The job-list filename is gone from the listing and lives in /jobs and
+    /view, which is what those commands are for; it was the widest thing on
+    screen and the least often read.
     """
     buckets = {b: [] for b in _SECTION_ORDER}
     for record, status in rows:
@@ -2169,43 +2750,71 @@ def run_list(rows):
         entries.sort(key=lambda rs: rs[0].get("submitted_at")
                                     or rs[0].get("held_at") or "")
 
+    ordered = [(bucket, record, status)
+               for bucket in _SECTION_ORDER
+               for record, status in buckets[bucket]]
+
+    # Columns sized from the data, then from the window. A name column wide
+    # enough for the longest name is worth having and is not worth wrapping the
+    # table for, so the window is allowed to overrule it -- and fit() below is
+    # the guarantee, not the intention.
+    cols = terminal_cols() if _tty() else 100
+    names = [str(r["name"]) for _, r, _ in ordered] or [""]
+    whats = [_what(r) for _, r, _ in ordered] or [""]
+    # One clock for the whole table, read once. Ages computed per row from a
+    # per-row now() are measured from instants a few microseconds apart, which
+    # is harmless right up until two rows straddle a minute boundary and the
+    # listing gives two runs submitted together different ages.
+    now = datetime.datetime.now()
+    ages = {id(r): _age(r, now) for _, r, _ in ordered}
+    # Everything on a row that is not the name, the pipeline or the needs cell:
+    #   "  " + glyph + "  " …name…  "  " …pipeline…  "  " + 8 + "  " + 4 + "  "
+    w_prog, w_age = 8, 4
+    fixed = 2 + 1 + 2 + 2 + 2 + w_prog + 2 + w_age + 2
+    # STATUS is reserved BEFORE the name and pipeline columns get to bid, not
+    # left whatever they happen not to use. It is the column carrying the one
+    # thing no other column can say -- "failed · 2× timeout in gatk_haplotype",
+    # "unknown · last known: 6 running" -- and a run name is allowed to be
+    # abbreviated long before that is. 30, because "waiting for approval" is
+    # 20 and the shortest useful failure phrase is longer than that.
+    w_status = 30
+    budget = max(24, cols - 1 - fixed - w_status)
+    w_name = min(max(len(n) for n in names), max(12, budget * 3 // 5))
+    w_what = min(max(len(w) for w in whats), max(10, budget - w_name))
+
     print()
-    for bucket in _SECTION_ORDER:
-        for record, status in buckets[bucket]:
-            tag = list_tag(record, status)
-            colour = _TAG_COLOUR[bucket]
-            # Only the tag is coloured, and only red where a person is
-            # actually needed -- held and needs attention. A listing where
-            # every row is lit up says nothing about which row to read first.
-            emphasis = BOLD if bucket in (HELD_BUCKET, ATTENTION_BUCKET) else ""
-            print(f"  {DIM}\u258c{RESET} {BOLD}{record['name']}{RESET}"
-                  f"  {DIM}\u00b7{RESET}  {colour}{emphasis}{tag}{RESET}")
-            # Every row says what its state means, held included. "held" is
-            # this tool's word for it; "awaiting your approval" is what it
-            # means, and the held row is the last one that should be answering
-            # in jargon -- it is the only state on the list that is waiting on
-            # the person reading it. The verbs are still stated once at the
-            # bottom rather than repeated under every held row.
-            detail = ("awaiting your approval" if bucket == HELD_BUCKET else
-                      _unavailable_line(record) if bucket == UNAVAILABLE_BUCKET else
-                      _finished_line(status) if bucket == FINISHED_BUCKET else
-                      list_line(status))
-            if detail:
-                print(f"  {DIM}\u2502{RESET}   {GREY}{detail}{RESET}")
-            # Never for a held run -- nothing has been launched, so there is
-            # no job_list yet. For everything else, preserved whenever one
-            # exists: it is what connects this name back to the actual
-            # GenPipes execution on disk.
-            if bucket != HELD_BUCKET and record.get("job_list"):
-                print(f"  {DIM}\u2502   {os.path.basename(record['job_list'])}{RESET}")
+    if ordered:
+        head = (f"     {'NAME':<{w_name}}  {'PIPELINE':<{w_what}}"
+                f"  {'PROGRESS':>{w_prog}}  {'AGE':>{w_age}}  STATUS")
+        print(f"  {DIM}{fit(head, cols - 3)}{RESET}")
+    for bucket, record, status in ordered:
+        glyph, colour = _mark(bucket, status)
+        name = str(record["name"])
+        # Truncated with an ellipsis rather than allowed to push the columns
+        # apart. A name too long for its column is a formatting problem; a table
+        # whose columns move from row to row is an unreadable one.
+        #
+        # The state's colour appears exactly twice, at the two ends of the row:
+        # on the glyph, and on the whole status phrase including its reason.
+        # Everything between them is bold, grey or plain, so the row has one
+        # highlight rather than four competing ones.
+        line = (f"  {colour}{glyph}{RESET}  "
+                f"{BOLD}{pad(name, w_name)}{RESET}"
+                f"  {GREY}{pad(_what(record), w_what)}{RESET}"
+                f"  {_progress(status):>{w_prog}}"
+                f"  {ages[id(record)]:>{w_age}}"
+                f"  {colour}{_row_status(bucket, record, status)}{RESET}")
+        print(fit(line, cols - 1))
 
     # Provenance for the whole listing rather than a timestamp per row: every
     # row above was resolved by the same batched scheduler call, a moment ago.
     at = next((s.at for _, s in rows if s is not None and s.at), None)
     if at:
-        print(f"  {DIM}\u258c{RESET}")
-        print(f"  {DIM}\u258c{RESET}   {GREY}states read from the scheduler at "
-              f"{at}{RESET}")
+        # A plain footer rather than the old \u258c gutter marker: the gutter used to
+        # align with the \u258c that started every row, and rows start with a state
+        # glyph now, so it aligned with nothing.
+        print()
+        print(f"     {DIM}states read from the scheduler at {at}{RESET}")
 
     print()
     print(f"  {BOLD}Actions{RESET}")

@@ -440,30 +440,27 @@ be idle.
 """
 
 
-# The progress checklist, parked. Set PLANS to True to put it back in the
-# prompt -- nothing else needs changing, and display.py's renderer, its parser
-# and their tests are all untouched and still passing.
+# The progress checklist, back on.
 #
-# It is off because the block arrives on screen TWICE. display.parse() lifts
-# `1. [ ] ...` lines out of the reply and draws them as the "Plan" block that
-# updates in place, but it does not remove them from the prose it then prints,
-# so the same four stages appear again as raw markdown directly underneath --
-# once rendered, once literal. That is a rendering defect rather than a
-# prompting one: the parser and the passthrough disagree about who owns those
-# lines, and no wording in here can settle it.
+# It was parked because the block arrived on screen TWICE: display.parse()
+# lifted `1. [ ] ...` lines out of the reply and drew them as the "Plan" block
+# that updates in place, but did not remove them from the prose it then
+# printed, so the same stages appeared again as raw markdown underneath --
+# once rendered, once literal. The note left here called that a rendering
+# defect rather than a prompting one, and said the fix was for parse() to
+# consume the lines it claims.
 #
-# So this text is kept intact rather than rewritten from memory later. Fixing
-# the double-draw is a display.py job -- parse() has to consume the lines it
-# claims -- and when that is done this goes back on, possibly behind a mode
-# rather than on by default.
-PLANS = False
+# That is what display._strip_plan now does, on both the solution path and the
+# connective-prose path, off one shared _PLAN_LINE pattern. With the lines
+# claimed in exactly one place, the checklist can go back in the prompt.
+PLANS = True
 
 PLAN_PROTOCOL = """
 
 THE PLAN
 
-For work with several stages -- preparing a run, diagnosing a failure -- open
-with a numbered checklist, exactly this shape, one line each:
+If finishing what they asked for will take you more than one reply, your FIRST
+reply opens with a numbered checklist, exactly this shape, one line each:
 
     1. [ ] read the ampliconseq step list
     2. [ ] locate the CIT readset
@@ -480,7 +477,13 @@ failed is described in your prose and the list is changed, rather than given a
 symbol of its own.
 
 Do not otherwise restate the plan. Below the list, say the one sentence that
-explains the next action, then take it. Work that is one step needs no plan.
+explains the next action, then take it.
+
+Judge "more than one reply" by the whole job they asked for, not by the step in
+front of you. Preparing a run is always several replies -- you have to establish
+the protocol, find the files it needs, generate the command, and bring it to the
+gate -- so it gets a checklist on the first reply, even though the first thing
+you actually do is one lookup.
 """
 
 # Said only while PLANS is off. Stated rather than left unsaid, because A1's
@@ -792,7 +795,34 @@ class GenpipeA1(A1):
         # 6. The gate node. Pure before interrupt() (safe to re-run on resume).
         def submission_gate(state):
             code = self._extract_pending_code(state)
-            reply = interrupt(self._build_proposal(state, code))   # <-- PAUSES here
+            proposal = self._build_proposal(state, code)
+
+            # An incomplete proposal never reaches the person. The gate means
+            # "you are one step from submitting"; a box you can only reject is
+            # not that, and it puts the wrong job on the wrong party -- the
+            # model knows what a readset is and can go and find one, whereas
+            # the person is handed a form with a hole in it and no way to fill
+            # it in from where they are standing.
+            #
+            # So it goes back to be finished, naming what is absent, and the
+            # gate is drawn only when there is a decision to make. This is why
+            # display.gate's `missing` branch and mirror._absent(required=True)
+            # exist no longer: the state they rendered cannot be reached.
+            #
+            # Before the interrupt, so the node stays pure and safe to re-run
+            # on resume, and routed to generate rather than execute so nothing
+            # is submitted on the way past.
+            missing = proposal.get("missing") or []
+            if missing:
+                state["messages"].append(HumanMessage(content=(
+                    "That submission is not ready: "
+                    + ", ".join(missing)
+                    + " missing. Find or ask for what is missing, then "
+                      "regenerate the command and propose it again.")))
+                state["next_step"] = "generate"
+                return state
+
+            reply = interrupt(proposal)                            # <-- PAUSES here
             if reply.get("approved"):
                 # propose_submission("cmd.sh") is a request, not runnable code:
                 # handing it to the interpreter gets `NameError: name

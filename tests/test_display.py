@@ -224,54 +224,204 @@ def main():
         than against anything else that happens to be on screen."""
         return next(l for l in out.splitlines() if name in l)
 
-    r.check("one flat list, no section headings",
+    r.check("one flat table, no section headings",
             "Awaiting approval" not in out and "Needs attention" not in out)
+    r.check("one fact per column, each populated on every row",
+            "PROGRESS" in out and "AGE" in out and "STATUS" in out)
+    # OK/FAIL/RUN looked like three facts and carried about one: RUN was 0 or
+    # a dash on every row that was not live, and OK had no denominator, so its
+    # number meant nothing without one.
+    r.check("and no bare counts without a denominator",
+            "OK" not in out and "FAIL" not in out)
 
-    r.contains("a held run is tagged on its own row", row("waiting"), "held")
-    r.check("and shows only the name and the tag, no command",
+    def cells_of(name):
+        """A row's fields, whitespace collapsed -- what the columns say,
+        without asserting on the exact padding that keeps them aligned."""
+        return row(name).split()
+
+    r.contains("a held run says what it is waiting for",
+               row("waiting"), "waiting for approval")
+    r.check("marked as waiting on a person, not as broken",
+            cells_of("waiting")[0] == "◇")
+    r.check("and its progress is a dot, not 0/0 -- it has no jobs to have done",
+            "·" in cells_of("waiting") and "0/0" not in row("waiting"))
+    r.check("and shows only the name and its state, no command",
             "bash cmd.sh" not in out)
     r.check("with no repeated per-row actions",
             out.count("/approve") == 1 and out.count("/modify") == 1
             and out.count("/reject") == 1)
 
-    r.contains("a truly active run is tagged live", row("running-one"), "live")
-    r.contains("with a running/completed tally under it", out, "6 running")
+    # The column the old listing had no equivalent of. Ten runs held, the
+    # oldest for a fortnight, is the actual state of a workspace, and it used
+    # to be nowhere on screen.
+    r.check("every row says how long it has been sitting there",
+            all(any(c.endswith(("m", "h", "d")) and c[:-1].isdigit()
+                    for c in cells_of(n))
+                for n in ("waiting", "running-one", "half-broken", "all-done")))
 
-    r.contains("a mixed active+failed run needs attention, it is not live",
-               row("half-broken"), "needs attention")
-    r.check("and 'live' is not what its row says",
-            "live" not in row("half-broken"))
-    r.contains("its still-running jobs are named too, not just the failures",
-               out, "still running")
-    r.contains("a fully dead run says so, and that nothing is left of it",
-               out, "2 failed  ·  nothing still running")
+    r.contains("a truly active run says it is running", row("running-one"), "running")
+    r.check("and carries its own mark", cells_of("running-one")[0] == "▶")
+    r.check("its progress is a fraction, so the number means something",
+            "9/15" in cells_of("running-one"))
 
-    r.contains("a cleanly finished run is tagged completed",
-               row("all-done"), "completed")
+    r.check("a mixed active+failed run is marked broken, not live",
+            cells_of("half-broken")[0] == "✗")
+    r.check("its row leads with the failure, not with what is still going",
+            row("half-broken").index("failed")
+            < row("half-broken").index("still running"))
+    r.contains("its still-running jobs are named, not just the failures",
+               row("half-broken"), "still running")
+    r.contains("a fully dead run says it failed", row("fully-dead"), "failed")
+    # "nothing still running" is what usually follows a failure. Saying it on
+    # every broken row spent the widest column on screen restating the expected
+    # case; the surprise -- jobs still burning allocation after a failure -- is
+    # the half worth the width, and it is still said above.
+    r.check("and does not spend the column restating the ordinary case",
+            "nothing still running" not in row("fully-dead"))
+
+    # One vocabulary, in the same place on every row, so the column reads down.
+    r.check("every row leads with its state in the same words",
+            all(any(w in row(n) for w in (
+                "waiting for approval", "running", "queued", "failed",
+                "completed", "stopped", "nothing to run", "unknown"))
+                for n in ("waiting", "running-one", "half-broken",
+                          "fully-dead", "all-done", "i-stopped-it",
+                          "nothing-to-do", "cant-tell")))
+
+    # resolve() already worked out which step broke and how. The old listing
+    # computed none of it and printed a count in a FAIL column instead, which
+    # is the same width and answers a strictly smaller question.
+    timeout_record = {"name": "timed-out", "status": "submitted", "held_at": None,
+                      "submitted_at": "2026-07-24T09:00:00",
+                      "job_list": "/s/job_output/DnaSeq.job_list.T7"}
+    timeout_status = runs.RunStatus(
+        counts={"COMPLETED": 1, "TIMEOUT": 2}, total=44, resolved=3, unknown=0,
+        finished=True, verdict="failed", doomed=0, source="sacct",
+        root_cause={"step": "gatk_haplotype_caller", "state": "TIMEOUT",
+                    "count": 2, "job": "gatk_haplotype_caller.S1"})
+    cause_out = drawn(display.run_list, [(timeout_record, timeout_status)])
+    cause_row = next(l for l in cause_out.splitlines() if "timed-out" in l)
+    r.contains("a broken run names the step that broke",
+               cause_row, "gatk_haplotype_caller")
+    r.contains("and says how it broke, in words rather than a Slurm constant",
+               cause_row, "timeout")
+    r.check("and how many broke the same way", "2×" in cause_row)
+    r.contains("its progress shows it died on takeoff, not at the finish line",
+               cause_row, "1/44")
+    # "failed · failed in stringtie" says it twice. The generic FAILED
+    # contributes no word of its own; every other state names something the
+    # leading "failed" does not.
+    plain = dict(timeout_record, name="plain-break")
+    plain_status = runs.RunStatus(
+        counts={"COMPLETED": 29, "FAILED": 1}, total=30, resolved=30,
+        unknown=0, finished=True, verdict="failed", doomed=0, source="sacct",
+        root_cause={"step": "stringtie", "state": "FAILED", "count": 1,
+                    "job": "stringtie.S1"})
+    plain_out = drawn(display.run_list, [(plain, plain_status)])
+    plain_row = next(l for l in plain_out.splitlines() if "plain-break" in l)
+    r.contains("a plain failure names its step", plain_row, "failed · stringtie")
+    r.check("and does not say 'failed' twice",
+            plain_row.count("failed") == 1)
+
+    # "complete" beside a ✓ and a 10/10 is the third time one row has said the
+    # same thing. The tick and the full fraction carry it; the NEEDS column is
+    # for what a run wants from you, and this one wants nothing.
+    r.check("a cleanly finished run reads as completed, with its full fraction",
+            cells_of("all-done")[-1] == "completed"
+            and "10/10" in cells_of("all-done"))
+    r.check("marked with the done tick", cells_of("all-done")[0] == "✓")
     r.check("and no completion time is invented for it",
             "completed Aug" not in out and " at " not in row("all-done"))
-    r.contains("a zero-job run says so plainly", out, "already up to date")
+    r.contains("a zero-job run says there was nothing to run",
+               row("nothing-to-do"), "nothing to run")
+    r.check("and is not given the tick that means jobs succeeded",
+            cells_of("nothing-to-do")[0] != "✓")
 
-    r.contains("a run somebody stopped is tagged cancelled, never completed",
-               row("i-stopped-it"), "cancelled")
-    r.check("its tag does not claim success",
-            "completed" not in row("i-stopped-it"))
+    r.contains("a run somebody stopped is stopped, never completed",
+               row("i-stopped-it"), "stopped")
+    r.check("its mark is not the success tick",
+            cells_of("i-stopped-it")[0] == "⊘")
+    r.check("and it does not claim success",
+            "complete" not in row("i-stopped-it"))
 
-    r.contains("an unresolvable run is tagged as such",
-               row("cant-tell"), "status unavailable")
-    r.check("it is not tagged as needing attention",
-            "needs attention" not in row("cant-tell"))
+    r.check("an unresolvable run is marked unknown, not broken",
+            cells_of("cant-tell")[0] == "?")
+    r.check("it is not marked as having failed",
+            cells_of("cant-tell")[0] != "✗")
     r.contains("and offers the last known verdict instead of silence",
-               out, "last known")
+               row("cant-tell"), "last known")
+
+    # Every mark is distinct, which is the property that lets the column carry
+    # the state on its own -- two states sharing a glyph would leave the
+    # difference carried by colour, and there is no colour left to carry it.
+    marks = [display._HELD_MARK, display._LIVE_MARK, display._BROKE_MARK,
+             display._DONE_MARK, display._STOPPED_MARK, display._NOTHING_MARK,
+             display._UNKNOWN_MARK]
+    r.equal("every state has its own glyph", len(set(marks)), len(marks))
+
+    # ---------------------------------------------------------------- #
+    r.section("/list says each state in colour at both ends of its row")
+    # These assert on the escapes themselves, so they cannot use drawn(),
+    # which exists to strip exactly what is being checked here.
+    painted = io.StringIO()
+    with redirect_stdout(painted):
+        display.run_list(rows)
+    painted = painted.getvalue()
+
+    def painted_row(name):
+        return next(l for l in painted.splitlines() if name in l)
+
+    # The glyph and the status phrase, and nothing in between. A row with its
+    # name, its counts and its status all lit up has four highlights competing,
+    # which is the same as having none.
+    for name, colour in (("waiting", display.AMBER),
+                         ("running-one", display.CYAN),
+                         ("half-broken", display.RED),
+                         ("all-done", display.GREEN)):
+        r.equal(f"{name}'s state colour is spent exactly twice",
+                painted_row(name).count(colour), 2)
+
+    r.check("held is amber, not the red of something that went wrong",
+            display.RED not in painted_row("waiting"))
+    r.check("and a failure is red rather than the amber of a decision",
+            display.AMBER not in painted_row("half-broken"))
+
+    # The reason travels with the word it explains. Splitting them would put
+    # "failed" in red and the one fact telling you what to do about it in
+    # whatever colour was left over.
+    broke = painted_row("half-broken")
+    r.check("a failure's reason carries the same colour as the word 'failed'",
+            broke.index(display.RED) < broke.index("failed")
+            and display.RESET not in broke[broke.index("failed"):
+                                           broke.index("still running")])
+
+    # Everything between the two ends is weight, not hue: bold name, grey
+    # pipeline, plain counts.
+    r.check("the name is bold rather than coloured",
+            display.BOLD in painted_row("waiting"))
+    r.check("and a stopped run is dim, not tagged with a colour of its own",
+            display.DIM in painted_row("i-stopped-it")
+            and not any(c in painted_row("i-stopped-it")
+                        for c in (display.RED, display.AMBER,
+                                  display.GREEN, display.CYAN)))
+
+    # The table has to fit the window, or the prompt box below it drifts -- see
+    # display.fit and the three redraws that share it.
+    r.check("no row is wider than a standard terminal",
+            max(display.cells(line) for line in out.splitlines()) <= 100)
 
     r.check("held sorts above everything else",
             out.index("waiting") < out.index("running-one")
             and out.index("running-one") < out.index("half-broken"))
 
-    r.contains("the job_list filename is preserved for launched runs",
-               out, "RnaSeq.stringtie.job_list.T1")
-    r.check("but never shown for an awaiting-approval run",
-            "job_list" not in out.split("running-one")[0])
+    # The job-list filename used to hang under every launched row. It was the
+    # widest thing on screen -- wide enough to be the reason a 15-run listing
+    # could not be a table -- and it is what /jobs and /view exist to show. The
+    # listing answers "which runs, and how are they", not "where on disk".
+    r.check("no job-list filename crowds the table",
+            "job_list" not in out)
+    r.check("and no absolute paths either",
+            "/s/job_output" not in out)
 
     r.contains("the listing says when the states were read", out, "09:15")
     r.contains("actions are offered once, at the bottom", out, "Actions")
@@ -433,6 +583,43 @@ def main():
     r.check("drawing all of it raises nothing",
             drawn(display.render, Msg("<solution>ok</solution>")) is not None)
 
+    # The defect that switched agent.PLANS off: the checklist was lifted into a
+    # plan event AND left in the text it was lifted from, so every turn drew the
+    # list twice -- once as the block that repaints in place, once as raw
+    # markdown directly underneath. The prompt requires exactly one <solution>
+    # or one <execute> per reply, so a checklist reliably landed in the
+    # solution path, which was the one that did not strip it.
+    both = display.parse(Msg(
+        "<solution>\n"
+        "1. [x] read the step list\n"
+        "2. [ ] generate the command\n\n"
+        "Three protocols here. Generating next.\n"
+        "</solution>"))
+    told = next(e for e in both if e["kind"] == "solution")["text"]
+    r.equal("the checklist is claimed by the plan block alone",
+            told, "Three protocols here. Generating next.")
+    r.check("so no raw checkbox line survives into the prose",
+            "[x]" not in told and "[ ]" not in told)
+
+    # A turn whose whole answer was the checklist has nothing left to say --
+    # the block above is already saying it, and an empty solution would print
+    # as a stray blank gap under it.
+    r.equal("a checklist-only reply is the block and nothing else",
+            [e["kind"] for e in display.parse(Msg(
+                "<solution>\n1. [ ] first\n2. [ ] second\n</solution>"))],
+            ["plan"])
+
+    # The stripping keys on the CHECKBOX, not on the numbering: a pipeline's
+    # step list, a set of options, any ordinary numbered list is content the
+    # reader asked for and must survive intact.
+    kept = next(e for e in display.parse(Msg(
+        "<solution>This protocol runs:\n1. trimmomatic\n2. bwa_mem\n</solution>"))
+        if e["kind"] == "solution")["text"]
+    r.contains("an ordinary numbered list is untouched", kept, "1. trimmomatic")
+    r.check("and is not mistaken for progress",
+            not any(e["kind"] == "plan" for e in display.parse(Msg(
+                "<solution>1. trimmomatic\n2. bwa_mem</solution>"))))
+
     # ---------------------------------------------------------------- #
     r.section("a question is rendered as a panel, never as code")
 
@@ -485,8 +672,10 @@ def main():
     r.equal("a documentation lookup is HELP",
             label("module load mugqic/genpipes/6.1.1 && genpipes rnaseq --help"),
             "HELP")
+    # Drawn lowercase: the label is a quiet caption on a block, not a heading
+    # shouted at the reader. _code_label's own vocabulary stays uppercase.
     r.contains("and the label is what gets drawn", loud(
-        display.render, Msg("<execute>\nbash cmd.sh\n</execute>")), "SUBMIT")
+        display.render, Msg("<execute>\nbash cmd.sh\n</execute>")), "submit")
 
     # ---------------------------------------------------------------- #
     r.section("long machine output is clipped at both ends, not one")
@@ -525,13 +714,18 @@ def main():
     r.contains("though the feedback is visible", rejected, "steps 6-12")
 
     # Command output arrives as a user turn now (the Anthropic API rejects a
-    # conversation that ends on the assistant's side), so it must render as OUT
-    # from either role.
+    # conversation that ends on the assistant's side), so it must render as
+    # machine output from either role.
     from_machine = loud(display.render,
                         HumanMessage("<observation>Generated cmd.sh</observation>"))
-    r.contains("output on the user channel is still TERMINAL", from_machine,
-               "TERMINAL")
+    r.contains("output on the user channel is still drawn", from_machine,
+               "Generated cmd.sh")
     r.check("and is not attributed to them", me not in from_machine)
+    # Uncaptioned on purpose: the command that produced it sits directly above,
+    # so a "terminal" line named the channel rather than the event and cost a
+    # line on every command the agent ran.
+    r.check("with no caption naming the channel",
+            "terminal" not in from_machine.lower())
 
     r.equal("the continue nudge is not drawn at all",
             display.parse(HumanMessage("[continue]")), [])
@@ -899,12 +1093,16 @@ def main():
 
     display.reset_plan()
     text = drawn(display.render, Msg(checklist))
-    r.contains("the block is labelled", text, "Plan")
     r.contains("every stage is named", text, "submit to the gate")
-    r.contains("finished stages are ticked", text, "✓ read the readset")
-    r.contains("the current one is marked", text, "▶ generate the command")
-    r.check("and stages not started carry no marker",
-            "▶ submit to the gate" not in text and "✓ submit" not in text)
+    # Drawn in the model's own notation rather than translated into a marker
+    # column: the list on screen and the list in the reply are one object, so
+    # nobody holds a mapping between a ▶ and a `3. [ ]` in their head.
+    r.contains("finished stages are ticked in place",
+               text, "1. [✓] read the readset")
+    r.contains("and the numbering is the model's own",
+               text, "4. [ ] submit to the gate")
+    r.check("a stage not started is an empty box, not a marker",
+            "▶" not in text and "⏺" not in text)
 
     # The fold is what makes this necessary: with the working folded away the
     # plan is the only thing on screen saying what is happening, so it is the

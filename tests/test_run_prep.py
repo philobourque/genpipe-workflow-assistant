@@ -35,6 +35,18 @@ from harness import Report
 from genpipe import cli
 from genpipe import intake
 from genpipe import prep
+from genpipe import ui
+
+
+def drawn(fn, *args, **kwargs):
+    """Call something that prints, and return what it printed, ANSI stripped."""
+    import io
+    import re
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn(*args, **kwargs)
+    return re.sub(r"\033\[[0-9;]*[A-Za-z]", "", buf.getvalue())
 
 
 def main():
@@ -213,6 +225,189 @@ def main():
     spy3 = GateSpy()
     r.truthy("a thread with nothing held is not handled here",
              not cli._at_the_gate(spy3, "no-such-thread", "hello"))
+
+    # ------------------------------------------------------------------ #
+    r.section("/model completes the closed set and leaves the open one alone")
+    # Biomni validates get_llm()'s `source` against a fixed list and passes
+    # `model` through untouched, so providers can be offered exhaustively and
+    # model names cannot be offered at all without guessing.
+    was = {k: os.environ.get(k) for k in
+           ("GENPIPE_LLM_SOURCE", "GENPIPE_LLM_MODEL", "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY")}
+    try:
+        os.environ["GENPIPE_LLM_SOURCE"] = "Anthropic"
+        os.environ["GENPIPE_LLM_MODEL"] = "claude-opus-5"
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-not-a-placeholder"
+        os.environ["OPENAI_API_KEY"] = "sk-..."      # .env.example shape
+        offered = cli._run_names(None, "model")
+        names = [v for v, _ in offered]
+        notes = dict(offered)
+
+        r.equal("every configurable provider is offered",
+                names, [p[1] for p in cli.KNOWN_PROVIDERS])
+        # Biomni knows eight sources; four of them need an endpoint or ambient
+        # cloud credentials rather than a pasted key, so /model cannot switch
+        # to them and completing them would offer a dead end.
+        r.check("and the ones a bare key cannot reach are not",
+                not {"AzureOpenAI", "Bedrock", "Ollama", "Custom"} & set(names))
+
+        r.contains("the active provider is marked", notes["Anthropic"], "current")
+        r.contains("with the model actually loaded, not the provider default",
+                   notes["Anthropic"], "claude-opus-5")
+        # A provider with no key is shown rather than hidden: "why is OpenAI
+        # missing?" is a worse question to leave someone with than a row that
+        # names the command that fixes it.
+        r.contains("a provider with no key is offered, and says so",
+                   notes["OpenAI"], "no key yet")
+
+        # The point of the whole thing: the second word is free-form, because
+        # Biomni never checks it.
+        editor = ui._Editor([("model", "[provider [model]]", "", "")], [],
+                            initial="/model ",
+                            arguments=lambda c: cli._run_names(None, c))
+        r.equal("the provider argument completes",
+                [v for v, _ in editor.arg_matches()], names)
+        typed = ui._Editor([("model", "", "", "")], [], initial="/model g",
+                           arguments=lambda c: cli._run_names(None, c))
+        r.equal("and filters as you type, case-insensitively",
+                [v for v, _ in typed.arg_matches()], ["Gemini", "Groq"])
+        after = ui._Editor([("model", "", "", "")], [], initial="/model Anthropic ",
+                           arguments=lambda c: cli._run_names(None, c))
+        r.equal("but the model name after it is typed, not chosen from a menu",
+                after.arg_matches(), None)
+
+        r.equal("a command whose argument we cannot enumerate still says so",
+                cli._run_names(None, "track"), None)
+
+        # ---------------------------------------------------------------- #
+        r.section("/verbose flips, rather than always meaning on")
+        from genpipe import display as disp
+        was_verbose = disp.VERBOSE
+        try:
+            disp.set_verbose(False)
+            disp._folded.clear()
+            out = drawn(cli._cmd_verbose, None, [])
+            r.equal("bare /verbose from folded turns it on", disp.VERBOSE, True)
+            # It used to mean "on" unconditionally, so pressing it again did
+            # nothing and then said so.
+            out_back = drawn(cli._cmd_verbose, None, [])
+            r.equal("and pressing it again turns it off", disp.VERBOSE, False)
+            r.contains("saying which way it went", out_back, "folded away")
+
+            r.equal("'on' still parses for anyone who says it",
+                    (drawn(cli._cmd_verbose, None, ["on"]), disp.VERBOSE)[1], True)
+            r.equal("and so does 'off'",
+                    (drawn(cli._cmd_verbose, None, ["off"]), disp.VERBOSE)[1], False)
+
+            # Nothing folded is not an event -- it means the session has done no
+            # working yet, which the person can see. It used to cost a block.
+            disp._folded.clear()
+            fresh = drawn(cli._cmd_verbose, None, [])
+            r.check("a session with no working yet says nothing about it",
+                    "othing has been folded" not in fresh)
+            r.check("and confirms the setting in one message",
+                    fresh.count("▌") == 2)
+
+            # The count belongs to the confirmation, not to a header of its own.
+            disp.set_verbose(False)
+            disp._folded.clear()
+            disp._folded.append({"kind": "code", "text": "ls x", "label": "READ"})
+            one = drawn(cli._cmd_verbose, None, [])
+            r.contains("replayed work is counted where it is confirmed",
+                       one, "1 step replayed")
+            r.check("and the count agrees with itself", "1 step(s)" not in one)
+        finally:
+            disp.set_verbose(was_verbose)
+            disp._folded.clear()
+
+        # ---------------------------------------------------------------- #
+        r.section("/model proves a model before it accepts one")
+        # A provider only rejects an unknown model when a request is made --
+        # get_llm() builds a client and returns -- so `/model Anthropic
+        # haiku-4-5` used to be confirmed on screen, written to .env, and then
+        # 404 a turn later from inside the agent loop.
+        class Boom(Exception):
+            def __init__(self, msg, status=None):
+                super().__init__(msg)
+                self.status_code = status
+
+        class FakeLLM:
+            def __init__(self, model, exc=None):
+                self.model, self.exc = model, exc
+            def invoke(self, _):
+                if self.exc:
+                    raise self.exc
+                return "ok"
+
+        class FakeAgent:
+            pass
+
+        r.equal("a live model passes",
+                cli._probe_llm(FakeLLM("m"))[0], cli._MODEL_OK)
+        r.equal("a 404 is the model not existing",
+                cli._probe_llm(FakeLLM("m", Boom("nope", 404)))[0],
+                cli._MODEL_REJECTED)
+        r.equal("and is recognised from the body when there is no status",
+                cli._probe_llm(FakeLLM("m", Boom("{'type': 'not_found_error'}")))[0],
+                cli._MODEL_REJECTED)
+        r.equal("a rejected key is refused too, not blamed on the model",
+                cli._probe_llm(FakeLLM("m", Boom("bad", 401)))[1],
+                "the key was rejected")
+        # The distinction the three-state return exists for: a rate limit says
+        # nothing about whether the model is real, and refusing the switch on
+        # that evidence would strand somebody behind a transient error.
+        r.equal("a rate limit leaves the verdict open, not negative",
+                cli._probe_llm(FakeLLM("m", Boom("slow down", 429)))[0],
+                cli._MODEL_UNVERIFIED)
+        r.equal("as does a network failure",
+                cli._probe_llm(FakeLLM("m", OSError("dns")))[0],
+                cli._MODEL_UNVERIFIED)
+
+        writes = []
+        scripted = {}
+        real = (cli._write_env_var, cli.get_llm, cli._drop_sampling_params)
+        cli._write_env_var = lambda k, v: writes.append((k, v))
+        cli.get_llm = lambda model, **kw: FakeLLM(model, scripted.get(model))
+        cli._drop_sampling_params = lambda llm, source: llm
+        try:
+            agent = FakeAgent()
+            agent.llm = FakeLLM("claude-sonnet-5")
+
+            scripted["haiku-4-5"] = Boom("model: haiku-4-5", 404)
+            out = drawn(cli._cmd_model, agent, ["Anthropic", "haiku-4-5"])
+            r.contains("a bad name is named, with what was wrong with it",
+                       out, "no such model")
+            r.equal("the working model is left in place",
+                    agent.llm.model, "claude-sonnet-5")
+            # The half that turned a typo into a lasting problem: the bad name
+            # reached .env, survived the restart, and came back on the next
+            # launch's banner.
+            r.equal("and nothing is written to .env", writes, [])
+            r.contains("the row says what is still in use", out, "Still using")
+
+            out = drawn(cli._cmd_model, agent, ["Anthropic", "claude-haiku-4-5"])
+            r.equal("a good name is applied", agent.llm.model, "claude-haiku-4-5")
+            r.equal("and only then persisted",
+                    writes, [("GENPIPE_LLM_SOURCE", "Anthropic"),
+                             ("GENPIPE_LLM_MODEL", "claude-haiku-4-5")])
+            r.contains("named the way the banner names it", out, "Anthropic · claude-haiku-4-5")
+
+            writes.clear()
+            scripted["claude-opus-5"] = Boom("rate limited", 429)
+            out = drawn(cli._cmd_model, agent, ["Anthropic", "claude-opus-5"])
+            r.equal("an unreachable provider does not block the switch",
+                    agent.llm.model, "claude-opus-5")
+            r.check("which is persisted like any other", writes != [])
+            r.contains("but the listing says the check did not happen",
+                       out, "Could not reach")
+        finally:
+            cli._write_env_var, cli.get_llm, cli._drop_sampling_params = real
+    finally:
+        for k, v in was.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     print()
     return r.finish()

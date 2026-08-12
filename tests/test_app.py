@@ -346,8 +346,13 @@ def main():
         app.pump(0.8)
         screen = app.emitted()[mark:]
         r.contains("the run is listed", screen, "rnaseq-stringtie")
-        r.contains("marked as held", screen, "held")
-        r.contains("with what it is waiting for", screen, "awaiting your approval")
+        r.contains("marked as waiting on a decision", screen,
+                   "waiting for approval")
+        # Not "awaiting your approval" under every held row any more. The
+        # listing is a table, the state is in its own column, and the sentence
+        # was repeated once per held run while saying the same thing the
+        # Actions block says once at the foot.
+        r.contains("and the verb for it is still offered", screen, "/approve")
 
         # ================================================================== #
         r.section("/approve submits it")
@@ -492,11 +497,13 @@ def main():
         # what is being asserted is that the two differ, not what the second is
         # called, and the model's exact command is not this suite's business.
         #
-        # Read from the mirror's `name` row, not from the /approve line. The
-        # gate stopped spelling the run name beside its verbs once the prompt
-        # learned to complete it -- see display.gate -- so the name now appears
-        # exactly once on that screen, which is the row this matches.
-        found = re.findall(r"name\s+(\S+)\s+not a flag", app.emitted()[mark:])
+        # Read from the gate's `named <run>` line, not from the /approve line.
+        # The gate stopped spelling the run name beside its verbs once the
+        # prompt learned to complete it -- see display.gate -- so the name
+        # appears exactly once on that screen. It moved out of the flag table
+        # (where it sat wearing a "not a flag" disclaimer) and into the
+        # consequence lines at the top, which is what this now matches.
+        found = re.findall(r"named\s+(\S+)", app.emitted()[mark:])
         second = found[-1] if found else None
         r.truthy("the second gate names a run", second)
         r.check("and it is not the first run's name", second != name,
@@ -531,7 +538,8 @@ def main():
             listed = again.emitted()
             r.contains("but /list still has the held run", listed,
                        second or f"{name}-2")
-            r.contains("and still says it is waiting", listed, "held")
+            r.contains("and still says it is waiting", listed,
+                       "waiting for approval")
         finally:
             again.close()
 

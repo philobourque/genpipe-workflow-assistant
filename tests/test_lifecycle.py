@@ -294,13 +294,18 @@ def main():
             try:
                 display.set_verbose(False)
                 row = [m for m in cli.menu() if m[0] == "verbose"][0]
-                r.equal("folded away, the argument offered is on", row[1], "[on]")
+                # Nothing to type: bare /verbose flips it. Offering an argument
+                # for a toggle invites somebody to work out which of the two
+                # they need before they can press a key.
+                r.equal("folded away, no argument is asked for", row[1], "")
                 r.contains("and the row says where it stands", row[2], "folded away")
+                r.contains("and which way it will go", row[2], "show")
 
                 display.set_verbose(True)
                 row = [m for m in cli.menu() if m[0] == "verbose"][0]
-                r.equal("showing, the argument offered is off", row[1], "[off]")
+                r.equal("showing, still no argument", row[1], "")
                 r.contains("and the row says that too", row[2], "showing")
+                r.contains("with the other direction offered", row[2], "fold")
                 r.contains("/help reads from the same place",
                            str(cli.help_rows()), "showing")
             finally:

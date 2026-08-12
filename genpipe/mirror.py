@@ -280,6 +280,15 @@ def _absent(row, required=False):
     return Line(row, row, FLAG_OF.get(row, ""), [], note="not set")
 
 
+# Rows the gate does not draw, because something directly above already said
+# it. `script` is the `-g` filename, which is the same word as the `bash
+# <script>` line the box opens with; `name` is not a flag at all and used to sit
+# in the flag table wearing a disclaimer saying so. Both are still parsed, still
+# on the proposal, and still available to /modify -- this is about what the
+# approval screen shows.
+_GATE_HIDDEN = ("script", "name")
+
+
 # Where each row sits when lines are put back in order: the invocation always
 # first, then modify's row order, then every flag that has no row at all. Ties
 # keep the order they arrived in, so a `-c` stack read out of a command is never

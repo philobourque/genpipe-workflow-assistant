@@ -173,6 +173,41 @@ finally:
 
     shutil.rmtree(tracker.path, ignore_errors=True)
 
+# ---------------------------------------------------------------------------
+# An incomplete proposal never reaches the person.
+#
+# The gate means "you are one step from submitting". A box you can only reject
+# is not that, and it puts the job on the wrong party: the model knows what a
+# readset is and can go and find one, while the person is handed a form with a
+# hole in it and no way to fill it from where they are standing.
+#
+# submission_gate is a closure over the compiled graph, so what is checked here
+# is the decision it makes -- build_proposal's `missing` verdict -- rather than
+# the node object. That verdict is the whole input to the branch.
+# ---------------------------------------------------------------------------
+complete = gate._build_proposal(
+    {"messages": [Msg("<execute>\ngenpipes rnaseq -t stringtie "
+                      "-r readset.tsv -d design.tsv -g cmd.sh\n</execute>")]},
+    'propose_submission("cmd.sh")')
+# -d as well as -r: stringtie is a protocol whose `needs` is DESIGN, so a
+# readset alone is not a complete rnaseq stringtie run. slots.gaps() is the one
+# table that knows which protocol wants which file.
+expect("a command with everything required has nothing missing",
+       complete["missing"], [])
+
+no_readset = gate._build_proposal(
+    {"messages": [Msg("<execute>\ngenpipes rnaseq -t stringtie "
+                      "-g cmd.sh\n</execute>")]},
+    'propose_submission("cmd.sh")')
+expect("a command with no readset reports it missing",
+       "readset" in (no_readset["missing"] or []), True)
+# The slots still parse -- what is absent is absent, not unparsed. This is the
+# distinction the gate node branches on, and the reason the box could ever have
+# been drawn approvable with a hole in it.
+expect("and its other slots are still parsed",
+       no_readset["slots"]["protocol"], "stringtie")
+
+
 print("\n" + "=" * 52)
 print(f"RESULT: {passed} passed, {failed} failed")
 print("=" * 52)

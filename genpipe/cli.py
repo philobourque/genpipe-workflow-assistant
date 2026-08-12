@@ -439,19 +439,102 @@ def build_agent(path=None, llm=None, source=None):
 #  anything starting with / is a command. No Python syntax required.     #
 # --------------------------------------------------------------------- #
 
-def _apply_llm(agent, source, model):
-    """Swap the model the agent uses, effective immediately -- no restart,
-    no rebuilding the graph. Safe because the compiled graph's generate node
-    reads agent.llm live on every step rather than capturing it by value
-    (verified against Biomni's a1.py), so reassigning this attribute is
-    enough on its own.
+# What _probe_llm found. Three outcomes rather than a boolean, because "the
+# provider says no such model" and "the provider did not answer" call for
+# opposite decisions: the first must block the switch, and the second must not,
+# since the name is probably fine and refusing would strand somebody behind a
+# rate limit.
+_MODEL_OK = "ok"
+_MODEL_REJECTED = "rejected"
+_MODEL_UNVERIFIED = "unverified"
+
+
+def _probe_llm(llm):
+    """Ask the provider to answer one trivial prompt. Returns (state, detail).
+
+    A provider only rejects an unknown model when a request is actually made.
+    get_llm() builds a client object and returns -- ChatAnthropic's constructor
+    never touches the network -- so nothing in the construction path can tell a
+    real model name from a typo. That is the whole bug this exists to close:
+    `/model Anthropic haiku-4-5` used to be accepted, confirmed on screen,
+    written to .env, and then 404 a turn later from inside the agent loop,
+    where it read as a problem with the message rather than with the command.
+
+    Deliberately provider-agnostic. It goes through the langchain object the
+    session is about to use, so one code path checks the whole chain at once --
+    key, base url, model name, and whether this account may use that model --
+    for all four providers, with no per-provider table to keep current. That is
+    the same argument _drop_sampling_params makes about sampling parameters:
+    the version of this that does not need a model table is the version that
+    stays right.
+
+    Costs one very short completion, paid only when somebody types /model or
+    /key. Nothing overrides max_tokens to trim it further: the current Anthropic
+    models think by default, a thinking budget shares that ceiling, and a
+    one-token cap is a second way to fail that has nothing to do with whether
+    the model exists.
     """
-    agent.llm = _drop_sampling_params(
+    try:
+        llm.invoke("hi")
+        return _MODEL_OK, ""
+    except Exception as e:                       # noqa: BLE001 -- see below
+        # Provider SDKs raise their own exception classes, and this module must
+        # not import four of them to name the ones it cares about. Both the
+        # Anthropic and OpenAI clients carry the HTTP status on the exception,
+        # which is the part that actually distinguishes the cases.
+        status = getattr(e, "status_code", None)
+        text = str(e)
+        if status == 404 or "not_found_error" in text:
+            return _MODEL_REJECTED, "no such model"
+        if status == 401 or "authentication_error" in text:
+            return _MODEL_REJECTED, "the key was rejected"
+        if status == 403 or "permission_error" in text:
+            return _MODEL_REJECTED, "this key may not use that model"
+        # Rate limits, overloads, timeouts, DNS. The model name is very likely
+        # fine and the caller is told the check did not happen, rather than
+        # being refused a switch on evidence nobody has.
+        return _MODEL_UNVERIFIED, f"{type(e).__name__}: {text.splitlines()[0][:120]}"
+
+
+def _apply_llm(agent, source, model):
+    """Swap the model the agent uses. True if it is now in use.
+
+    Effective immediately -- no restart, no rebuilding the graph. Safe because
+    the compiled graph's generate node reads agent.llm live on every step
+    rather than capturing it by value (verified against Biomni's a1.py), so
+    reassigning this attribute is enough on its own.
+
+    The new model is proven before it replaces the working one. A rejected
+    model leaves the session exactly as it was: `agent.llm` is untouched, so a
+    typo costs one error message rather than every turn until the next restart.
+    """
+    candidate = _drop_sampling_params(
         get_llm(model,
                 stop_sequences=["</execute>", "</solution>"],
                 source=source),
         source)
-    print(f"  {display.GREEN}Using{display.RESET} {source} · {model}\n")
+    state, detail = _probe_llm(candidate)
+    if state == _MODEL_REJECTED:
+        print(f"  {display.RED}{source} · {model} -- {detail}.{display.RESET}")
+        # The one thing the provider will not tell us is what the name should
+        # have been, and every wrong name here so far has been a real model
+        # missing its family prefix.
+        print(f"  {display.GREY}Model names are given in full, e.g. "
+              f"{DEFAULT_MODEL}. Still using "
+              f"{display._identity(os.environ.get('GENPIPE_LLM_SOURCE', DEFAULT_SOURCE), getattr(agent.llm, 'model', None))}."
+              f"{display.RESET}\n")
+        return False
+    agent.llm = candidate
+    # display._identity, not a second f-string saying the same thing: the
+    # banner and the readiness line already render this pair, and a private
+    # copy here is one edit away from the two disagreeing about how a model is
+    # named.
+    print(f"  {display.GREEN}Using{display.RESET} {display._identity(source, model)}")
+    if state == _MODEL_UNVERIFIED:
+        print(f"  {display.GREY}Could not reach {source} to confirm the model "
+              f"exists -- {detail}{display.RESET}")
+    print()
+    return True
 
 
 def _cmd_model(agent, args):
@@ -478,7 +561,12 @@ def _cmd_model(agent, args):
         print(f"  {display.RED}No {source} key configured yet -- run /key first.{display.RESET}\n")
         return
     model = " ".join(args[1:]) if len(args) > 1 else default_model
-    _apply_llm(agent, source, model)
+    # Persisted only once the provider has answered to it. Writing first was
+    # what turned a typo into a lasting problem: the bad name went into .env,
+    # survived the restart, and came back on the next launch's banner, so the
+    # session after the mistake looked broken for no visible reason.
+    if not _apply_llm(agent, source, model):
+        return
     _write_env_var("GENPIPE_LLM_SOURCE", source)
     _write_env_var("GENPIPE_LLM_MODEL", model)
     os.environ["GENPIPE_LLM_SOURCE"] = source
@@ -1727,16 +1815,36 @@ def _cmd_verbose(agent, args):
     connective prose by default, the way a chain of thought is folded away. This
     unfolds it, and replays what has already happened -- a fold you can only
     open going forward is not much of a fold.
+
+    Bare /verbose FLIPS it. A command whose whole job is one setting with two
+    states, typed with no argument, can only sensibly mean "the other one" --
+    and it used to mean "on" unconditionally, so typing it while the working
+    was already showing did nothing and said so in three lines. `on` and `off`
+    still work for anyone who would rather say it than count states.
+
+    One confirmation, whichever way it went. The replay used to announce itself
+    with a header, and then a second block announced the setting, and a third
+    case announced that there had been nothing to replay -- three messages for
+    one keystroke.
     """
-    wanted = True
-    if args and args[0].lower() in ("off", "no", "hide", "quiet"):
+    word = args[0].lower() if args else ""
+    if word in ("off", "no", "hide", "quiet"):
         wanted = False
-    display.set_verbose(wanted)
-    if wanted:
-        display.replay()
-        display.done("Showing the working from here on.", "/verbose off to fold it away again")
+    elif word in ("on", "yes", "show"):
+        wanted = True
     else:
-        display.done("Folding the working away again.", "/verbose to show it")
+        wanted = not display.VERBOSE
+    display.set_verbose(wanted)
+    if not wanted:
+        display.done("Working folded away.", "/verbose to show it")
+        return
+    # Replayed first, so the confirmation lands nearest the prompt -- under the
+    # work it is describing rather than above a screen of it.
+    replayed = display.replay()
+    display.done(
+        "Showing the agent's working."
+        + (f"  {replayed} step{'s' if replayed != 1 else ''} replayed." if replayed else ""),
+        "/verbose to fold it away")
 
 
 def _cmd_jobs(agent, args):
@@ -1895,14 +2003,19 @@ def _specs_now():
     the time -- it read as "off" while the working was already being shown. A
     toggle has to say which way it will flip and where it currently stands, so
     both halves of the row are rewritten from the live setting.
+
+    The argument column is empty now, because bare /verbose flips it and there
+    is nothing to type. `on` and `off` still parse; they are just no longer the
+    thing the menu teaches, since offering an argument for a toggle invites
+    somebody to work out which one they need before pressing a key.
     """
     out = []
     for name, args, desc, group, fn in COMMAND_SPECS:
         if name == "verbose":
-            if display.VERBOSE:
-                args, desc = "[off]", "fold the agent's working away  ·  now: showing"
-            else:
-                args, desc = "[on]", "show the agent's working  ·  now: folded away"
+            args = ""
+            desc = ("fold the agent's working away  ·  now: showing"
+                    if display.VERBOSE else
+                    "show the agent's working  ·  now: folded away")
         out.append((name, args, desc, group, fn))
     return out
 
@@ -2078,14 +2191,62 @@ _WATCH = ("check", "jobs", "diagnose", "cancel", "monitor", "hold")
 _EITHER = ("modify", "view")
 
 
+def _provider_names():
+    """The providers /model accepts, each noted with the model it defaults to.
+
+    Providers can be completed and models cannot, and that asymmetry is
+    Biomni's rather than ours. get_llm() checks `source` against a fixed set
+    (biomni/llm.py's ALLOWED_SOURCES) and dispatches on it; `model` it never
+    inspects at all, just hands to the provider's client as an opaque string.
+    So a menu of providers is exhaustive and stays correct, while a menu of
+    model names could only ever be a hand-kept guess -- stale the week a
+    provider ships something, and wrong in the direction that matters, since
+    it would imply the models NOT listed are unavailable when any string the
+    provider recognizes works.
+
+    Hence: complete the closed set, and leave the open one to be typed. The
+    default model rides along in the note so that `/model Anthropic` with no
+    second word is a visible choice rather than a silent one.
+
+    KNOWN_PROVIDERS is four of Biomni's eight on purpose -- see its own
+    comment: the other four need an endpoint or ambient cloud credentials
+    rather than a pasted key, so /model cannot reach them and must not offer
+    them.
+    """
+    here = os.environ.get("GENPIPE_LLM_SOURCE", DEFAULT_SOURCE)
+    running = os.environ.get("GENPIPE_LLM_MODEL", DEFAULT_MODEL)
+    out = []
+    for _, source, env_var, default_model in KNOWN_PROVIDERS:
+        if _looks_like_placeholder(os.environ.get(env_var, "")):
+            # Offered, not hidden, and marked. Hiding a provider you have no
+            # key for answers "why is OpenAI missing?" with silence; saying so
+            # here names the command that fixes it.
+            note = f"{default_model}  ·  no key yet, /key first"
+        elif source == here:
+            # The model actually loaded, not this provider's default. They
+            # differ the moment anyone types a second word, and "current" beside
+            # a model you are not running is the one note here that could lie.
+            note = f"{running}  ·  current"
+        else:
+            note = default_model
+        out.append((source, note))
+    return out
+
+
 def _run_names(agent, command):
     """Values to complete the first argument of `command` with, or None.
 
-    None means "this command's argument is not a run name" -- /track's first
-    argument is a name being invented, and /model's is a provider. An empty list
-    means it is a run name and there are none, which the prompt says out loud
-    rather than silently offering nothing.
+    None means "this command's argument is neither a run name nor anything
+    else we can enumerate" -- /track's first argument is a name being
+    invented. /model's is a provider, which is a closed set, so it completes
+    from _provider_names(). An empty list means it IS a run name and there are
+    none, which the prompt says out loud rather than silently offering
+    nothing.
     """
+    # Before the try: this reads the environment, not the registry, and a
+    # broken registry has no bearing on whether the provider list is right.
+    if command == "model":
+        return _provider_names()
     try:
         if command in _DECIDE:
             records = agent.registry.held()
