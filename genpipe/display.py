@@ -319,18 +319,17 @@ def welcome():
     names from a fortnight of testing, none of them news, none of them anything
     you were about to act on.
 
-    So the nearest line is a question, and under it the three commands that
-    answer "what can I do from here". Green, because every command everywhere in
-    this interface is green.
+    So the nearest line is a question, and nothing else.
+
+    It used to carry two more things: a sentence restating what an answer looks
+    like, and a row of three commands. Both were already on the banner a few
+    lines above -- "Ask naturally" with a worked example, and /list and
+    /check all under "Keep track" -- so this was the same guidance a second
+    time, in the one place where brevity is worth most. A question with an
+    answer printed underneath it is not an invitation.
     """
     print()
     print(f"  {BOLD}What can I help you with today?{RESET}")
-    print()
-    print(f"  {GREY}Ask a GenPipes question or describe the run you want.{RESET}")
-    print()
-    print(f"    {GREEN}/help{RESET} {GREY}commands{RESET}     "
-          f"{GREEN}/list{RESET} {GREY}runs{RESET}     "
-          f"{GREEN}/check all{RESET} {GREY}refresh statuses{RESET}")
     print()
 
 
@@ -361,8 +360,15 @@ def _left_column(user, source, model, path):
     # picture: it cannot be grepped out of a screenshot, pasted into an issue,
     # or read aloud by anything. Whatever the mark looks like, the product has
     # to say its own name in text somewhere.
-    lines.append(_centre(f"{GREY}assistant{RESET}  {GREY}{DIM}{VERSION}{RESET}",
-                         _LEFT_W))
+    # "GenPipes assistant", not "assistant". The full name used to reach the
+    # screen through the right column's opening sentence ("...describe the
+    # GenPipes run you want"); that sentence has gone, and with it the only
+    # plain-text occurrence of the product's own name -- leaving it legible
+    # solely as box-drawing glyphs, which is exactly what the paragraph above
+    # says must never be the case.
+    lines.append(_centre(
+        f"{GREY}GenPipes assistant{RESET}  {GREY}{DIM}{VERSION}{RESET}",
+        _LEFT_W))
     lines.append("")
     # Centred with the wordmark, not on its old fixed indent: the two are one
     # lockup, and a mark whose halves disagree about their centre line reads as
@@ -371,39 +377,70 @@ def _left_column(user, source, model, path):
     return lines
 
 
+# How far a command runs before its description, and a metadata label before
+# its value. Constants because both columns must start in ONE place: a
+# description that begins at a different offset per row reads as two lists
+# rather than one.
+_CMD_W = 13
+_META_W = 9
+
+
 def _right_column(w, source=None, model=None, path=None):
+    """The onboarding half: what to type, and what this session is.
+
+    THREE GROUPS, ONE RULE, NO RULES BETWEEN THEM. This used to carry two
+    horizontal separators and two blocks of instruction -- how to open the
+    command menu, how to autocomplete, how to get the list back, and a second
+    heading listing four monitoring verbs. That is a manual, and a manual is the
+    wrong thing to hand somebody before they have typed anything: the command
+    list is one keystroke away by design, and the monitoring verbs are offered
+    by name at the moment each one applies.
+
+    So the rule is spent once, on the only boundary here that is not
+    onboarding -- what this session is running. Everything above it is
+    separated by whitespace, which is what whitespace is for.
+    """
     lines = [""]
-    lines.append(f"{BOLD}Getting started{RESET}")
-    lines += _wrap("Ask a question or describe the GenPipes run you want:", w)
-    lines.append(f"  {WHITE}run dnaseq germline_snv on my readset, all steps{RESET}")
-    lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
-    # Two rows, not one sentence: both are hand-styled, so neither can go
-    # through _wrap() -- textwrap would count the escape sequences -- and a
-    # single 60-column row clips at the widths where the box gives the right
-    # column 49 to 59, taking the green / and Tab with it.
-    lines.append(f"{GREY}Type {RESET}{GREEN}/{RESET}{GREY} to see available "
-                 f"commands.{RESET}")
-    lines.append(f"{GREY}Press {RESET}{GREEN}Tab{RESET}{GREY} to "
-                 f"autocomplete.{RESET}")
-    # Hand-styled for the same reason as the two rows above: _wrap counts escape
-    # sequences as characters, so a command name coloured inside it either
-    # clips or breaks the wrap. It stays green because every other command on
-    # this screen is green, and the one that tells you where the rest of them
-    # live is the last one that should look like prose.
-    lines.append(f"{GREEN}/help{RESET}{GREY} brings the full list back at any "
-                 f"time.{RESET}")
-    lines.append(f"{GREY}{DIM}{'\u2500' * w}{RESET}")
-    lines.append(f"{BOLD}Once it's running{RESET}")
-    lines += _wrap("You can monitor it, cancel it, or diagnose a failure:", w)
-    lines.append(f"  {GREEN}/check{RESET}  {GREEN}/jobs{RESET}  "
-                 f"{GREEN}/cancel{RESET}  {GREEN}/diagnose{RESET}")
+    lines.append(f"{BOLD}{WHITE}Getting started{RESET}")
+    lines.append("")
+
+    # The example is the most important line on this screen and is deliberately
+    # NOT green: it is a thing to say, not a command to type, and colouring it
+    # like the commands below would file it under the same idea.
+    lines.append(f"{WHITE}Ask naturally{RESET}")
+    lines.append(f"  {WHITE}run dnaseq germline_snv on my readset, "
+                 f"all steps{RESET}")
+    lines.append("")
+
+    lines.append(f"{WHITE}Keep track{RESET}")
+    # Hand-padded rather than sent through _wrap(): textwrap counts escape
+    # sequences as characters, so a coloured command inside it either clips or
+    # breaks the wrap. The padding is measured on the plain text for the same
+    # reason.
+    for cmd, what in (("/list", "see your runs"),
+                      ("/check all", "refresh statuses")):
+        lines.append(f"  {GREEN}{cmd}{RESET}"
+                     f"{' ' * max(1, _CMD_W - len(cmd))}{GREY}{what}{RESET}")
+    lines.append("")
+
+    lines.append(f"{WHITE}Need something else?{RESET}")
+    lines.append(f"  {GREY}type {RESET}{GREEN}/{RESET}"
+                 f"{GREY} to browse commands{RESET}")
+
     # What this session is actually using. It closes the reference half rather
     # than the identity half because that is what it is -- something you look up
     # -- and because putting it here is what makes the two columns the same
     # height instead of padding one to match the other.
-    lines.append(f"{GREY}{DIM}{'─' * w}{RESET}")
-    lines.append(f"{GREY}{_identity(source, model)}{RESET}")
-    lines.append(f"{DIM}{_tilde(path or '')}{RESET}")
+    lines.append("")
+    lines.append(f"{GREY}{DIM}{chr(0x2500) * w}{RESET}")
+    lines.append("")
+    # Both read from what this session settled on, never hardcoded. On a first
+    # launch there is no key yet and no model chosen, and saying so is the
+    # honest answer rather than naming a default nobody picked.
+    for label, value in (("Model", model or "not configured yet"),
+                         ("Project", _tilde(path or ""))):
+        lines.append(f"{DIM}{label}{RESET}"
+                     f"{' ' * max(1, _META_W - len(label))}{GREY}{value}{RESET}")
     # The approval promise used to close this screen. It says more where it is
     # demonstrated -- at the gate, holding a real submission -- than as a claim
     # made to someone who has not yet typed anything.

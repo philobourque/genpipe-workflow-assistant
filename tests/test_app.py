@@ -273,7 +273,10 @@ def main():
         # a claim made to someone who has not typed anything yet, so what is
         # asserted here is that the screen orients rather than promises.
         r.contains("says what to type first", screen, "Getting started")
-        r.contains("and what is available afterwards", screen, "/check")
+        # From "Keep track" now, not the "Once it's running" block that used to
+        # list four monitoring verbs before anybody had a run to monitor.
+        r.contains("and the command that follows a run", screen, "/check all")
+        r.contains("naming the session's model", screen, "claude-sonnet-5")
         r.contains("dev mode is announced, not hidden", screen, "dev mode")
         r.contains("...naming what is simulated", screen, "fake cluster")
         r.check("and it never asked for an API key",

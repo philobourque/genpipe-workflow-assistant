@@ -165,9 +165,14 @@ def main():
     r.section("the invitation sits nearest the prompt")
     out = drawn(display.welcome)
     r.contains("it asks rather than reports", out, "What can I help you with today?")
-    r.contains("and says what an answer looks like", out, "describe the run you want")
-    for cmd in ("/help", "/list", "/check all"):
-        r.contains(f"offering {cmd}", out, cmd)
+    # ONE LINE, AND ONLY ONE. It used to add a sentence restating what an
+    # answer looks like and a row of three commands -- both of which the banner
+    # a few lines above already carries, with a worked example. A question with
+    # its own answer printed underneath is not an invitation.
+    r.check("and nothing else", len([l for l in out.splitlines() if l.strip()]) == 1,
+            out)
+    for gone in ("describe the run you want", "/help", "/list", "/check all"):
+        r.check(f"no {gone!r} restated here", gone not in out, out)
 
     # ---------------------------------------------------------------- #
     r.section("/list tags each row with its lifecycle state, not its raw status")
@@ -565,6 +570,58 @@ def main():
         r.check(f"borders line up at {cols} columns",
                 len(widths) <= 1, f"row widths={sorted(widths)}")
         r.contains(f"still says what it is at {cols}", out, "GenPipes")
+    _os.environ.pop("COLUMNS", None)
+
+    # ---------------------------------------------------------------- #
+    r.section("the banner onboards, and does not lecture")
+    _os.environ["COLUMNS"] = "100"
+    out = drawn(display.banner, "Anthropic", "claude-sonnet-5")
+    for heading in ("Getting started", "Ask naturally", "Keep track",
+                    "Need something else?"):
+        r.contains(f"has {heading!r}", out, heading)
+    r.contains("with a worked example to say out loud", out,
+               "run dnaseq germline_snv on my readset, all steps")
+    r.contains("the two commands worth knowing", out, "/list")
+    r.contains("and what they do", out, "see your runs")
+    r.contains("plus how to find the rest", out, "to browse commands")
+
+    # What went, and why: the banner was a manual. The command list is one
+    # keystroke away by design, and the monitoring verbs are offered by name at
+    # the moment each applies -- so neither needs teaching before anybody has
+    # typed anything.
+    for gone in ("Press Tab", "autocomplete", "brings the full list",
+                 "Once it's running", "/jobs", "/cancel", "/diagnose"):
+        r.check(f"no longer says {gone!r}", gone not in out, out)
+
+    # Model and project are read from the session, never hardcoded.
+    r.contains("names the model in use", out, "claude-sonnet-5")
+    r.contains("under a label", out, "Model")
+    r.contains("and the project directory", out, "Project")
+    other = drawn(display.banner, "Anthropic", "claude-opus-4-5")
+    r.contains("a different model renders differently", other, "claude-opus-4-5")
+    r.check("with no trace of the previous one",
+            "claude-sonnet-5" not in other, other)
+    unset = drawn(display.banner, None, None)
+    r.contains("and an unconfigured session says so", unset, "not configured yet")
+
+    # ONE horizontal rule on the right, immediately before the metadata.
+    # Whitespace separates the three onboarding groups; a rule between them
+    # made three short lists look like three unrelated screens.
+    right = display._right_column(60, "Anthropic", "claude-sonnet-5", "/tmp/p")
+    rules = [i for i, l in enumerate(right) if "─" in l]
+    r.equal("exactly one rule on the right side", len(rules), 1)
+    tail = "\n".join(right[rules[0]:])
+    r.contains("and it sits immediately before the metadata", tail, "Model")
+    r.check("with nothing but metadata after it",
+            "Keep track" not in tail and "Ask naturally" not in tail, tail)
+
+    # A healthy startup screen carries no alarm colours.
+    painted_banner = io.StringIO()
+    with redirect_stdout(painted_banner):
+        display.banner("Anthropic", "claude-sonnet-5")
+    raw = painted_banner.getvalue()
+    r.check("no red anywhere on a healthy banner", display.RED not in raw)
+    r.check("and no amber either", display.AMBER not in raw)
     _os.environ.pop("COLUMNS", None)
 
     r.section("dev mode is stated loudly, and only when it applies")
