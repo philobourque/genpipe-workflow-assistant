@@ -3528,50 +3528,12 @@ def forked(original, new):
     print()
 
 
-def change_plan(deltas, notes=()):
-    """The apply screen for a guided /modify: every change as old → new.
-
-    Shown for every change set, including a single row. It used to be skipped
-    for one change on the grounds that the re-rendered gate is already the
-    review -- true when the only question was "apply or not", and false now that
-    the screen underneath it asks which of four things should happen to the
-    change. Holding it for later and forking it into a second run are not
-    confirmations of a decision already made; they are the decision.
-    """
-    print()
-    print(f"  {GREEN}▌{RESET} {BOLD}Ready to apply{RESET}")
-    print()
-    width = max((len(d[0]) for d in deltas), default=8) + 4
-    for slot, old, new in deltas:
-        if isinstance(new, (list, tuple)):
-            # The `-c` stack. Shown as the stack it will BECOME, in order, with
-            # each line marked by what happened to it -- the untouched inis dim
-            # so the eye goes to the `+`, and the dropped ones listed after it
-            # struck through in red, because an ini leaving is a change nobody
-            # can see by reading the result.
-            was, now = list(old or ()), list(new)
-            bases = {os.path.basename(str(x)) for x in was}
-            for ini in now:
-                fresh = os.path.basename(str(ini)) not in bases
-                mark = f"{GREEN}+{RESET}" if fresh else f"{DIM}·{RESET}"
-                body = f"{GREEN}{BOLD}{ini}{RESET}" if fresh else f"{DIM}{ini}{RESET}"
-                print(f"    {WHITE}{slot:<{width}}{RESET}{mark}  {body}")
-                slot = ""
-            keep = {os.path.basename(str(x)) for x in now}
-            for ini in was:
-                if os.path.basename(str(ini)) not in keep:
-                    print(f"    {WHITE}{slot:<{width}}{RESET}{RED}−{RESET}"
-                          f"  {RED}{ini}{RESET}")
-                    slot = ""
-            continue
-        old_text = old if old not in (None, "") else "—"
-        print(f"    {WHITE}{slot:<{width}}{RESET}{DIM}{old_text}{RESET}"
-              f"  {DIM}→{RESET}  {BOLD}{new}{RESET}")
-    for note in notes or ():
-        print()
-        print(f"    {DIM}{'note':<{width}}{RESET}{AMBER}{note}{RESET}")
-    print()
-
+# change_plan() lived here: a "Ready to apply" block listing every edit before
+# a menu asked what to do with them. Removed with that menu (see cli, where
+# _ask_ending was) for the reason the deltas never needed restating -- each one
+# is already drawn on the row it belongs to, `old -> new` in green, which is
+# nearer the thing it describes than any separate list can be. What follows the
+# panel now is the gate, which is the review and the authorisation at once.
 
 def reading_as(name, text):
     """Prose at the gate, and how it was understood. Printed before anything

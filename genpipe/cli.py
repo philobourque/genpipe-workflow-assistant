@@ -731,23 +731,26 @@ def _step_risks(agent, name, change):
 
 
 def _cmd_modify(agent, args):
-    """/modify <name> [what to change] -- rewrite a run's command.
+    """/modify <name> [what to change] -- change what this run will be.
 
-    With a change, it is one model call and back to the gate. Without one, it
-    opens the guided flow: pick the rows, fill them in, review, apply.
+    ONE MEANING, EVERYWHERE: replace this run's proposal. `/modify foo` is a
+    person saying what foo should become, so foo becomes it. There is no
+    trailing menu asking whether they meant it.
 
-    A RUN THAT IS NOT HELD IS FORKED, NEVER REWRITTEN. This used to refuse
-    outright -- "only a run waiting at the gate can be modified" -- which made
-    the commonest thing anybody wants to do with a finished run impossible:
-    run it again against a different readset, a second database, a re-sequenced
-    sample. The command is right there on the record and the fork machinery
-    already existed; all that stood in the way was this check.
+    That menu existed because a rework destroys the held interrupt, so applying
+    changes and keeping the original apart were genuinely different acts. They
+    still are -- but that is what a second VERB is for, not a confirmation
+    screen on the first one. /fork keeps both. See _cmd_fork.
 
-    Rewriting one in place stays forbidden, and for the reason abandon() and
-    rename() give: after submission the name is tied to a job list and to jobs
-    that may still be on the scheduler, and moving it strands them. So the
-    original is never touched. What comes back is a second run, held at its own
-    gate, which is what somebody asking for this actually wanted anyway.
+    A SUBMITTED RUN IS REDIRECTED, NOT SILENTLY FORKED. This used to fork it
+    and say so afterwards, which was the right instinct when there was no other
+    way to get a variant: refusing outright made the commonest thing anybody
+    wants to do with a finished run -- run it again against a different readset
+    -- impossible. Now /fork exists and is tab-completable, so the redirect
+    costs one keystroke and buys /modify a single meaning. Rewriting a
+    submitted run in place stays forbidden for the reason abandon() and
+    rename() give: its name is tied to a job list and to jobs that may still be
+    on the scheduler.
     """
     if not args:
         held = agent.registry.held()
@@ -774,7 +777,11 @@ def _cmd_modify(agent, args):
                 "It was found on disk rather than built here, so there is "
                 "nothing to copy. Describe the run you want instead.")
             return
-        _modify_past(agent, name, record, " ".join(rest))
+        display.problem(
+            f"'{name}' has already been through /approve — it is "
+            f"{record['status'].replace('_', ' ')}.",
+            f"Its name is tied to a job list, so it cannot be rewritten.  ·  "
+            f"/fork {name}" + (f" {' '.join(rest)}" if rest else ""))
         return
 
     if rest:
@@ -783,29 +790,51 @@ def _cmd_modify(agent, args):
     _modify_guided(agent, name, record)
 
 
-def _modify_past(agent, name, record, change=""):
-    """/modify on a run that has already been submitted. Always a fork.
+def _cmd_fork(agent, args):
+    """/fork <name> [new name] [what to change] -- build a second run from this one.
 
-    Prose goes straight through -- there is one question left, what to call the
-    result, and the panel that would ask it has nothing else to offer. Without
-    prose it opens the same guided flow a held run gets, with the ending
-    restricted: applying to the original is not on the table.
+    The verb that lets /modify mean one thing. Keeping the original and
+    replacing it are genuinely different acts -- a rework destroys the held
+    interrupt, so there is no way back to the first proposal once the model has
+    regenerated over it -- and that distinction deserves a verb rather than a
+    confirmation screen appended to every edit.
+
+    Works on a run in ANY state, which is the other half of the point: the
+    commonest thing anybody wants from a finished run is to run it again
+    against a different readset, and the original keeps its name, its job list
+    and its jobs throughout.
+
+    THE NAME IS ASKED FIRST here, unlike everything else in /modify. For a fork
+    it is the one thing that must be decided, and the collision has to be
+    visible before Enter rather than resolved silently by unique_name()
+    afterwards.
     """
+    if not args:
+        display.problem("usage: /fork <name> [what to change]",
+                        "/list shows what there is.")
+        return
+    name, *rest = args
+    record = agent.registry.get(name)
+    if record is None:
+        display.problem(f"No run named '{name}'.", "/list shows what there is.")
+        return
     proposal = record.get("proposal") or {}
-    # The run's ACTUAL lifecycle state, not the raw registry status -- "live"
-    # is reserved for a run that currently has queued or running jobs (see
-    # runs.list_tag(), the same words /list tags its rows with), and a launched
-    # run sitting here is exactly as likely to be finished, failing, or
-    # unreachable as it is to still be running.
-    status = runs_store.resolve(record) if record.get("job_list") else None
-    display.forking_from(name, runs_store.list_tag(record, status))
-    if not change:
-        _modify_guided(agent, name, record, fork_only=True)
+    if not proposal.get("generated"):
+        display.problem(
+            f"'{name}' has no generation command on record.",
+            "It was found on disk rather than built here, so there is nothing "
+            "to copy. Describe the run you want instead.")
         return
 
-    wanted = agent.registry.unique_name(name)
+    # The run's ACTUAL lifecycle state, not the raw registry status -- "live"
+    # is reserved for a run that currently has queued or running jobs (see
+    # runs.list_tag(), the same words /list tags its rows with).
+    status = runs_store.resolve(record) if record.get("job_list") else None
+    display.forking_from(name, runs_store.list_tag(record, status))
+
     try:
-        wanted = ui.ask("What should the new run be called?", default=wanted)
+        wanted = ui.ask("What should the new run be called?",
+                        default=agent.registry.unique_name(name))
     except (EOFError, KeyboardInterrupt):
         return
     verdict = modify.check("name", str(wanted or ""), proposal,
@@ -813,18 +842,23 @@ def _modify_past(agent, name, record, change=""):
     if not verdict:
         display.problem(verdict.message, f"'{name}' is unchanged.")
         return
-
-    request = modify.fork_prose(proposal, change)
     new_name = agent.registry.unique_name(str(wanted).strip())
-    agent._gate_note = {"warnings": [], "changed": []}
-    thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
-    with ui.Activity("building the variant") as act:
-        agent.run(request, thread, on_step=_narrate(act), name=new_name)
-    display.forked(name, new_name)
+
+    change = " ".join(rest)
+    if change:
+        request = modify.fork_prose(proposal, change)
+        agent._gate_note = {"warnings": [], "changed": []}
+        thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
+        with ui.Activity("building the variant") as act:
+            agent.run(request, thread, on_step=_narrate(act), name=new_name)
+        display.forked(name, new_name)
+        return
+    # No prose: pick the changes in the panel, then fork with them.
+    _modify_guided(agent, name, record, fork_as=new_name)
 
 
 def _run_panel(agent, name, proposal, m, offered, candidates, changes,
-               required, fork_only=False):
+               required, fork_as=None):
     """The in-place panel. Returns (outcome, row) and mutates `changes`.
 
         ("done",   None)   review what has been changed
@@ -974,10 +1008,15 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
             if choices():
                 return "↑↓ · 1-9 to pick · type to narrow · esc closes the row"
             return "type the new value · enter confirms · esc closes the row"
-        if fork_only:
-            return "↑↓ · enter opens a row · esc leaves without creating a new run"
-        return ("↑↓ · enter opens a row · esc leaves this run alone, "
-                "changes and all")
+        # What Enter on the last row will DO, named on the screen where it is
+        # pressed. There is no menu after this one, so this line is the only
+        # place the consequence appears -- and the two consequences are
+        # genuinely different runs being written.
+        if fork_as:
+            return (f"↑↓ · enter opens a row · d creates {fork_as} · "
+                    f"esc creates nothing")
+        return ("↑↓ · enter opens a row · d applies to this run · "
+                "esc discards the changes")
 
     picked = ui.choose(question, options, free_text=False, draw=draw,
                        cursor=modify.cursor_of(entries(), "name"),
@@ -988,8 +1027,8 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
     return ("cancel", None) if picked is None else ("done", None)
 
 
-def _modify_guided(agent, name, record, fork_only=False):
-    """The guided /modify: multi-select the rows, fill each, review, apply.
+def _modify_guided(agent, name, record, fork_as=None):
+    """The guided /modify: open the rows, fill them, and go back to the gate.
 
     One model call for the whole set, however many rows changed -- composed into
     a single unambiguous sentence by modify.sentence(). The command string is
@@ -997,10 +1036,22 @@ def _modify_guided(agent, name, record, fork_only=False):
     diverge the model's view of the conversation from what is queued, and its
     next turn would reason about a command it did not write.
 
-    `fork_only` is for a run that has already been submitted -- see
-    _modify_past. Everything about picking and filling the rows is identical;
-    what changes is that the ending cannot offer to apply the changes to the
-    original, because its name belongs to a job list now.
+    TWO SCREENS, NOT FIVE. There used to be a `review N changes` row leading to
+    a `Ready to apply` print leading to a `What should happen to these changes?`
+    menu, and only then the regeneration. All three are gone.
+
+    The delta was already legible without them: every changed row shows
+    `old -> new` in green ON THE ROW IT BELONGS TO, which is closer to the thing
+    being described than a separate list of the same edits could ever be. And
+    the screen that follows -- the re-rendered gate, with the moved rows green
+    -- is both the review and the one place execution is authorised. Confirming
+    an edit twice before the authorisation screen is not caution; it is three
+    chances to lose track of which screen is the one that matters.
+
+    `fork_as` makes this build a SECOND run under that name instead of
+    replacing this one. It arrives from /fork, which asked for the name up
+    front -- see _cmd_fork for why the two are different verbs rather than a
+    question at the end of one.
     """
     proposal = record.get("proposal") or {}
     directory = record.get("workdir") or os.getcwd()
@@ -1055,11 +1106,11 @@ def _modify_guided(agent, name, record, fork_only=False):
 
         outcome, row = _run_panel(agent, name, proposal, m, offered,
                                   candidates, changes, required,
-                                  fork_only=fork_only)
+                                  fork_as=fork_as)
         if outcome == "cancel":
-            if fork_only:
+            if fork_as:
                 display.nothing("Nothing created.",
-                                f"'{name}' and its job list are unchanged.")
+                                f"'{name}' is unchanged.")
             else:
                 display.nothing("Left alone.", f"'{name}' is still held.")
             return
@@ -1084,126 +1135,48 @@ def _modify_guided(agent, name, record, fork_only=False):
             continue
 
         if not changes:
-            if fork_only:
-                display.nothing("Nothing changed.",
-                                f"'{name}' and its job list are unchanged.")
+            if fork_as:
+                display.nothing("Nothing changed.", f"'{name}' is unchanged.")
             else:
                 display.nothing("Nothing changed.", f"'{name}' is still held.")
             return
 
-        # `config` hands change_plan the OLD STACK AS A LIST rather than
-        # modify.current()'s joined string, because that is what makes the two
-        # sides comparable: change_plan diffs them by basename to mark what was
-        # added and what left. Every other row is a scalar and stays one.
-        deltas = [(row,
-                   modify.config_stack(proposal) if row == modify.CONFIG
-                   else name if row == "name"
-                   else modify.current(proposal, row),
-                   new) for row, new in changes.items()]
-        notes = modify.cross_check(proposal, changes)
-        display.change_plan(deltas, notes)
-        ending, fork_name = _ask_ending(agent, name, changes,
-                                        fork_only=fork_only)
-        if ending == "again":
-            required = {row: why for row, why
-                        in modify.required_after(proposal, changes).items()
-                        if not changes.get(row)}
+        # A row an earlier answer made mandatory and nobody filled in. This is
+        # the ONE thing that still sends somebody back to the panel, and it is
+        # not a confirmation -- changing the pipeline invalidates the protocol,
+        # and regenerating with the old one would produce a command nobody
+        # asked for. The rows come back red with the reason beside them.
+        outstanding = {row: why for row, why
+                       in modify.required_after(proposal, changes).items()
+                       if not changes.get(row)}
+        if outstanding:
+            required = outstanding
+            display.problem(
+                "Some rows still have to be answered: "
+                + ", ".join(sorted(outstanding)),
+                "They are marked on the command.")
             continue
-        if ending == "fork":
-            _fork_run(agent, name, record, proposal, changes, wanted=fork_name)
-            return
-        if ending == "apply":
-            break
-        # esc, or a headless caller that answered nothing. Silence is not
-        # consent for a change set somebody spent four prompts assembling, but
-        # it is not a change either.
-        if fork_only:
-            display.nothing("Nothing created.",
-                            f"'{name}' and its job list are unchanged.")
-        else:
-            display.nothing("Left alone.", f"'{name}' is still held.")
-        return
+        break
 
+    if fork_as:
+        _fork_run(agent, name, record, proposal, changes, wanted=fork_as)
+        return
     _apply_changes(agent, name, proposal, changes)
 
 
-def _ask_ending(agent, name, changes, fork_only=False):
-    """What to do with a finished change set. Returns (ending, fork name).
-
-    THREE ROWS, NOT FOUR. There used to be a "hold for later" between "back to
-    launch" and the fork, and the two of them applied the same changes, left the
-    run in the same `held` status, and submitted nothing. The only difference
-    was whether the gate was redrawn afterwards -- a rendering preference,
-    offered as a decision, on the screen whose entire job is to make decisions
-    legible. (The batch case it was reaching for is real: somebody editing six
-    runs does not want six boxes. That wants a flow of its own, not a menu row
-    whose sole effect is suppressing a repaint.)
-
-    The names changed with the count. "back to launch" launched nothing -- it
-    applied and redrew the gate -- and "change something else" was four words
-    for "keep editing". Every label here now begins with a verb that is what
-    happens.
-
-    ESC IS THE FOURTH OUTCOME AND IT DISCARDS. That is why it is in the note
-    rather than left to the generic "esc cancels": a person who has answered
-    four prompts reads "cancels" as "close this menu", and the changes are gone.
-    It is deliberately not a row -- an outcome that throws work away should take
-    a key you have to mean, not one you can arrow onto.
-
-    THE FORK'S NAME IS ON ITS ROW. Picking the fork used to be followed by a
-    bare "what should the new run be called?", so the one fact that decides the
-    answer -- whether the name is free -- arrived after the fork was already
-    chosen, and unique_name() appended a `-2` nobody was shown. Now it is a
-    Field: the proposed name is visible while the choice is still open, and the
-    collision is stated before Enter.
-    """
-    # The name the fork should propose. A `name` row already answered in this
-    # pass is what somebody has said they want this run called, so the fork
-    # takes it; otherwise the first free variant of the current name, which is
-    # what unique_name would have picked silently anyway.
-    proposed = changes.get("name") or agent.registry.unique_name(name)
-
-    def collision(text):
-        """What to say about the typed name, recomputed on every keystroke."""
-        if not text:
-            return "a name is needed to keep both runs"
-        verdict = modify.check("name", text, None, registry=agent.registry)
-        if not verdict:
-            return verdict.message
-        settled = agent.registry.unique_name(text)
-        if settled != text:
-            return f"{text} already exists — enter saves this as {settled}"
-        return ""
-
-    def usable(text):
-        """Whether Enter may leave with this name. A collision is not a
-        refusal -- it is answered by suffixing, and the note says so."""
-        return bool(text) and bool(modify.check("name", text, None,
-                                                registry=agent.registry))
-
-    field = ui.Field("fork", proposed, note=collision, ok=usable,
-                     hint="type to rename · enter confirms · esc discards")
-
-    # A submitted run cannot be the target of its own edit, so the row that
-    # would offer it is not drawn at all. Greying it out and explaining would
-    # be worse: this panel's job is to make the remaining choice obvious, and
-    # the remaining choice here is genuinely just the name.
-    rows = []
-    if not fork_only:
-        rows.append(slots.Option("apply", f"apply to {name}",
-                                 "back to the gate, still held"))
-    rows.append(slots.Option("fork", "save as a new run",
-                             f"{name} stays exactly as it is"))
-    rows.append(slots.Option("again", "keep editing", "back to the command"))
-
-    # With the apply row gone the fork is row 0, so the cursor opens on the
-    # field -- which is right when the name is the only thing left to decide,
-    # and would be wrong on the held panel where applying is the common answer.
-    ending = ui.choose(
-        "What should happen to these changes?", rows,
-        free_text=False, field=field,
-        note="nothing is submitted by any of these  ·  esc discards them")
-    return ending, field.text
+# _ask_ending() lived here: a three-row menu asking whether a finished change
+# set should be applied to the run, saved as a new one, or edited further.
+#
+# It existed because a rework destroys the held interrupt, so "replace" and
+# "keep both" really are different acts. But that is a reason for a second
+# VERB, not for a question appended to every edit -- /modify foo already says
+# which run is being changed, and /fork keeps both. The third row, "keep
+# editing", was undoing a screen that should not have been there.
+#
+# Its one genuinely load-bearing detail moved rather than died: the fork's name
+# is asked BEFORE anything else, so a collision is visible while the choice is
+# still open instead of being resolved silently by unique_name() afterwards.
+# See _cmd_fork.
 
 
 def _fill_resources(agent, name, proposal, directory):
@@ -1407,11 +1380,11 @@ def _fork_run(agent, name, record, proposal, changes, wanted=None):
     does NOT get is the original's history, which is why the request carries the
     base command with it -- see modify.fork_sentence.
 
-    `wanted` normally arrives already answered, off the fork row's own field --
-    see _ask_ending. The prompt below is the fallback for callers that have no
-    panel to have asked in, and the `name` row is popped either way: a rename
-    belongs to the run being forked FROM, and applying it here would rename the
-    original as a side effect of copying it.
+    `wanted` normally arrives already answered, because /fork asks for the name
+    before opening the panel. The prompt below is the fallback for callers that
+    have no panel to have asked in, and the `name` row is popped either way: a
+    rename belongs to the run being forked FROM, and applying it here would
+    rename the original as a side effect of copying it.
     """
     changes.pop("name", None)
     if not wanted:
@@ -1470,8 +1443,8 @@ def _apply_changes(agent, name, proposal, changes):
 
     There is no longer a version of this that applies the changes and does NOT
     redraw the gate. That was "hold for later", and it left the run in exactly
-    the state this does -- see _ask_ending, which explains why it stopped being
-    offered as a choice.
+    the state this does: the redraw is the review AND the authorisation point,
+    so suppressing it would remove the only screen that matters.
     """
     new_name = changes.pop("name", None)
     sentence = modify.sentence(proposal, changes)
@@ -2002,7 +1975,8 @@ COMMAND_SPECS = [
     ("new",      "",                   "start a fresh conversation",              "talking",  None),
     ("verbose",  "[off]",              "show or fold away the agent's working",   "talking",  _cmd_verbose),
     ("approve",  "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve),
-    ("modify",   "<name> [change]",    "rewrite a held run and ask again",        "deciding", _cmd_modify),
+    ("modify",   "<name> [change]",    "change a held run and ask again",         "deciding", _cmd_modify),
+    ("fork",     "<name> [change]",    "build a second run from an existing one", "deciding", _cmd_fork),
     ("reject",   "<name> [why...]",    "abandon a held run; nothing submitted",   "deciding", _cmd_reject),
     ("view",     "<name>",             "the command a run is, and what it takes", "watching", _cmd_view),
     ("list",     "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list),
@@ -2227,7 +2201,7 @@ _WATCH = ("check", "jobs", "diagnose", "cancel", "monitor", "hold")
 # held could not be modified at all. It forks one now -- see _cmd_modify -- and
 # a completion list that still hid every finished run would hide exactly the
 # runs somebody reaches for when they want to run something again.
-_EITHER = ("modify", "view")
+_EITHER = ("modify", "view", "fork")
 
 
 def _provider_names():

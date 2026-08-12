@@ -1092,10 +1092,17 @@ def panel_entries(m, offered, open_row=None, choices=(), typed="",
     if extras:
         if changes:
             count = len(changes)
+            # "apply", not "review". It used to lead to a review screen and
+            # then an apply menu, and the label was honest about that -- but
+            # the two screens are gone: the deltas are already legible on the
+            # rows above, and the gate that follows is both the review and the
+            # one place execution is authorised. A row that says "review" in
+            # front of a screen that applies is the worst of the two.
             out.append(Entry(EXTRA, DONE, (EXTRA, DONE),
-                             label=f"review {count} change"
+                             label=f"apply {count} change"
                                    f"{'' if count == 1 else 's'}",
-                             description="nothing is submitted by reviewing"))
+                             description="regenerates the command · "
+                                         "nothing is submitted"))
         out.append(Entry(EXTRA, ELSE, (EXTRA, ELSE), label="describe it instead",
                          description="say it in a sentence and I'll fill these in"))
 

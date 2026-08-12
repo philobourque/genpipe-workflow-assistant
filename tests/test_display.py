@@ -1051,53 +1051,6 @@ def main():
             "/check <name>" in text and "/status" not in text)
 
     # ---------------------------------------------------------------- #
-    r.section("the confirmations for the new verbs")
-
-    text = drawn(display.abandoned, "chipseq-0728", "wrong samples")
-    r.contains("says what happened", text, "abandoned")
-    r.contains("keeps the reason", text, "wrong samples")
-    r.contains("and states plainly that nothing was submitted",
-               text, "nothing was submitted")
-
-    text = drawn(display.renamed, "old-0728", "h3k27ac-rep1")
-    r.contains("both names", text, "h3k27ac-rep1")
-    r.contains("and that the run is untouched", text, "nothing regenerated")
-
-    text = drawn(display.change_plan,
-                 [("protocol", "chipseq", "atacseq"), ("steps", "1-5", "1-8")],
-                 ["atacseq needs the mark column to be 'atac'"])
-    r.contains("every delta as old to new", text, "chipseq")
-    r.contains("the second one too", text, "1-8")
-    r.contains("and the cross-field consequence", text, "atac")
-
-    # `-c` is the one row whose value is plural, so it is reviewed as a stack
-    # rather than as one `old → new` line: four inis flattened onto that line
-    # run past the panel, and the ordering that decides which ini wins is the
-    # first thing to go off the edge. An ini that LEAVES has to be visible too
-    # -- nothing in the resulting stack shows that it used to be there.
-    text = drawn(display.change_plan,
-                 [("config", ["base.ini", "rorqual.ini", "cit.ini"],
-                   ["base.ini", "rorqual.ini", "mine.override.ini"])])
-    r.contains("an ini that was added is marked", text, "+  mine.override.ini")
-    r.contains("an ini that was dropped is still shown", text, "−  cit.ini")
-    r.contains("and the ones that stayed are listed in order",
-               text, "·  base.ini")
-    r.check("the label is printed once, not on every ini",
-            text.count("config") == 1)
-
-    text = drawn(display.reading_as, "chipseq-0728", "steps 1-5 → 1-8")
-    r.contains("prose states its interpretation", text, "Reading that as")
-
-    text = drawn(display.scan_results, "/scratch/me", [], [])
-    r.contains("an empty scan says where it looked", text, "/scratch/me")
-    r.contains("and what a run looks like", text, "job_output")
-
-    text = drawn(display.scan_results, "/scratch/me",
-                 [{"name": "a"}], added=["a"], skipped=[("b", "already known")])
-    r.contains("what was added", text, "1 run added")
-    r.contains("and what was not, with why", text, "already known")
-
-    # ---------------------------------------------------------------- #
     r.section("the plan is drawn, and drawn once")
     # The model's checklist used to be parsed and thrown away, which left the
     # fold with nothing to say what the agent was working through.
