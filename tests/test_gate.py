@@ -249,8 +249,12 @@ def main():
     ampliconseq_bare = g.build_proposal(
         [Msg("<execute>genpipes ampliconseq -g cmd.sh</execute>")],
         "bash cmd.sh")
-    r.equal("a bare command with nothing at all is missing the readset",
-            ampliconseq_bare["missing"], ["readset"])
+    # Both, now. ampliconseq takes no `-t`, so its need for a design had
+    # nowhere to live -- `needs` hangs off a protocol -- and the gate reported
+    # a complete command for one that cannot generate past step 7 (`asva`
+    # reads self.contrasts, and design_file raises when there is no -d).
+    r.equal("a bare command is missing the readset and the design",
+            ampliconseq_bare["missing"], ["readset", "design"])
 
     rnaseq_no_design = g.build_proposal(
         [Msg("<execute>genpipes rnaseq -t stringtie -r readset.tsv "
@@ -265,6 +269,46 @@ def main():
         "bash cmd.sh")
     r.equal("nothing missing once the required slots are all filled",
             complete["missing"], [])
+
+    r.section("an omitted -t is not missing, but it is still stated")
+    # The trade this pins. slots.DEFAULTS now carries GenPipes' own `-t`
+    # defaults, so a command without `-t` is complete and `missing` says so --
+    # which is true, and which quietly removed the only line on the approval box
+    # that mentioned the protocol at all. What replaces it has to be visible,
+    # because dnaseq defaults to GERMLINE: a tumour/normal cohort approved with
+    # no `-t` generates, submits, finishes, and answers a different question.
+    # Nobody reading the box could have caught it.
+    assumed = g.build_proposal(
+        [Msg("<execute>genpipes dnaseq -r readset.tsv -g cmd.sh</execute>")],
+        "bash cmd.sh")
+    r.equal("no -t is not a missing slot", assumed["missing"], [])
+    r.contains("but the box names the protocol that will run",
+               assumed["explanation"], "germline_snv")
+    r.contains("and says it was assumed rather than asked for",
+               assumed["explanation"], "assumed, no -t given")
+    # The RECORD keeps describing the command as written. Filling the slot in
+    # would put a `-t` in the run history that is not in the command, and no
+    # later reader could tell a defaulted run from a chosen one.
+    r.equal("the slot itself stays empty, because the flag is",
+            assumed["slots"]["protocol"], None)
+
+    stated = g.build_proposal(
+        [Msg("<execute>genpipes dnaseq -t somatic_fastpass -r r.tsv "
+             "-p pairs.csv -g cmd.sh</execute>")],
+        "bash cmd.sh")
+    r.contains("a stated protocol is shown as stated",
+               stated["explanation"], "protocol: somatic_fastpass")
+    r.truthy("and is not labelled an assumption",
+             "assumed" not in stated["explanation"])
+
+    # A pipeline GenPipes gives no default for must claim nothing. covseq takes
+    # no `-t` at all, so there is no protocol to assume and inventing a line
+    # here would be inventing a fact.
+    bare = g.build_proposal(
+        [Msg("<execute>genpipes covseq -r r.tsv -g cmd.sh</execute>")],
+        "bash cmd.sh")
+    r.truthy("a pipeline with no default assumes nothing",
+             "protocol:" not in bare["explanation"])
 
     return r.finish()
 

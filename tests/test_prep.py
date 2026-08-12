@@ -113,11 +113,26 @@ def main():
     r.equal("and then nothing is missing", prep.missing(state), None)
     r.check("so it is ready to generate", prep.ready(state))
 
-    # Case 4: the pipeline is named and the protocol is not. The protocol must
-    # come before any document question, because the protocol is what decides
-    # which documents are required at all.
+    # Case 4: the pipeline is named and the protocol is not. The ORDERING rule
+    # this pins is unchanged -- the protocol is what decides which documents
+    # are required, so it can never be asked after them. What changed is that
+    # dnaseq no longer has to ask: GenPipes' own `-t` carries
+    # default="germline_snv", so the default settles it and the first real
+    # question is the readset. The default still governs what comes next, which
+    # is the property that matters: germline_snv wants neither -d nor -p, so
+    # neither is asked for.
     state = prep.Preparation(pipeline="dnaseq")
-    r.equal("the protocol comes first", prep.missing(state).slot, "protocol")
+    r.equal("a defaulted protocol asks nothing about itself",
+            prep.missing(state).slot, "readset")
+    state.learn(readset="readset.tsv")
+    r.equal("and its default demands no document", prep.missing(state), None)
+
+    # A protocol that is NOT the default still governs the documents.
+    state = prep.Preparation(pipeline="dnaseq", protocol="somatic_ensemble")
+    r.equal("a somatic protocol asks for its readset first",
+            prep.missing(state).slot, "readset")
+    state.learn(readset="readset.tsv")
+    r.equal("and then its pairs file", prep.missing(state).slot, "pairs")
 
     state = prep.Preparation(pipeline="dnaseq", protocol="somatic_fastpass",
                              readset="readset.tsv")
@@ -150,9 +165,15 @@ def main():
     r.check("and the output directory", "output" in prep.ASSUMED)
     # slots.gaps() is the authority on what gets asked, and it must not have
     # grown any of these.
+    # rnaseq_light takes no -t, so a pipeline and a readset is everything the
+    # COMMAND needs -- but not everything the run needs: step 7 of 8 is
+    # sleuth_differential_expression, which reads the design and raises without
+    # one. The design is asked for; steps, config and output still are not.
     state = prep.Preparation(pipeline="rnaseq_light", readset="r.tsv")
-    r.equal("a fully specified light run asks nothing",
-            prep.missing(state), None)
+    r.equal("a light run is asked for its design and nothing else",
+            prep.missing(state).slot, "design")
+    state.learn(design="d.tsv")
+    r.equal("and then nothing at all", prep.missing(state), None)
 
     # ------------------------------------------------------------------ #
     r.section("the state is summarised so it can be corrected")

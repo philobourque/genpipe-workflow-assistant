@@ -29,6 +29,45 @@ out-of-range step, re-read `--help` before changing anything else.
 Reading is free. `--help`, `ls`, log inspection and `sacct` consume no
 allocation. So does generation itself — see section 3.
 
+## 1a. Choosing the pipeline
+
+There is no default pipeline — bare `genpipes` only prints help. This is the one
+choice nothing can make for you, and it is not a flag: get it wrong and every
+choice below is wrong too.
+
+| pipeline | default `-t` | for |
+|---|---|---|
+| `dnaseq` | `germline_snv` | DNA variants, germline or somatic, short reads |
+| `longread_dnaseq` | `nanopore` | the same, from Nanopore or PacBio |
+| `rnaseq` | `stringtie` | expression, differential expression, RNA variants, fusions |
+| `rnaseq_light` | none | Kallisto + Sleuth; fast, for QC and a first look |
+| `rnaseq_denovo_assembly` | `trinity` | no reference genome available |
+| `chipseq` | `chipseq` | ChIP-seq and ATAC-seq peak calling |
+| `methylseq` | `bismark` | bisulfite methylation |
+| `ampliconseq` | none | 16S/18S/ITS microbial profiling, via DADA2 |
+| `covseq` | none | SARS-CoV-2 consensus, Illumina |
+| `nanopore_covseq` | `default` | SARS-CoV-2, Nanopore |
+
+**Respect what they said.** A named pipeline, or an unambiguous description
+("16S", "bisulfite", "ATAC"), settles it. Say which one you are using; do not
+ask them to confirm it.
+
+**Ambiguous: read the data before asking.** One `head -1` of a file they already
+gave you: `MarkName`/`MarkType` columns → `chipseq`; FAST5 paths or no
+`FASTQ1`/`FASTQ2` → long-read; a path under `$MUGQIC_INSTALL_HOME/testdata/<x>/`
+names its own pipeline.
+
+**Never guess across families.** Family clear, member not — `rnaseq` and
+`dnaseq` are the full pipelines and the fair reading; `rnaseq_light` and
+`rnaseq_denovo_assembly` answer different questions, so ask. Family unclear:
+ask.
+
+**Take the `-t` default where the table shows one, and say that you took it.**
+An unstated protocol is not a question there. `dnaseq` needs care: the default
+is germline, so tumour/normal wording or a pairs file on disk means the default
+is wrong — somatic needs `-p`, and a germline run on paired data completes and
+answers the wrong question.
+
 ## 2. Environment
 
 GenPipes v6 is a Python package delivered through CVMFS and reached with a
@@ -131,25 +170,16 @@ applied left to right, later winning. Each layer answers a different question:
    on: `rorqual.ini` on Rorqual, `narval.ini` on Narval. Carries partitions,
    walltimes, the resource macros and the `RAP_ID`/`JOB_MAIL` line. Check
    `hostname`; do not assume.
-5. **genome ini** — only for a non-default genome. **Find it by looking, not by
-   deriving it from the species name.** The directory is
-   `$MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/`, and it holds
-   SEVERAL inis: an unversioned `<Species>.<assembly>.ini` and one per Ensembl
-   release, e.g. `Mus_musculus.GRCm38.Ensembl83.ini`. The unversioned one is not
-   reliably the one whose indexes exist.
-
-   ```bash
-   ls $MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/*.ini
-   ls $MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/genome/star_index/
-   ```
-
-   Pick the versioned ini whose release has a `star_index/` built, at an
-   `sjdbOverhang` matching read length minus one (101 bp reads want
-   `sjdbOverhang99`). This matters because the naming rule is right for human
-   and wrong elsewhere: `Mus_musculus.GRCm38.ini` pins Ensembl 102, while the
-   only STAR index built for GRCm38 on this install is Ensembl 83. That run
-   generates cleanly, submits cleanly, and dies at `star_align` with no index —
-   the worst shape of failure, because everything before it looked right.
+5. **genome ini** — only for a non-default genome. **Find it by looking, never
+   by deriving it from the species name.** `ls
+   $MUGQIC_INSTALL_HOME/genomes/species/<Species>.<assembly>/*.ini` holds an
+   unversioned ini plus one per Ensembl release; the unversioned one is not
+   reliably the one whose indexes exist. Pick the versioned ini whose release
+   has a `genome/star_index/` built, at an `sjdbOverhang` of read length minus
+   one. The naming rule is right for human and wrong elsewhere:
+   `Mus_musculus.GRCm38.ini` pins Ensembl 102, but the only GRCm38 STAR index
+   here is Ensembl 83 — a run that generates, submits, and dies at `star_align`
+   with no index, the worst shape of failure.
 6. **your own overrides** — last word.
 
 A private override ini is just a file with the sections you want to change,
@@ -178,11 +208,11 @@ Confirm names against `ls $GENPIPES_INIS/<pipeline>/` if one does not resolve.
 | `methylseq` | `bismark`, `gembs` | — | `-d` |
 | | `hybrid` | `methylseq.hybrid.ini` | `-d` |
 | | `dragen` | `methylseq.dragen.ini` | `-d` |
-| `longread_dnaseq` | `nanopore`, `revio` | — | `-d` |
+| `longread_dnaseq` | `nanopore`, `revio` | — | neither |
 | | `nanopore_paired_somatic` | `longread_dnaseq.cancer.ini` | `-p` |
 | `rnaseq_denovo_assembly` | `trinity`, `seq2fun` | — | `-d` |
-| `nanopore_covseq` | `default`, `basecalling` | `ARTIC_v4.ini` / `ARTIC_v4.1.ini` by primer scheme | `-d` |
-| `covseq` | none | `ARTIC_v4.ini` / `ARTIC_v4.1.ini` by primer scheme | `-d` |
+| `nanopore_covseq` | `default`, `basecalling` | `ARTIC_v4.ini` / `ARTIC_v4.1.ini` by primer scheme | neither |
+| `covseq` | none | `ARTIC_v4.ini` / `ARTIC_v4.1.ini` by primer scheme | neither |
 | `ampliconseq`, `rnaseq_light` | none | — | `-d` |
 
 `<pipeline>.batch.ini` is a separate overlay for `-b` batch-effect correction,
@@ -208,9 +238,15 @@ eyeball it — section 9.
 
 ## 7. Design file
 
-Tab-separated, describing contrasts for a differential analysis. Required for
-rnaseq `stringtie`; used by chipseq differential binding, where an absent or
-invalid design skips that step rather than erroring.
+Tab-separated, describing contrasts for a differential analysis. Every pipeline
+accepts `-d`; six have a step that reads it — `rnaseq` (`stringtie` only),
+`rnaseq_denovo_assembly`, `methylseq`, `chipseq`, `ampliconseq`, `rnaseq_light`.
+
+**`-s` decides whether it is required, not the pipeline.** One step reads it, so
+a range stopping before that step needs no design. Take the number from `--help`.
+In range and absent, generation FAILS ("Design file is required for this
+pipeline/protocol") — it does not skip the step. Running without one is a
+decision about the step range; say so.
 
 First column is `Sample`, and the names must match the readset exactly. For
 chipseq the second column is `MarkName` (`atac` under the `atacseq` protocol).
@@ -296,12 +332,10 @@ For a run that did reach the scheduler, five artifacts, all tied by the run's
 timestamp. Glob on the timestamp; never derive a path by splitting a job name on
 dots.
 
-**`log_report`** maps job IDs to steps. Starting point only — a diagnosis that
-reads nothing else is not a diagnosis. Two of its states mislead, because it
-reads `.o` prologues and epilogues rather than asking Slurm: `RUNNING` can mean
-a job killed so hard it never wrote an epilogue, so confirm with `sacct`; and
-`CANCELLED` is usually a dependency cascade, not a real cancel — the fix is
-upstream, and a job that never ran has no cause of its own.
+**`log_report`** maps job IDs to steps. Starting point only. Two of its states
+mislead, because it reads `.o` prologues rather than asking Slurm: `RUNNING` can
+mean a job killed so hard it never wrote an epilogue, so confirm with `sacct`;
+`CANCELLED` is usually a dependency cascade, so the fix is upstream.
 
 **`sacct -j <id> --format=JobID,JobName%40,State,ExitCode,Elapsed,Timelimit,MaxRSS,ReqMem`**
 says how it died and by how much it missed. Killed at 3:00:06 against 3:00:00
@@ -310,14 +344,14 @@ means it was working when killed; dead at 0:00:33 means it hit an error.
 **The `.o` log**, `job_output/<step_dir>/<jobname>_<TIMESTAMP>.o` — what the
 tool was doing, and its error message.
 
-**The `.sh` script**, same directory — what the tool was *told* to do, with
-every flag and input path. This distinguishes "needed more resources" from
-"given the wrong input". It is the artifact most often skipped and most often
-decisive. Read it before proposing any fix.
+**The `.sh` script**, same directory — what the tool was *told* to do, with every
+flag and input path. It separates "needed more resources" from "given the wrong
+input", and is the artifact most often skipped and most often decisive. Read it
+before proposing any fix.
 
 **The config trace**, `<Pipeline>.<protocol>.<TIMESTAMP>.config.trace.ini` in the
-generation directory — which ini section produced that value. It can list
-options a step never used, so cross-check against the `.sh`.
+generation directory — which ini section produced a value. It can list options a
+step never used, so cross-check against the `.sh`.
 
 Reporting rules:
 
@@ -336,21 +370,19 @@ Reporting rules:
 - Put a resource fix in a private override ini **appended last to `-c`**. One
   that is not last is overruled, which looks exactly like a fix that did nothing.
 
-Worked example. Job 15985499 ended `TIMEOUT`, killed at 3:00:06 against a
-3:00:00 limit at 99.2% CPU efficiency — working when killed. `log_report` puts
-it at step 20, `metrics_verify_bam_id`. The config trace shows
-`[verify_bam_id] cluster_walltime = 3:00:00`. The obvious fix is to raise the
-walltime, and it is wrong. The `.sh` shows `VerifyBamID` pointed at a
-genome-wide 100,000-marker panel against a single-chromosome CRAM, and the `.o`
-shows it walking chr1–chr6 hunting markers the file cannot contain. More time
-would only buy more futile search. The fix is to skip the step for
-chromosome-subsetted data or supply a matching panel — visible only in the
-`.sh`.
+Worked example, and why the `.sh` is not optional. A job ends `TIMEOUT`, killed
+at 3:00:06 against 3:00:00 at 99.2% CPU — working when killed, at
+`metrics_verify_bam_id`, whose trace shows `cluster_walltime = 3:00:00`. Raising
+the walltime is the obvious fix and it is wrong: the `.sh` shows `VerifyBamID`
+pointed at a genome-wide marker panel against a single-chromosome CRAM, and the
+`.o` shows it walking chr1–chr6 for markers the file cannot contain. More time
+buys more futile search. Skip the step for subsetted data, or supply a matching
+panel — visible only in the `.sh`.
 
-The other two classes resolve elsewhere. Out of memory: `MaxRSS` at the `ReqMem`
-ceiling and a `.o` that stops mid-sentence, so raise `cluster_mem` for that
-section, sized from the observed `MaxRSS`. Generation failure: no `job_output`
-at all and an explicit "REQUIRED parameter ... is not defined" on stderr.
+Out of memory: `MaxRSS` at the `ReqMem` ceiling and a `.o` stopping
+mid-sentence — raise `cluster_mem` for that section, sized from `MaxRSS`.
+Generation failure: no `job_output` at all, and "REQUIRED parameter ... is not
+defined" on stderr.
 
 ## 13. Data you must not open
 

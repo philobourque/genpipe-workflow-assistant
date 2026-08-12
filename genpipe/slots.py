@@ -102,8 +102,58 @@ PIPELINES = {
     "rnaseq_light": [],
 }
 
-# Where --help marks a default, an unspecified protocol is not a gap.
-DEFAULTS = {"rnaseq": "stringtie"}
+# Where GenPipes itself marks a default, an unspecified protocol is not a gap.
+#
+# Every entry is the literal `default=` on that pipeline's `-t` argument, read
+# out of the install rather than decided here:
+#
+#   .../site-packages/genpipes/pipelines/<pipeline>/__init__.py
+#
+# This table used to hold only rnaseq, which meant the other six pipelines
+# asked "which protocol?" for a question GenPipes answers by itself -- and
+# worse, made the agent's choice look like a judgement when it was reproducing
+# a documented default. Deferring to the install is also the only version-safe
+# story: when 6.2 changes a default, this is wrong in an obvious place rather
+# than subtly wrong everywhere.
+#
+# The three pipelines absent from this table take no `-t` at all -- see the
+# empty lists above -- so there is no default for them to have.
+DEFAULTS = {
+    "chipseq": "chipseq",
+    "dnaseq": "germline_snv",
+    "longread_dnaseq": "nanopore",
+    "methylseq": "bismark",
+    "nanopore_covseq": "default",
+    "rnaseq": "stringtie",
+    "rnaseq_denovo_assembly": "trinity",
+}
+
+# Pipelines that take no `-t` and still consume a design file.
+#
+# `needs` hangs off a PROTOCOL, so a pipeline with no protocols had nowhere to
+# record that it needs anything -- and ampliconseq and rnaseq_light fell
+# straight through gaps(), which reported no missing design for a run that
+# cannot generate without one.
+#
+# Verified against the install rather than decided here, by asking which steps
+# reach `self.contrasts`: ampliconseq's `asva` and rnaseq_light's
+# `sleuth_differential_expression` both do. covseq and nanopore_covseq -- the
+# other two pipelines that take no `-t` -- reference it nowhere, which is why
+# they are not here and must not be added.
+#
+# WHAT "REQUIRED" REALLY MEANS, because it is narrower than it looks. The
+# design is read by ONE step, and `-s` decides whether that step runs at all:
+# `asva` is step 7 of 8, `sleuth_differential_expression` step 7 of 8. Below
+# those, a run needs no design. That is a fact about step numbers, and step
+# numbers are the one thing this repo refuses to hold (see modify.py's note on
+# why there is no step table here and must never be one), so this table cannot
+# express it. It asks whenever a design step EXISTS -- a question that can be
+# declined -- and genpipes.md carries the precise rule for the model, which
+# reads `--help` and does know the numbers.
+_PIPELINE_NEEDS = {
+    "ampliconseq": DESIGN,
+    "rnaseq_light": DESIGN,
+}
 
 # Feature inis that are chosen by what the *data* is, not by which protocol was
 # picked. dnaseq.exome.ini sets experiment_type=exome and touches both germline
@@ -115,9 +165,24 @@ DATA_OVERLAYS = {
     "dnaseq.exome.ini": "capture/exome reads rather than whole-genome",
 }
 
-# Pipelines whose design file is genuinely optional: chipseq skips the
-# differential-binding step when there is no valid design rather than failing,
-# so demanding one would block a legitimate peak-calling-only run.
+# Pipelines this table does not ask a design for even though one of their steps
+# reads it.
+#
+# The comment here used to say chipseq "skips the differential-binding step when
+# there is no valid design rather than failing". That is not what the install
+# does. `differential_binding` opens with `if self.contrasts:`, which looks like
+# a guard and is not one: `contrasts` reaches `design_file`, and that property
+# raises MissingInputError when no `-d` was given. Nothing anywhere catches it.
+# So chipseq without a design does not skip a step -- it fails to generate, the
+# moment step 19 is in range.
+#
+# chipseq stays here anyway, for the reason the old comment was reaching for
+# even though it got the mechanism wrong: peak calling without differential
+# binding is an ordinary, complete chipseq run, `differential_binding` is step
+# 19 of 24, and `-s 1-18` is a normal thing to ask for. Demanding a design up
+# front would block it. The trade is deliberate -- a run that DOES include step
+# 19 fails at generation, which costs nothing but a message, whereas a question
+# nobody can answer blocks work that was always legitimate.
 _DESIGN_OPTIONAL = {"chipseq"}
 
 
@@ -262,17 +327,39 @@ def _readset_gap(candidates=()):
                     "pipeline.")
 
 
+def _who(pipeline, protocol):
+    """How to name the run in a question: "dnaseq somatic_fastpass", "ampliconseq".
+
+    Both parts are optional and either can repeat the other. A pipeline with no
+    `-t` has no protocol to name, and chipseq's default protocol is *called*
+    chipseq -- printing the pair blindly gives "ampliconseq ampliconseq needs a
+    design file", which reads like a bug in the question and makes the reader
+    distrust the rest of it.
+    """
+    parts = [pipeline] if pipeline else []
+    if protocol and protocol != pipeline:
+        parts.append(protocol)
+    return " ".join(parts)
+
+
 def _design_gap(pipeline, protocol, candidates=()):
-    who = f"{pipeline} {protocol}".strip()
+    who = _who(pipeline, protocol)
     return Gap("design", f"{who} needs a design file. Which one?".lstrip(),
                [Option(path, path) for path in candidates],
                free_text=True,
+               # The second sentence is what makes this question answerable by
+               # somebody who has no design file. Exactly one step reads it,
+               # and `-s` decides whether that step runs -- so "I don't have
+               # one" is a legitimate answer that means "keep -s below the
+               # differential step", not a dead end. Without saying so, the
+               # only visible options are inventing a design or giving up.
                note="Columns are contrasts; 1 is control, 2 is treatment, 0 or "
-                    "blank excludes the sample.")
+                    "blank excludes the sample. Only the differential step "
+                    "reads it — a step range that stops before it needs none.")
 
 
 def _pairs_gap(pipeline, protocol, candidates=()):
-    who = f"{pipeline} {protocol}".strip()
+    who = _who(pipeline, protocol)
     return Gap("pairs", f"{who} needs a pairs file. Which one?".lstrip(),
                [Option(path, path) for path in candidates],
                free_text=True,
@@ -354,11 +441,16 @@ def gaps(pipeline=None, protocol=None, readset=None, design=None, pairs=None,
     if not readset:
         found.append(_readset_gap(readset_candidates))
 
-    needs = proto.needs if proto else None
+    # A protocol's demand where there is one, the pipeline's where there is no
+    # protocol to carry it. Both, rather than either, because the two tables
+    # describe different pipelines and never the same one: _PIPELINE_NEEDS
+    # holds only pipelines whose PIPELINES entry is empty.
+    needs = proto.needs if proto else _PIPELINE_NEEDS.get(pipeline)
+    named = proto.name if proto else None      # nothing to name; see _who
     if needs == DESIGN and not design and pipeline not in _DESIGN_OPTIONAL:
-        found.append(_design_gap(pipeline, proto.name, design_candidates))
+        found.append(_design_gap(pipeline, named, design_candidates))
     if needs == PAIRS and not pairs:
-        found.append(_pairs_gap(pipeline, proto.name, pairs_candidates))
+        found.append(_pairs_gap(pipeline, named, pairs_candidates))
 
     return found
 

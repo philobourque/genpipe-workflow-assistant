@@ -686,6 +686,23 @@ def build_proposal(messages, code):
         lines.append(f"  pipeline: {pipeline}")
     if protocol:
         lines.append(f"  protocol: {protocol}")
+    elif pipeline and slots.DEFAULTS.get(pipeline):
+        # An omitted `-t` is not a missing slot -- GenPipes has its own default
+        # and the command runs -- but it is the one assumption in the box that
+        # nothing else on screen states. Before DEFAULTS covered every pipeline
+        # this line read `MISSING (required): protocol`, which was untrue and
+        # loud; the risk in making it true was making it invisible, and an
+        # invisible assumption is the worse of the two. dnaseq is why: the
+        # default is germline, so a tumour/normal cohort approved here runs to
+        # completion and answers a different question, with nothing in the
+        # approval box that a reader could have caught it by.
+        #
+        # Said as an assumption rather than recorded as a slot. The slots keep
+        # describing the command as WRITTEN -- filling in `protocol` here would
+        # put a `-t` in the record that is not in the command, and every later
+        # reader of that record would have no way to tell the two apart.
+        lines.append(f"  protocol: {slots.DEFAULTS[pipeline]} "
+                     "— assumed, no -t given")
     if steps:
         lines.append(f"  steps: {steps}")
     if inis:
