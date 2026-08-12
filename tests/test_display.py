@@ -1140,6 +1140,99 @@ def main():
     fresh = drawn(display.render, Msg(other))
     r.contains("but a new plan starts a new block", fresh, "read the logs")
 
+    # ------------------------------------------------------------------ #
+    r.section("post_approve: the one message that claims something ran")
+    # This line is the only place the product tells somebody that work reached
+    # a shared cluster. It used to be printed whenever the graph came back
+    # unpaused -- which is true of a thread that finished, one that died, and
+    # one that was never resumed -- so it made a claim it could not support.
+    # It now renders the reconciled record, and the word "submitted" belongs to
+    # exactly one status.
+    def record(status, **kw):
+        base = {"status": status, "jobs_seen": None, "expected_jobs": None,
+                "retry_safe": False, "outcome_detail": ""}
+        base.update(kw)
+        return base
+
+    done = drawn(display.post_approve, "r1",
+                 record(runs.SUBMITTED, jobs_seen=46, expected_jobs=46))
+    r.contains("a real submission says so", done, "submitted")
+    r.contains("with the job count", done, "46 job")
+    r.contains("and offers monitoring", done, "/check r1")
+
+    # Zero jobs is a success, not a failure, and must not read as one.
+    nothing = drawn(display.post_approve, "r2",
+                    record(runs.SUBMITTED, jobs_seen=0, expected_jobs=0))
+    r.contains("zero jobs reads as an outcome, not a fault",
+               nothing, "already up to date")
+    r.check("and does not offer a check with nothing to check",
+            "/check" not in nothing, nothing)
+    for word in ("failed", "unknown", "error"):
+        r.check(f"nor does it say {word!r}", word not in nothing.lower(), nothing)
+
+    # A failure, with jobs already on the scheduler behind it.
+    partial = drawn(display.post_approve, "r3",
+                    record(runs.SUBMIT_FAILED, jobs_seen=20, expected_jobs=46,
+                           outcome_detail="the submission command reported a failure"))
+    r.contains("a failure says so", partial, "failed")
+    r.check("and never uses the word submitted", "submitted" not in partial,
+            partial)
+    r.contains("it names the jobs already out there", partial, "20 job")
+    r.contains("and warns against approving again", partial, "run twice")
+
+    # THE INVARIANT THAT MATTERS MOST HERE: a failure with no rows counted is
+    # still not offered a bare retry, because no count can prove that no sbatch
+    # succeeded -- only the scheduler can.
+    blind = drawn(display.post_approve, "r4",
+                  record(runs.SUBMIT_FAILED, jobs_seen=0, expected_jobs=46))
+    r.contains("a failure with zero rows still says check first",
+               blind, "may already be queued")
+    r.contains("and points at the scheduler", blind, "squeue")
+
+    safe = drawn(display.post_approve, "r5",
+                 record(runs.SUBMIT_FAILED, jobs_seen=0, expected_jobs=46,
+                        retry_safe=True))
+    r.contains("only a quiet scheduler unlocks a retry", safe, "safe to try again")
+
+    unknown = drawn(display.post_approve, "r6",
+                    record(runs.SUBMIT_UNKNOWN,
+                           outcome_detail="the outcome of the submission was "
+                                          "never established"))
+    r.contains("an unestablished outcome says exactly that", unknown, "unknown")
+    r.check("and is never promoted to submitted",
+            "submitted" not in unknown, unknown)
+    r.contains("it too points at the scheduler", unknown, "squeue")
+
+    # ------------------------------------------------------------------ #
+    r.section("reconciled(): what startup found still in flight")
+    r.equal("a normal launch says nothing at all",
+            drawn(display.reconciled, []).strip(), "")
+
+    class Out:
+        def __init__(self, status, jobs_seen=None, detail=""):
+            self.status, self.jobs_seen, self.detail = status, jobs_seen, detail
+
+    good = drawn(display.reconciled,
+                 [("rnaseq-0812", Out(runs.SUBMITTED, 15))])
+    r.contains("a settled run is named", good, "rnaseq-0812")
+    r.contains("with what became of it", good, "submitted")
+    r.contains("and its job count", good, "15 job")
+    # A closed laptop after a complete submission is a successful run with an
+    # interrupted terminal. Warning-colouring that teaches people to ignore the
+    # colour on the day it means something.
+    r.check("a complete one is not dressed as a problem",
+            "squeue" not in good, good)
+
+    murky = drawn(display.reconciled, [
+        ("a", Out(runs.SUBMITTED, 15)),
+        ("b", Out(runs.SUBMIT_UNKNOWN, None, "the outcome was never established")),
+    ])
+    r.contains("an unresolved one says so", murky, "outcome unknown")
+    r.contains("with the reason", murky, "never established")
+    r.contains("and points at the scheduler", murky, "squeue")
+    r.contains("stating plainly that nothing was retried", murky,
+               "Nothing was retried")
+
     return r.finish()
 
 

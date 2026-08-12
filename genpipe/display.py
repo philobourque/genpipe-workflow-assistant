@@ -64,6 +64,10 @@ import unicodedata
 
 from . import mirror
 from . import modify
+# Stdlib-only, like this module: the status vocabulary lives with the registry
+# that writes it, so a renderer cannot invent a fifth outcome the store has
+# never heard of.
+from . import runs
 
 # ---------------------------------------------------------------------------
 # ANSI escape codes. \033[<n>m sets an attribute; \033[0m clears everything.
@@ -2064,18 +2068,141 @@ def ready(source=None, model=None, fake=None):
           f"{GREY}{_identity(source, model)}{RESET}")
 
 
-def post_approve(thread_id, approved):
-    """Clean confirmation after the gate decision, replacing the raw dict dump."""
-    if approved:
+def post_approve(name, record):
+    """What the approved command actually did, read off the reconciled record.
+
+    THE WORD "submitted" APPEARS FOR EXACTLY ONE STATUS. It used to be printed
+    whenever the graph came back unpaused, which is true of a thread that
+    finished, one that died, and one that was never resumed -- so the single
+    message in this product that claims something reached a shared cluster was
+    the one making a claim it could not support.
+
+    Four outcomes, four different next actions, because they are four genuinely
+    different situations and the wrong remedy is expensive in each:
+
+      submitted        monitor it.
+      zero jobs        nothing to monitor. A real and successful result, so it
+                       is not dressed up as a failure.
+      failed           amber. Whether a retry is safe is NOT inferred from the
+                       job count -- a job list with no new rows does not prove
+                       no sbatch succeeded, since GenPipes creates the job and
+                       appends its row as two separate statements. Retry is
+                       offered only where Slurm itself was asked and was quiet.
+      unknown          amber, and the honest one. Never quietly promoted to
+                       either neighbour.
+    """
+    status = (record or {}).get("status")
+    seen = (record or {}).get("jobs_seen")
+    expected = (record or {}).get("expected_jobs")
+    detail = (record or {}).get("outcome_detail") or ""
+    print()
+
+    if status == runs.SUBMITTED:
+        if seen:
+            head = f"submitted  \u00b7  {seen} job{'s' if seen != 1 else ''}"
+        elif expected == 0 or seen == 0:
+            head = "nothing to do \u2014 every step was already up to date"
+        else:
+            head = "submitted"
+        print(f"  {DIM}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  {DIM}{head}{RESET}")
+        if seen:
+            print(f"  {DIM}\u258c{RESET}")
+            print(f"  {DIM}\u258c{RESET}   /check {WHITE}{name}{RESET}")
         print()
-        print(f"  {DIM}\u258c {BOLD}{thread_id}{RESET}  {DIM}\u00b7{RESET}  {DIM}submitted{RESET}")
-        print(f"  {DIM}\u258c{RESET}")
-        print(f"  {DIM}\u258c{RESET}   /check {WHITE}{thread_id}{RESET}")
+        return
+
+    if status in (runs.SUBMIT_FAILED, runs.SUBMIT_UNKNOWN):
+        word = ("the submission failed" if status == runs.SUBMIT_FAILED
+                else "the outcome is unknown")
+        print(f"  {AMBER}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  {AMBER}{word}{RESET}")
+        if detail:
+            print(f"  {AMBER}\u258c{RESET}   {DIM}{detail}{RESET}")
+        if seen:
+            print(f"  {AMBER}\u258c{RESET}   {WHITE}{seen} job{'s' if seen != 1 else ''} "
+                  f"were recorded before it stopped{RESET}"
+                  f"{DIM} \u2014 they are on the scheduler{RESET}")
+        print(f"  {AMBER}\u258c{RESET}")
+        if (record or {}).get("retry_safe"):
+            print(f"  {AMBER}\u258c{RESET}   {DIM}Slurm has no jobs from this "
+                  f"attempt \u2014 it is safe to try again.{RESET}")
+            print(f"  {AMBER}\u258c{RESET}   /modify {WHITE}{name}{RESET}"
+                  f"{DIM}, or /reject it{RESET}")
+        else:
+            # The default, and deliberately the cautious one. Anything that is
+            # not positively known to be quiet may already have work queued.
+            print(f"  {AMBER}\u258c{RESET}   {DIM}Some jobs may already be "
+                  f"queued. Check before resubmitting \u2014 approving again is "
+                  f"how a pipeline gets run twice.{RESET}")
+            print(f"  {AMBER}\u258c{RESET}   /check {WHITE}{name}{RESET}"
+                  f"{DIM}  \u00b7  squeue -u $USER{RESET}")
         print()
-    else:
+        return
+
+    if status == runs.SUBMITTING:
+        print(f"  {AMBER}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  "
+              f"{AMBER}still submitting{RESET}")
+        print(f"  {AMBER}\u258c{RESET}   {DIM}The command was started and has "
+              f"not reported back.{RESET}")
         print()
-        print(f"  {DIM}\u258c {BOLD}{thread_id}{RESET}  {DIM}\u00b7{RESET}  {DIM}rejected, feedback sent{RESET}")
-        print()
+        return
+
+    print(f"  {DIM}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  "
+          f"{DIM}{status or 'no outcome recorded'}{RESET}")
+    print()
+
+
+def reconciled(settled):
+    """What startup found and resolved about submissions left in flight.
+
+    Printed only when there IS something -- a normal launch says nothing --
+    because this is news by definition: a run was mid-submission when a session
+    ended, and what became of it is the first thing worth knowing.
+
+    Deliberately not amber unless it needs to be. A session killed after a
+    complete submission is a successful run with an interrupted terminal, and
+    dressing that in a warning colour would make the commonest cause of this
+    (closing a laptop) look like a fault.
+    """
+    if not settled:
+        return
+    print()
+    n = len(settled)
+    print(f"  {DIM}▌ {BOLD}{n} run{'s' if n != 1 else ''}{RESET}"
+          f"{DIM} {'were' if n != 1 else 'was'} still submitting when a "
+          f"session ended. Reconciled:{RESET}")
+    for name, outcome in settled:
+        status = getattr(outcome, "status", None)
+        seen = getattr(outcome, "jobs_seen", None)
+        if status == runs.SUBMITTED:
+            said = (f"submitted · {seen} job{'s' if seen != 1 else ''}"
+                    if seen else "submitted")
+            tint = ""
+        elif status == runs.SUBMIT_FAILED:
+            said, tint = "the submission failed", AMBER
+        else:
+            said, tint = "outcome unknown", AMBER
+        print(f"  {DIM}▌{RESET}   {WHITE}{name}{RESET}  {DIM}·{RESET}  "
+              f"{tint}{said}{RESET}")
+        detail = getattr(outcome, "detail", "")
+        if detail and status != runs.SUBMITTED:
+            print(f"  {DIM}▌{RESET}     {DIM}{detail}{RESET}")
+    # Said once, here, rather than per row: the reason any of this is worth
+    # reading is that a run whose outcome is not established may already have
+    # work queued, and approving it again is how a pipeline gets run twice.
+    if any(getattr(o, "status", None) != runs.SUBMITTED for _, o in settled):
+        print(f"  {DIM}▌{RESET}")
+        print(f"  {DIM}▌{RESET}   {DIM}Nothing was retried. Check before "
+              f"resubmitting:{RESET} squeue -u $USER")
+    print()
+
+
+def post_reject(name):
+    """The counterpart for a rejection. Split out from post_approve, which no
+    longer takes a boolean: the two messages had nothing in common but a bar."""
+    print()
+    print(f"  {DIM}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  "
+          f"{DIM}rejected, feedback sent{RESET}")
+    print()
 # ---------------------------------------------------------------------------
 # Run status. GenPipes' log_report prints a flat list where a failure reads with
 # exactly the same weight as a success, which is the wrong way round.

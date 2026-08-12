@@ -136,6 +136,13 @@ STORE = os.environ["GENPIPE_FAKE_STORE"]
 PIPELINES = __import__("json").load(open(os.path.join(STORE, "pipelines.json")))
 STEP_COUNT = 20
 
+# How many jobs fake_submit will create (its STEPS x SAMPLES). Stated here as
+# well because the generator has to declare the total in the script's header
+# BEFORE the submission runs -- which is what real GenPipes does, and what lets
+# a clean exit be checked against a promise rather than merely believed.
+# test_fakecluster asserts the two agree.
+FAKE_STEPS, FAKE_SAMPLES = 5, 3
+
 
 def die(msg):
     sys.stderr.write(f"genpipes: error: {msg}\n")
@@ -251,11 +258,34 @@ if not out:
 
 # Write a cmd.sh that, when run, behaves like a real submission: it creates
 # job_output/ and a job_list naming the jobs it "submitted".
+#
+# THE HEADER IS PART OF THE FIDELITY, not decoration. runs.reconcile() reads
+# four things off a generated script -- its declared OUTPUT_DIR/JOB_LIST, its
+# `# TOTAL: N jobs`, and whether its `set` line carries pipefail -- to decide
+# whether a submission actually happened. A fake that omitted them made every
+# offline run reconcile as "unknown", which is the correct verdict for a script
+# that declares nothing and exactly the wrong thing for a fake whose whole
+# purpose is that everything downstream works for real.
+#
+# The TIMESTAMP is fixed HERE rather than by fake_submit, because that is what
+# real GenPipes does and it is what makes the job list identifiable BEFORE the
+# submission runs -- which is what a baseline needs.
 label = f"{pipeline.capitalize()}.{protocol or 'default'}"
+stamp = time.strftime("%Y-%m-%dT%H.%M.%S")
+total = FAKE_STEPS * FAKE_SAMPLES
+outdir = flag(args, "-o") or flag(args, "--output-dir") or os.getcwd()
+outdir = outdir if os.path.isabs(outdir) else os.path.join(os.getcwd(), outdir)
 with open(out, "w") as f:
     f.write("#!/bin/bash\n")
+    f.write("# Exit immediately on error\n\n")
+    f.write("set -eu -o pipefail\n\n")
     f.write(f"# fake GenPipes submission script for {label}\n")
-    f.write(f'exec "$GENPIPE_FAKE_STORE/bin/fake_submit" "{label}"\n')
+    f.write(f"#   TOTAL: {total} jobs\n\n")
+    f.write(f"OUTPUT_DIR={outdir}\n")
+    f.write("JOB_OUTPUT_DIR=$OUTPUT_DIR/job_output\n")
+    f.write(f"TIMESTAMP={stamp}\n")
+    f.write(f"JOB_LIST=$JOB_OUTPUT_DIR/{label}.job_list.$TIMESTAMP\n")
+    f.write(f'exec "$GENPIPE_FAKE_STORE/bin/fake_submit" "{label}" "{stamp}"\n')
 os.chmod(out, 0o755)
 # stdout, not stderr: the agent shows the command's output in the transcript, and
 # a generation that appears to have printed nothing reads as a generation that
@@ -341,7 +371,9 @@ def plan():
 cwd = os.getcwd()
 out = os.path.join(cwd, "job_output")
 os.makedirs(out, exist_ok=True)
-stamp = time.strftime("%Y-%m-%dT%H.%M.%S")
+# Fixed by the generator and passed in, as real GenPipes bakes it into the
+# script. It is what makes the job list nameable before the run starts.
+stamp = sys.argv[2] if len(sys.argv) > 2 else time.strftime("%Y-%m-%dT%H.%M.%S")
 listing = os.path.join(out, f"{label}.job_list.{stamp}")
 
 base = 41000000
@@ -361,18 +393,28 @@ for i, (name, state) in enumerate(plan()):
     with open(os.path.join(out, log), "w") as f:
         f.write(body)
     rows.append((jid, name, log, state))
-    print(f"Submitted batch job {jid}   # {name}")
 
-with open(listing, "w") as f:
-    for i, (jid, name, log, state) in enumerate(rows):
-        # GenPipes' real manifest shape, positionally exact:
-        #   id \t name \t dependencies(colon-joined) \t log
-        # The dependency column is populated for everything after the first job
-        # precisely so that runs.parse_job_list is tested against the field that
-        # used to defeat it -- a fan-in job whose dependency string is longer
-        # than its own name.
-        deps = ":".join(r[0] for r in rows[:i]) if i else ""
+    # APPENDED PER JOB, and flushed, because that is what the real script does
+    # and the difference is the whole reason a partial submission is
+    # recoverable: `sbatch` then `>> $JOB_LIST` are two statements, so a run
+    # that dies half way leaves the rows for the jobs it did create. Writing
+    # the manifest in one go at the end would make every interrupted run look
+    # like it submitted nothing.
+    #
+    # GenPipes' real manifest shape, positionally exact:
+    #   id \t name \t dependencies(colon-joined) \t log
+    # The dependency column is populated for everything after the first job
+    # precisely so that runs.parse_job_list is tested against the field that
+    # used to defeat it -- a fan-in job whose dependency string is longer than
+    # its own name.
+    deps = ":".join(r[0] for r in rows[:i]) if i else ""
+    with open(listing, "a") as f:
         f.write(f"{jid}\t{name}\t{deps}\t{log}\n")
+        f.flush()
+    # The line runs.submitted_ids() counts, in GenPipes' own wording. The
+    # `Submitted batch job` line above it was sbatch's, which the real script
+    # consumes into a variable rather than printing.
+    print(f"Submitted job with ID: {jid}")
 
 # A registry of every job this fake cluster knows about, so sacct can answer
 # about a run's jobs long after the submitting process is gone.

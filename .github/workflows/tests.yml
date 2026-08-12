@@ -37,6 +37,9 @@ jobs:
         run: python tests/test_gate.py
 
       - name: Runs and jobs
+        # Includes reconcile(): whether a submission actually happened. The
+        # suite for the defect where 46 real jobs ran and the registry said
+        # the run was still awaiting approval.
         run: python tests/test_runs.py
 
       - name: The fake cluster

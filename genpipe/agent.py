@@ -1347,7 +1347,27 @@ class GenpipeA1(A1):
                 display.problem(f"No run named '{name}'.",
                                 "/list shows what there is.")
                 return {"status": "unknown", "thread_id": None}
-            return self._gate_status(config)
+            # Nothing is parked here, so nothing can be approved. Said plainly,
+            # because the caller used to be handed a bare "done" from the
+            # checkpoint and printed "<name> · submitted" on the strength of
+            # it -- for a run whose command had never been resumed. The status
+            # carries `submitted: False` so no caller has to infer it again.
+            status = self._gate_status(config)
+            status["submitted"] = False
+            status["record_status"] = record.get("status")
+            if approved:
+                if record.get("status") == runs_store.HELD:
+                    display.problem(
+                        f"'{name}' is not waiting at the gate any more.",
+                        "Its conversation ended without a pending decision — "
+                        f"/modify {name} to rebuild it, or /reject to drop it.")
+                elif record.get("status") in runs_store.AFTER_APPROVAL:
+                    display.problem(
+                        f"'{name}' has already been through /approve — it is "
+                        f"{record.get('status')}.",
+                        f"/check {name} for where it stands. Nothing was "
+                        f"submitted a second time.")
+            return status
         if approved:
             # Re-checked here, not just when the box was drawn. The box may have
             # been on screen for a day, and /approve is the irreversible act.
@@ -1377,9 +1397,44 @@ class GenpipeA1(A1):
                 return status
         self.log = []
         command = Command(resume={"approved": bool(approved), "feedback": feedback})
-        self._drive(command, config, on_step)
+
+        # Everything irreversible happens between here and the finally below.
+        #
+        # The baseline is taken BEFORE the command runs, because the only
+        # honest measure of what this approval submitted is the number of job
+        # rows it ADDED: GenPipes appends with >>, an output directory is
+        # routinely reused, and a retry of the same script writes into the very
+        # same list as the attempt that failed.
+        #
+        # The record is moved to `submitting` before the resume, so a process
+        # killed mid-flight leaves a state that asks to be reconciled rather
+        # than one that invites a second approval.
+        #
+        # And the reconciliation is in a `finally`, which is the whole fix for
+        # the 2026-07-29 defect: 46 jobs were submitted and completed, the turn
+        # that would have recorded them died on an API error two nodes later,
+        # and the run still said `held` a fortnight afterwards. An exception in
+        # the REPORTING of a submission must never lose the submission.
+        script = baseline = None
         if approved:
-            self._record_submission(name, started)
+            script = self._approved_script(record)
+            baseline = runs_store.job_list_state(
+                runs_store.declared_job_list(script))
+            # Written to the record, not just held in this frame. The `finally`
+            # below covers an exception; it does not cover a kill, a closed
+            # terminal or a rebooted login node, and the baseline is the one
+            # piece of evidence that cannot be recovered afterwards. Persisting
+            # it is what lets reconcile_stale() answer for a session that never
+            # came back.
+            self.registry.begin_submission(name, workdir=os.getcwd(),
+                                           baseline=baseline, script=script,
+                                           since=started)
+        try:
+            self._drive(command, config, on_step)
+        finally:
+            if approved:
+                self._reconcile_submission(name, started, script, baseline,
+                                           config)
         status = self._settle(thread_id, config, held=None if approved else name)
 
         # A run that was NOT approved must still be waiting when this returns.
@@ -1575,6 +1630,21 @@ class GenpipeA1(A1):
                     "proposal": value,
                     "thread_id": thread_id}
 
+        # A graph that DIED is not a graph that finished, and conflating them is
+        # how /approve came to print "submitted" for a run it never touched. On
+        # 2026-07-29 an API error killed the turn after the submission ran;
+        # LangGraph wrote __error__ into the checkpoint, nothing read it, this
+        # returned "done", and cli._cmd_approve took "done" as proof.
+        #
+        # snap.tasks[].error is where that marker surfaces. Reported as its own
+        # status so no caller can mistake it for a completed turn.
+        error = next((t.error for t in (snap.tasks or ()) if getattr(t, "error", None)),
+                     None)
+        if error is not None:
+            return {"status": "errored",
+                    "error": str(error),
+                    "thread_id": thread_id}
+
         # Otherwise the run finished. snap.values can be empty for a thread that
         # never ran (unknown thread_id), so guard before indexing messages and
         # return final=None rather than raising.
@@ -1618,41 +1688,184 @@ class GenpipeA1(A1):
     #  Monitoring, in three sizes. check() is one aggregate number, jobs() is #
     #  every job, diagnose() is the only one that costs a model call.             #
     # --------------------------------------------------------------------- #
-    def _record_submission(self, name, since):
-        """Called from resume() right after an approved submission runs. Records
-        the job list GenPipes just wrote, promoting the run from held to
-        submitted and pinning the directory it ran in.
+    def _approved_script(self, record):
+        """The generated script this run's proposal submits, as an absolute path.
 
-        `since` is the time the submission started. Only a job list written after
-        that moment belongs to this run. Without this guard, a submission that
-        creates zero jobs (everything already up to date) writes no list at all,
-        and the glob would silently grab the newest list from a PREVIOUS run --
-        linking this name to another run's jobs.
-
-        The working directory is recorded rather than inferred. A job's log path
-        in the job list is relative to wherever the submission ran, so without
-        this a later /diagnose can only find logs if you happen to still be sitting in
-        the same directory. Pinning it here is what makes analysis work from
-        anywhere, in any later session.
+        Read off the proposal rather than guessed from the cwd, because the
+        proposal is what was approved and the cwd is only where somebody was
+        standing. Returns None when the script cannot be located, which
+        reconcile() treats as "no declared total to check against" rather than
+        as permission to assume success.
         """
-        workdir = os.getcwd()
+        proposal = (record or {}).get("proposal") or {}
+        script = proposal.get("script")
+        if not script:
+            return None
+        if os.path.isabs(script):
+            return script if os.path.exists(script) else None
+        for base in (record.get("workdir") or "", os.getcwd(),
+                     ((proposal.get("slots") or {}).get("output_dir") or "")):
+            candidate = os.path.join(base, script) if base else script
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+        return None
 
-        # The proposal is read BEFORE the search, not after: it carries the -o
-        # directory and the name of the script that was approved, and those are
-        # what say where GenPipes put the list. The cwd is only where the person
-        # was standing.
-        held = self.registry.get(name)
-        proposal = (held or {}).get("proposal")
-        slots = (proposal or {}).get("slots") or {}
-        newest = runs_store.find_job_list(workdir, since,
-                                          output_dir=slots.get("output_dir"),
-                                          script=(proposal or {}).get("script"))
+    def _last_observation(self, config):
+        """What the execute node last returned on this thread, or None.
 
-        # Promote even when there is no list: "every step already up to date"
-        # produces no jobs, and that is a successful outcome, not a run still
-        # awaiting approval.
-        self.registry.mark_submitted(name, newest, workdir=workdir,
-                                     proposal=proposal, thread_id=name)
+        Read back out of the checkpoint rather than captured in flight, so it
+        survives the exception this whole path exists to survive. None means we
+        never saw it, which reconcile() classifies as unknown -- never as a
+        clean run.
+        """
+        try:
+            snap = self.app.get_state(config)
+        except Exception:                       # noqa: BLE001 -- see below
+            # A checkpoint we cannot read is exactly the case that must not
+            # raise: this runs in a `finally`, and an exception here would
+            # replace the original failure with a confusing one and skip the
+            # record write that is the entire point.
+            return None
+        for message in reversed(list((snap.values or {}).get("messages") or [])):
+            content = str(getattr(message, "content", "") or "")
+            if "<observation>" in content:
+                return content
+        return None
+
+    def _reconcile_submission(self, name, since, script, baseline, config):
+        """Establish what the approved command actually did, and record it.
+
+        Runs in resume()'s `finally`, so it happens whether the turn ended
+        cleanly, raised, or was interrupted. Nothing here may raise: this is the
+        last chance to write down that a submission occurred, and a traceback
+        from the bookkeeping would lose exactly what the bookkeeping is for.
+
+        No model is consulted. The four facts are the script's declared total,
+        whether the runner reported a non-zero exit, how many job rows appeared
+        that were not there before, and -- only when a failure needs grading --
+        what Slurm says. See runs.reconcile for how they combine, and for why a
+        clean exit alone is never enough.
+        """
+        try:
+            record = self.registry.get(name) or {}
+            proposal = record.get("proposal")
+            observation = self._last_observation(config)
+
+            after = runs_store.job_list_state((baseline or {}).get("path"))
+            # No declared list to watch -- an older script, or one whose header
+            # could not be read. Fall back to the mtime search, which is weaker
+            # (it cannot produce a delta) but is better than no path at all.
+            if not (baseline or {}).get("path"):
+                slots = (proposal or {}).get("slots") or {}
+                found = runs_store.find_job_list(
+                    os.getcwd(), since, output_dir=slots.get("output_dir"),
+                    script=(proposal or {}).get("script"))
+                after = runs_store.job_list_state(found)
+                baseline = None
+
+            outcome = runs_store.reconcile(
+                script=script, observation=observation,
+                baseline=baseline, after=after, quiet=None)
+
+            # Slurm is asked only when the answer changes what may be offered:
+            # a failed or unestablished outcome, where the question is whether a
+            # bare retry could double-submit. A successful one needs no query,
+            # and querying on every approval would put an sacct call on the
+            # happy path for nothing.
+            if outcome.status in (runs_store.SUBMIT_FAILED,
+                                  runs_store.SUBMIT_UNKNOWN):
+                outcome = runs_store.reconcile(
+                    script=script, observation=observation,
+                    baseline=baseline, after=after,
+                    quiet=runs_store.scheduler_quiet_since(since))
+
+            self.registry.record_outcome(name, outcome, workdir=os.getcwd(),
+                                         proposal=proposal)
+            return outcome
+        except Exception as e:                  # noqa: BLE001 -- see docstring
+            try:
+                self.registry.record_outcome(
+                    name,
+                    runs_store.Outcome(
+                        runs_store.SUBMIT_UNKNOWN,
+                        detail=f"the outcome could not be established ({e})"),
+                    workdir=os.getcwd())
+            except Exception:                   # noqa: BLE001
+                pass
+            return None
+
+    def reconcile_stale(self):
+        """Resolve runs left mid-submission by a session that never came back.
+
+        Called at startup. A record only reaches `submitting` and stays there
+        if the process died between /approve and the reconciliation in
+        resume()'s `finally` -- a kill, a closed terminal, a rebooted login
+        node. Until this ran, such a record sat in /list forever saying
+        "submitting" about a session that ended days ago.
+
+        NOTHING IS RETRIED AND NOTHING IS SUBMITTED. This reads three things
+        that are already on disk -- the persisted baseline, the job list, and
+        the checkpoint's last observation -- and writes a status. It never
+        resumes a graph, never runs a command, and cannot reach the scheduler
+        except to ASK, which it does only when the answer decides whether a
+        retry may be offered.
+
+        The verdict is the same reconcile() every other path uses, so a run
+        resolved here and a run resolved in-flight are held to one standard:
+
+          rows added == the script's declared total   -> submitted
+          the observation survived and reported a
+          failure                                     -> submit_failed
+          anything else                               -> submit_unknown
+
+        Returns the names it settled, so the caller can say so.
+        """
+        settled = []
+        for record in self.registry.submitting():
+            name = record["name"]
+            try:
+                script = (record.get("submitted_script")
+                          or self._approved_script(record))
+                baseline = record.get("job_list_baseline")
+                path = ((baseline or {}).get("path")
+                        or runs_store.declared_job_list(script))
+                after = runs_store.job_list_state(path)
+
+                # The checkpoint outlives the process, so the observation may
+                # still be there -- if the turn got far enough to store one.
+                observation = None
+                if record.get("thread_id"):
+                    observation = self._last_observation(
+                        self._config(record["thread_id"]))
+
+                outcome = runs_store.reconcile(
+                    script=script, observation=observation,
+                    baseline=baseline, after=after, quiet=None)
+                if outcome.status != runs_store.SUBMITTED:
+                    outcome = runs_store.reconcile(
+                        script=script, observation=observation,
+                        baseline=baseline, after=after,
+                        quiet=runs_store.scheduler_quiet_since(
+                            record.get("submitted_since")
+                            or _epoch(record.get("submitted_at"))))
+                self.registry.record_outcome(name, outcome)
+                settled.append((name, outcome))
+            except Exception as e:                  # noqa: BLE001
+                # Startup must not fail because a record is malformed. An
+                # unresolvable one is left unknown rather than left claiming to
+                # be in flight.
+                try:
+                    self.registry.record_outcome(
+                        name,
+                        runs_store.Outcome(
+                            runs_store.SUBMIT_UNKNOWN,
+                            detail=f"could not be reconciled at startup ({e})"))
+                    settled.append((name, None))
+                except Exception:                   # noqa: BLE001
+                    pass
+        if settled:
+            display.reconciled(settled)
+        return [name for name, _ in settled]
 
     def _need_run(self, name, needs_jobs=True):
         """Resolve a name to a record, explaining the failure if it can't.
@@ -1676,15 +1889,32 @@ class GenpipeA1(A1):
                             "/history still has the record.")
             return None
         if needs_jobs and not record["job_list"]:
-            # Two different things, and saying the wrong one costs a real
-            # investigation: GenPipes may genuinely have created no jobs, or it
-            # may have written a list somewhere the search did not reach. The
-            # record cannot tell them apart after the fact, so say both and hand
-            # over the escape hatch rather than assert the happier one.
-            display.problem(f"No job list was recorded for '{name}' -- either "
-                            f"every step was already up to date, or GenPipes "
-                            f"wrote its list outside the directories searched.",
-                            f"/track {name} <path/to/job_list>")
+            # This used to have to guess between "no jobs were created" and
+            # "the list was written somewhere we did not look", because nothing
+            # had counted. reconcile() now has, so say what was established and
+            # fall back to the old both-answers wording only for records that
+            # predate it.
+            seen, expected = record.get("jobs_seen"), record.get("expected_jobs")
+            if record["status"] == runs_store.SUBMITTED and seen == 0:
+                display.problem(
+                    f"'{name}' created no jobs — every step was already up to "
+                    f"date.", "There is nothing on the scheduler to check.")
+            elif record["status"] in (runs_store.SUBMIT_FAILED,
+                                      runs_store.SUBMIT_UNKNOWN,
+                                      runs_store.SUBMITTING):
+                display.problem(
+                    f"'{name}' is {record['status'].replace('_', ' ')} — "
+                    f"{record.get('outcome_detail') or 'no job list was recorded'}.",
+                    "squeue -u $USER shows what is actually queued  ·  "
+                    f"/track {name} <path/to/job_list> adopts a list by hand")
+            else:
+                display.problem(
+                    f"No job list was recorded for '{name}' -- either every "
+                    f"step was already up to date, or GenPipes wrote its list "
+                    f"outside the directories searched."
+                    + (f" {seen} of {expected} jobs were counted."
+                       if seen is not None and expected is not None else ""),
+                    f"/track {name} <path/to/job_list>")
             return None
         return record
 
@@ -1762,6 +1992,24 @@ class GenpipeA1(A1):
                     "name": name, "what": what, "when": when,
                     "line": "held at the gate, nothing submitted",
                     "suggest": f"/approve {name}  ·  /modify {name}  ·  /reject {name}"})
+                continue
+            # A submission whose outcome is not a clean success outranks
+            # everything else here, because it is the only row that may mean
+            # work is on the cluster that nobody is tracking -- and the only one
+            # where the wrong next action submits a pipeline twice.
+            if record.get("status") in (runs_store.SUBMIT_FAILED,
+                                        runs_store.SUBMIT_UNKNOWN,
+                                        runs_store.SUBMITTING):
+                seen = record.get("jobs_seen")
+                line = record.get("status").replace("_", " ")
+                if seen:
+                    line += f" — {seen} job(s) recorded before it stopped"
+                elif record.get("outcome_detail"):
+                    line += f" — {record['outcome_detail']}"
+                groups[display.ATTENTION].append({
+                    "name": name, "what": what, "when": when, "line": line,
+                    "suggest": (f"/check {name}" if record.get("retry_safe")
+                                else f"/check {name}  ·  squeue -u $USER")})
                 continue
             if status is None and not record.get("job_list"):
                 # A submission where every step was already up to date creates
@@ -2048,6 +2296,21 @@ class GenpipeA1(A1):
             "need to read a file that is not quoted above.",
         ]
         return "\n".join(lines)
+
+
+def _epoch(stamp):
+    """An ISO timestamp from the registry as a float, or None.
+
+    Only a fallback: `submitted_since` is written as a float precisely so this
+    is not needed, but records written before that field existed still have to
+    be answerable about.
+    """
+    if not stamp:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(stamp)).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 def _one_line(text, limit=140):

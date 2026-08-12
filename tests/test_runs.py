@@ -531,10 +531,332 @@ Human time spent on this pipeline: 0:41:02
 
         _since_checks(r)
         _list_bucket_checks(r)
+        _reconcile_checks(r)
+        _stale_submission_checks(r)
 
         return r.finish()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _script(path, total=None, pipefail=True, outdir=None, stamp="2026-08-12T10.00.00"):
+    """A generated script's header, in the shape GenPipes really writes it.
+
+    Only the header matters here: reconcile() reads the declared total, the
+    `set` line and the JOB_LIST path, and never executes anything.
+    """
+    outdir = outdir or os.path.dirname(path)
+    lines = ["#!/bin/bash", "# Exit immediately on error", ""]
+    lines.append("set -eu -o pipefail" if pipefail else "set -eu")
+    lines.append("")
+    if total is not None:
+        lines.append(f"#   TOTAL: {total} jobs")
+    lines += [f"OUTPUT_DIR={outdir}",
+              "JOB_OUTPUT_DIR=$OUTPUT_DIR/job_output",
+              f"TIMESTAMP={stamp}",
+              "JOB_LIST=$JOB_OUTPUT_DIR/DnaSeq.somatic_fastpass.job_list.$TIMESTAMP",
+              ""]
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def _reconcile_checks(r):
+    """Did the submission happen? Every cell of the evidence table.
+
+    This is the suite for the 2026-07-29 defect and its whole family. A real
+    run put 46 jobs on Rorqual, the turn that would have recorded them died on
+    an API error, and the registry said `held` a fortnight later -- so /approve
+    offered it again and /check refused to look at it. Nothing here needs a
+    cluster: reconcile() is pure over evidence gathered elsewhere.
+
+    The two rules being pinned, both of which cost real work when they were
+    absent:
+
+      exit 0 is not on its own proof of success. It is accepted only when the
+      rows added match the total the script declared, or when the script's own
+      `pipefail` semantics make a clean exit mean every sbatch returned 0.
+
+      a failure with no new rows is not proof that nothing reached Slurm.
+      GenPipes runs `sbatch` and appends the row as two separate statements, so
+      `retry_safe` is never inferred from a count -- only from asking Slurm.
+    """
+    r.section("reconcile(): what the evidence actually establishes")
+    work = tempfile.mkdtemp(prefix="genpipe_rec_")
+    try:
+        listing = os.path.join(work, "job_output",
+                               "DnaSeq.somatic_fastpass.job_list.2026-08-12T10.00.00")
+        script = _script(os.path.join(work, "cmd.sh"), total=3, outdir=work)
+
+        r.equal("the declared total is read off the header",
+                runs.expected_jobs(script), 3)
+        r.truthy("and so is pipefail", runs.has_pipefail(script))
+        r.equal("the job list path is resolved from the header, not globbed",
+                runs.declared_job_list(script), listing)
+
+        # -- a clean, complete submission -------------------------------- #
+        before = runs.job_list_state(listing)
+        r.equal("a baseline over a file that does not exist yet is zero rows",
+                (before["rows"], before["identity"]), (0, None))
+        make_job_list(listing, [("1", "a.s", "step/a.o", ""),
+                                ("2", "b.s", "step/b.o", ""),
+                                ("3", "c.s", "step/c.o", "")])
+        after = runs.job_list_state(listing)
+        out = runs.reconcile(script=script,
+                             observation="Submitted job with ID: 1\n"
+                                         "Submitted job with ID: 2\n"
+                                         "Submitted job with ID: 3\n",
+                             baseline=before, after=after)
+        r.equal("3 of 3 rows and a clean exit is submitted", out.status,
+                runs.SUBMITTED)
+        r.equal("with the count recorded", out.jobs_seen, 3)
+
+        # -- ROWS ARE A DELTA, NOT A TOTAL ------------------------------- #
+        # The case that makes a baseline necessary: GenPipes appends, the
+        # TIMESTAMP is baked into the script, so retrying one script writes
+        # into the very same list as the attempt that failed.
+        rerun_before = runs.job_list_state(listing)
+        r.equal("a second approval starts from 3 rows already present",
+                rerun_before["rows"], 3)
+        with open(listing, "a") as f:
+            f.write("4\td.s\t\tstep/d.o\n")
+            f.write("5\te.s\t\tstep/e.o\n")
+            f.write("6\tf.s\t\tstep/f.o\n")
+        rerun_after = runs.job_list_state(listing)
+        out = runs.reconcile(script=script, observation="ok",
+                             baseline=rerun_before, after=rerun_after)
+        r.equal("only the rows this approval added are counted", out.jobs_seen, 3)
+        r.equal("so a rerun into the same list still reconciles", out.status,
+                runs.SUBMITTED)
+
+        # A file replaced underneath us cannot be differenced.
+        swapped = dict(rerun_before)
+        swapped["identity"] = (rerun_before["identity"][0],
+                               (rerun_before["identity"][1] or 0) + 1,
+                               rerun_before["identity"][2])
+        r.equal("a different file at the same path yields no delta",
+                runs.rows_added(swapped, rerun_after), None)
+        shrunk = dict(rerun_after)
+        shrunk["identity"] = (rerun_after["identity"][0], rerun_after["identity"][1], 1)
+        r.equal("nor does a file that shrank",
+                runs.rows_added(rerun_before, shrunk), None)
+
+        # -- zero jobs is a real success --------------------------------- #
+        empty_script = _script(os.path.join(work, "uptodate.sh"), total=0,
+                               outdir=os.path.join(work, "u"))
+        none_state = runs.job_list_state(runs.declared_job_list(empty_script))
+        out = runs.reconcile(script=empty_script, observation="",
+                             baseline=none_state, after=none_state)
+        r.equal("a script promising 0 jobs that creates none is submitted",
+                out.status, runs.SUBMITTED)
+        r.equal("with zero jobs, not an error", out.jobs_seen, 0)
+
+        # -- the silent-failure case exit status cannot see --------------- #
+        # No pipefail: a failed sbatch leaves awk exiting 0, the script runs on
+        # and exits clean having submitted fewer jobs than it promised. This is
+        # the reason a clean exit is never trusted on its own.
+        quiet_script = _script(os.path.join(work, "nopipefail.sh"), total=3,
+                               pipefail=False, outdir=os.path.join(work, "np"))
+        qlist = runs.declared_job_list(quiet_script)
+        qbefore = runs.job_list_state(qlist)
+        make_job_list(qlist, [("7", "a.s", "step/a.o", "")])
+        out = runs.reconcile(script=quiet_script,
+                             observation="Submitted job with ID: 7\n"
+                                         "Submitted job with ID: \n",
+                             baseline=qbefore, after=runs.job_list_state(qlist))
+        r.equal("a clean exit with 1 of 3 rows is NOT submitted", out.status,
+                runs.SUBMIT_UNKNOWN)
+        r.contains("and says so", out.detail, "1 of 3 jobs were recorded")
+        r.equal("an empty id after the label is not counted as a submission",
+                runs.submitted_ids("Submitted job with ID: 7\n"
+                                   "Submitted job with ID: \n"), ["7"])
+
+        # A script that declares no total is trusted only on its own semantics.
+        bare = _script(os.path.join(work, "bare.sh"), total=None,
+                       outdir=os.path.join(work, "b"))
+        blist = runs.declared_job_list(bare)
+        bbefore = runs.job_list_state(blist)
+        make_job_list(blist, [("8", "a.s", "step/a.o", "")])
+        out = runs.reconcile(script=bare, observation="ok", baseline=bbefore,
+                             after=runs.job_list_state(blist))
+        # PIPEFAIL ALONE DOES NOT PROMOTE. It proves no sbatch the script ran
+        # returned non-zero; it proves nothing about whether the script
+        # contained every submission it was meant to. With no declared total
+        # there is no second fact to check the exit status against.
+        r.equal("no declared total is unknown even with pipefail",
+                out.status, runs.SUBMIT_UNKNOWN)
+        r.contains("and it says why", out.detail, "declares no job total")
+        r.contains("while noting what pipefail does establish",
+                   out.detail, "no submission it ran failed")
+        nobody = _script(os.path.join(work, "nobody.sh"), total=None,
+                         pipefail=False, outdir=os.path.join(work, "n2"))
+        nlist = runs.declared_job_list(nobody)
+        nbefore = runs.job_list_state(nlist)
+        make_job_list(nlist, [("9", "a.s", "step/a.o", "")])
+        out = runs.reconcile(script=nobody, observation="ok", baseline=nbefore,
+                             after=runs.job_list_state(nlist))
+        r.equal("no total and no pipefail: nothing vouches for it",
+                out.status, runs.SUBMIT_UNKNOWN)
+
+        # -- a reported failure ------------------------------------------ #
+        # biomni's own wording, and the shape that matters: it returns stderr
+        # ONLY, so the "Submitted job with ID" lines are gone by this point and
+        # the job list is the sole surviving witness.
+        failed_obs = "Error running Bash script (exit code 1):\nsbatch: error\n"
+        r.truthy("a runner error is recognised", runs.execution_failed(failed_obs))
+        r.equal("a clean run is not", runs.execution_failed("all fine"), False)
+        r.equal("an observation nobody captured is neither",
+                runs.execution_failed(None), None)
+
+        pbefore = runs.job_list_state(listing)
+        with open(listing, "a") as f:
+            f.write("10\tg.s\t\tstep/g.o\n")
+        out = runs.reconcile(script=script, observation=failed_obs,
+                             baseline=pbefore, after=runs.job_list_state(listing))
+        r.equal("a failure with rows behind it is a partial submission",
+                out.status, runs.SUBMIT_FAILED)
+        r.equal("and the live jobs are counted", out.jobs_seen, 1)
+        r.check("a partial is never retry-safe", not out.retry_safe)
+
+        # -- THE ONE THAT MUST NOT BE INFERRED --------------------------- #
+        # A failure that added no rows still does not prove nothing was
+        # submitted: the sbatch and its `>>` are two statements, and a kill in
+        # between leaves a real job with nothing written down for it.
+        clean_before = runs.job_list_state(listing)
+        out = runs.reconcile(script=script, observation=failed_obs,
+                             baseline=clean_before, after=clean_before)
+        r.equal("a failure with no new rows is still a failure", out.status,
+                runs.SUBMIT_FAILED)
+        r.equal("with nothing counted", out.jobs_seen, 0)
+        r.check("and it is NOT declared safe to retry on that basis",
+                not out.retry_safe)
+        asked = runs.reconcile(script=script, observation=failed_obs,
+                               baseline=clean_before, after=clean_before,
+                               quiet=True)
+        r.truthy("only asking Slurm makes a retry safe", asked.retry_safe)
+        unknown_sched = runs.reconcile(script=script, observation=failed_obs,
+                                       baseline=clean_before, after=clean_before,
+                                       quiet=None)
+        r.check("a scheduler that could not be reached is not 'quiet'",
+                not unknown_sched.retry_safe)
+
+        # -- nothing established at all ----------------------------------- #
+        out = runs.reconcile(script=script, observation=None,
+                             baseline=clean_before, after=clean_before)
+        r.equal("no observation and no rows is unknown, never held or submitted",
+                out.status, runs.SUBMIT_UNKNOWN)
+        r.check("the word 'submitted' is never claimed for it",
+                out.status != runs.SUBMITTED)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _stale_submission_checks(r):
+    """A submission whose session never came back.
+
+    `submitting` is written before the command runs, so a process killed
+    mid-flight leaves one behind. resume()'s `finally` catches an exception; it
+    cannot catch a kill, a closed terminal or a rebooted login node -- and that
+    is exactly the case where a full pipeline may be on the cluster with
+    nothing on the record to say so.
+
+    Two properties are pinned here. The BASELINE MUST BE DURABLE, because it is
+    the one measurement that cannot be reconstructed afterwards; and a killed
+    session must still be resolvable from what is left on disk, including all
+    the way to `submitted` when the job list adds up.
+    """
+    r.section("a submission whose session never came back")
+    work = tempfile.mkdtemp(prefix="genpipe_stale_")
+    try:
+        reg = runs.Registry(work)
+        listing = os.path.join(work, "job_output",
+                               "DnaSeq.somatic_fastpass.job_list.2026-08-12T10.00.00")
+        script = _script(os.path.join(work, "cmd.sh"), total=3, outdir=work)
+        proposal = {"command": "bash cmd.sh", "script": "cmd.sh",
+                    "generated": "genpipes dnaseq -t somatic_fastpass -g cmd.sh",
+                    "slots": {"pipeline": "dnaseq"}}
+        reg.hold("killed", "chat-1", proposal, work)
+
+        before = runs.job_list_state(runs.declared_job_list(script))
+        reg.begin_submission("killed", workdir=work, baseline=before,
+                             script=script, since=1.0)
+
+        rec = reg.get("killed")
+        r.equal("the record moves before the command runs", rec["status"],
+                runs.SUBMITTING)
+        r.equal("and it is no longer offered for approval", reg.held(), [])
+        r.truthy("the baseline is on the record, not in a dead process's memory",
+                 rec.get("job_list_baseline"))
+        r.equal("recording the file it will watch",
+                rec["job_list_baseline"]["path"], listing)
+        r.equal("and the script it is checking against",
+                rec.get("submitted_script"), script)
+        r.equal("submitting() finds it", [x["name"] for x in reg.submitting()],
+                ["killed"])
+
+        # --- the process dies here. All three rows landed. ---------------- #
+        make_job_list(listing, [("1", "a.s", "step/a.o", ""),
+                                ("2", "b.s", "step/b.o", ""),
+                                ("3", "c.s", "step/c.o", "")])
+
+        # A later session, with no observation to read: the terminal that held
+        # it is gone. The job list is not.
+        reloaded = runs.Registry(work).get("killed")
+        outcome = runs.reconcile(
+            script=reloaded["submitted_script"], observation=None,
+            baseline=reloaded["job_list_baseline"],
+            after=runs.job_list_state(reloaded["job_list_baseline"]["path"]))
+        r.equal("3 of 3 rows settles it as submitted, with no exit status",
+                outcome.status, runs.SUBMITTED)
+        r.equal("and the count survives", outcome.jobs_seen, 3)
+        r.contains("saying what established it", outcome.detail,
+                   "from the job list alone")
+
+        # Fewer rows than promised is NOT promoted. The script may have been
+        # killed part way, which is precisely the dangerous case.
+        partial = runs.reconcile(
+            script=script, observation=None, baseline=before,
+            after={"path": listing, "rows": 2,
+                   "identity": (0, 1, 10)})
+        r.equal("2 of 3 rows stays unknown", partial.status, runs.SUBMIT_UNKNOWN)
+        r.check("and is never called retry-safe on a count alone",
+                not partial.retry_safe)
+
+        # Nor is a run with no declared total, however many rows appeared.
+        bare = _script(os.path.join(work, "bare2.sh"), total=None,
+                       outdir=os.path.join(work, "b2"))
+        blist = runs.declared_job_list(bare)
+        bbefore = runs.job_list_state(blist)
+        make_job_list(blist, [("9", "a.s", "step/a.o", "")])
+        out = runs.reconcile(script=bare, observation=None, baseline=bbefore,
+                             after=runs.job_list_state(blist))
+        r.equal("no declared total is still unknown after a crash",
+                out.status, runs.SUBMIT_UNKNOWN)
+
+        # Recording the outcome takes it out of submitting() for good.
+        reg.record_outcome("killed", outcome)
+        settled = runs.Registry(work).get("killed")
+        r.equal("the reconciled status is durable", settled["status"],
+                runs.SUBMITTED)
+        r.equal("nothing is left mid-submission",
+                runs.Registry(work).submitting(), [])
+        r.equal("and it is still not approvable", runs.Registry(work).held(), [])
+
+        # A stale record with no baseline at all -- written before the field
+        # existed -- must be answerable rather than crash. It cannot produce a
+        # delta, so it cannot be promoted.
+        reg.hold("ancient", "chat-2", proposal, work)
+        reg.update("ancient", status=runs.SUBMITTING)
+        old = runs.Registry(work).get("ancient")
+        r.equal("an old record normalises to no baseline",
+                old["job_list_baseline"], None)
+        out = runs.reconcile(script=script, observation=None, baseline=None,
+                             after=runs.job_list_state(listing))
+        r.equal("and cannot be promoted without one", out.status,
+                runs.SUBMIT_UNKNOWN)
+        r.equal("because no delta is computable", out.jobs_seen, None)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

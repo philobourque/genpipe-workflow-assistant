@@ -30,14 +30,17 @@ Run:  python tests/test_mock_pipeline.py
 Exit code is 0 if every scenario behaves as expected, 1 otherwise.
 """
 import os
+import subprocess
 import sys
 import shutil
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.messages import AIMessage
 from genpipe.cli import build_agent
+from genpipe import runs as runs_store
 
 
 class FakeLLM:
@@ -52,7 +55,18 @@ class FakeLLM:
     def invoke(self, messages):
         i = min(self.calls, len(self.script) - 1)
         self.calls += 1
+        if self.script[i] is BOOM:
+            # What an exhausted API key looked like on 2026-07-29, and the
+            # shape of anything else that kills a turn after the command has
+            # already run: a rate limit, a dropped connection, a Ctrl-C.
+            raise RuntimeError("Error code: 400 - credit balance is too low")
         return AIMessage(content=self.script[i])
+
+
+# A scripted turn that raises instead of replying. Used to fail the turn AFTER
+# the submission has executed, which is the only way to test that the record
+# survives the reporting.
+BOOM = object()
 
 
 # A harmless bash heredoc: writes a stub "GenPipes-shaped" script and a
@@ -68,6 +82,9 @@ GENERATE_STEP = (
     "cat > cmd.sh << 'EOF'\n"
     "#!/bin/bash\n"
     "echo mock-submission-ran\n"
+    # A durable side effect, so a test can assert the command really ran even
+    # when the turn that would have reported it never finished.
+    "echo ran >> mock-submission-ran\n"
     "EOF\n"
     "chmod +x cmd.sh\n"
     "</execute>"
@@ -116,6 +133,14 @@ def main():
 
         status = agent.resume("mock-approve", approved=True)
         expect("finishes after approval", status["status"], "done")
+        # The graph's shape is not the claim worth checking. What /approve says
+        # to a person now comes from the RECORD, because "done" is equally true
+        # of a thread that finished, one that died, and one that was never
+        # resumed -- see section C.
+        name = agent.registry.all()[0]["name"]
+        expect("and the run is no longer awaiting approval",
+               agent.registry.get(name)["status"] in
+               (runs_store.SUBMITTED, runs_store.SUBMIT_UNKNOWN), True)
 
         print("\n=== B. reject path ===")
         agent.llm = FakeLLM([GENERATE_STEP, SUBMIT_STEP,
@@ -125,6 +150,112 @@ def main():
 
         status = agent.resume("mock-reject", approved=False, feedback="not now")
         expect("finishes after rejection", status["status"], "done")
+
+        # ============================================================== #
+        print("\n=== C. an exception AFTER the submission ran ===")
+        # The 2026-07-29 defect, reproduced. The submission executes, then the
+        # turn that would have reported it dies -- on that day, an API credit
+        # error two graph nodes later. _record_submission sat after _drive()
+        # and was simply skipped, so 46 real jobs finished on Rorqual while the
+        # registry said `held` and kept offering /approve.
+        agent.llm = FakeLLM([GENERATE_STEP, SUBMIT_STEP, BOOM])
+        status = agent.run("mock task", thread_id="mock-boom")
+        expect("pauses at the gate", status["status"], "paused")
+        boom = agent.registry.held_for_thread("mock-boom")["name"]
+        raised = None
+        try:
+            agent.resume(boom, approved=True)
+        except Exception as e:                        # noqa: BLE001
+            raised = e
+        expect("the reporting turn really did fail", raised is not None, True)
+        expect("the submission really did run",
+               os.path.exists(os.path.join(workdir, "mock-submission-ran")), True)
+        record = agent.registry.get(boom)
+        expect("but the run is NOT left awaiting approval",
+               record["status"] != runs_store.HELD, True)
+        expect("and it is not offered for approval again",
+               boom in [h["name"] for h in agent.registry.held()], False)
+        expect("the outcome was recorded despite the exception",
+               record["status"] in (runs_store.SUBMITTED,
+                                    runs_store.SUBMIT_UNKNOWN,
+                                    runs_store.SUBMIT_FAILED), True)
+
+        # ============================================================== #
+        print("\n=== D. approving a run with nothing parked at the gate ===")
+        # Defect B. The thread above is now parked on an errored task rather
+        # than an interrupt -- exactly the state chat-0729-132543 was left in.
+        # resume() used to return the checkpoint's bare "done" here, and
+        # cli._cmd_approve printed "<name> · submitted" on the strength of it,
+        # having resumed nothing.
+        again = agent.resume(boom, approved=True)
+        expect("a second /approve reports that nothing was submitted",
+               again.get("submitted"), False)
+        expect("it is not dressed up as a completed turn",
+               again.get("status") == "done" and again.get("submitted") is not False,
+               False)
+
+        # ============================================================== #
+        print("\n=== E. a session killed mid-submission, resolved at startup ===")
+        # The gap the `finally` cannot close. An exception is caught; a SIGKILL,
+        # a closed terminal or a rebooted login node is not, and the record is
+        # left saying `submitting` about a session that ended days ago -- while
+        # a full pipeline may be sitting on the cluster.
+        #
+        # Simulated by doing exactly what resume() does up to the point of no
+        # return, then walking away: mark submitting with the baseline, run the
+        # command, and never reconcile.
+        agent.llm = FakeLLM([GENERATE_STEP, SUBMIT_STEP,
+                             "<solution>done</solution>"])
+        status = agent.run("mock task", thread_id="mock-killed")
+        expect("pauses at the gate", status["status"], "paused")
+        killed = agent.registry.held_for_thread("mock-killed")["name"]
+
+        script = agent._approved_script(agent.registry.get(killed))
+        baseline = runs_store.job_list_state(
+            runs_store.declared_job_list(script))
+        agent.registry.begin_submission(killed, workdir=workdir,
+                                        baseline=baseline, script=script,
+                                        since=time.time())
+        expect("the run is mid-submission and not approvable",
+               killed in [h["name"] for h in agent.registry.held()], False)
+        expect("and is visible as such",
+               killed in [x["name"] for x in agent.registry.submitting()], True)
+
+        # The command runs; the session does not come back to report it.
+        subprocess.run(["bash", os.path.join(workdir, "cmd.sh")],
+                       cwd=workdir, capture_output=True)
+
+        # Counted across the reconciliation, not absolutely: sections A and C
+        # ran the same stub, so the marker already has lines in it. What must
+        # not change is the count.
+        marker = os.path.join(workdir, "mock-submission-ran")
+        before_runs = open(marker).read().count("ran")
+
+        settled = agent.reconcile_stale()
+        expect("startup settles it", killed in settled, True)
+        after = agent.registry.get(killed)
+        expect("it is no longer mid-submission",
+               after["status"] != runs_store.SUBMITTING, True)
+        expect("and never silently returns to awaiting approval",
+               after["status"] != runs_store.HELD, True)
+        expect("nothing is left for a second pass",
+               agent.registry.submitting(), [])
+        # THE PROPERTY THAT MATTERS MOST HERE. Reconciling reads three things
+        # off disk and writes a status; it must never resume a graph or re-run
+        # a command. The stub appends one line per execution, so a retry would
+        # show up as an extra one.
+        expect("and nothing was resubmitted",
+               open(marker).read().count("ran"), before_runs)
+        expect("the outcome is recorded conservatively — this stub declares no "
+               "job total, so a clean exit cannot be checked",
+               after["status"], runs_store.SUBMIT_UNKNOWN)
+        # retry_safe is deliberately NOT asserted here: it is answered by
+        # asking the real scheduler, so it depends on what this machine's sacct
+        # says -- True on a quiet login node, None-and-therefore-False where
+        # there is no sacct at all. Both are correct; neither is a property of
+        # this code path. test_runs pins it exactly, with quiet= supplied.
+        expect("the evidence behind the verdict is on the record",
+               "retry_safe" in after and "outcome_detail" in after, True)
 
         print(f"\n{PASSED} passed, {FAILED} failed")
         return 0 if FAILED == 0 else 1

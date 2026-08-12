@@ -112,7 +112,13 @@ def main():
             r.section("running cmd.sh submits: real artifacts appear")
             code, out = sh("bash cmd.sh", work)
             r.equal("submission exits clean", code, 0)
-            r.contains("reports submitted job ids", out, "Submitted batch job")
+            # GenPipes' own wording, not sbatch's. The real script captures
+            # sbatch's "Submitted batch job N" into a variable
+            # (JOB_ID=$(sbatch ... | awk '{print $4}')) so it never reaches
+            # stdout, and then echoes this line itself. runs.submitted_ids()
+            # counts these, so the fake has to print the one that really
+            # appears -- confirmed against a real 46-job observation.
+            r.contains("reports submitted job ids", out, "Submitted job with ID:")
 
             job_output = os.path.join(work, "job_output")
             r.truthy("job_output/ created", os.path.isdir(job_output))

@@ -78,6 +78,33 @@ GONE = "gone"
 # Nothing was submitted; the record and the reason stay in /history.
 ABANDONED = "abandoned"
 
+# The three states that exist so this tool can stop guessing about the cluster.
+#
+# Before them a run had two homes after /approve -- `held`, which invites a
+# second approval for work already on the scheduler, and `submitted`, which
+# invites monitoring for jobs that may not exist. On 2026-07-29 a real run took
+# the first: 46 jobs were submitted and completed, the turn that would have
+# recorded them died on an API error, and the record still said `held` a
+# fortnight later. Both homes were lies, and the code picked whichever one the
+# exception happened to leave behind.
+#
+#   SUBMITTING      /approve was accepted and the command is running. Written
+#                   BEFORE the graph is resumed, so a process killed mid-flight
+#                   leaves this rather than nothing.
+#   SUBMIT_FAILED   execution ran and reported failure. Says nothing about what
+#                   reached the scheduler -- see reconcile()'s `retry_safe`.
+#   SUBMIT_UNKNOWN  the outcome could not be established. The honest state, and
+#                   the one that must never be quietly upgraded to either
+#                   neighbour.
+SUBMITTING = "submitting"
+SUBMIT_FAILED = "submit_failed"
+SUBMIT_UNKNOWN = "submit_unknown"
+
+# Statuses meaning "the command ran, or may have run". None of them may be
+# approved again, and every one of them wants reconciling against Slurm before
+# anything is retried.
+AFTER_APPROVAL = (SUBMITTING, SUBMITTED, SUBMIT_FAILED, SUBMIT_UNKNOWN)
+
 # GenPipes version whose `tools log_report` we call. Same pin as genpipes.md.
 GENPIPES_MODULE = "mugqic/genpipes/6.1.1"
 
@@ -329,6 +356,70 @@ class Registry:
         base.update(fields)
         return self._append(base)
 
+    def begin_submission(self, name, workdir=None, baseline=None, script=None,
+                         since=None):
+        """Mark a run as being submitted, BEFORE the command is allowed to run.
+
+        The record has to change before the irreversible act, not after it. A
+        process killed between the two leaves `submitting`, which is visibly
+        unfinished and asks to be reconciled -- where leaving `held` would
+        invite a second approval of work that may already be on the scheduler.
+
+        THE BASELINE IS PERSISTED HERE, and that is what makes the reconciling
+        possible at all after a crash. It was previously a local variable in
+        agent.resume(): if the process died mid-submission, the one measurement
+        that says which job rows belong to THIS approval died with it, and a
+        later reconciliation could only ever answer "unknown" -- for a run that
+        may have put a full pipeline on the cluster. A snapshot of a file is
+        cheap to store and impossible to reconstruct afterwards, so it goes on
+        the record next to the status it justifies.
+        """
+        fields = {"status": SUBMITTING, "submitted_at": _now()}
+        if workdir:
+            fields["workdir"] = workdir
+        if baseline is not None:
+            fields["job_list_baseline"] = baseline
+        if script:
+            fields["submitted_script"] = script
+        if since is not None:
+            fields["submitted_since"] = float(since)
+        return self.update(name, **fields)
+
+    def submitting(self):
+        """Runs recorded as mid-submission. Normally empty.
+
+        A record only stays here if the process died between `/approve` and the
+        reconciliation in resume()'s `finally` -- a kill, a closed terminal, a
+        node reboot. See agent.reconcile_stale(), which is what empties it.
+        """
+        return [r for r in self.live() if r["status"] == SUBMITTING]
+
+    def record_outcome(self, name, outcome, workdir=None, proposal=None):
+        """Write what reconcile() established. The only way a run becomes
+        `submitted`, and the only way it stops being `submitting`.
+
+        The evidence is stored alongside the verdict -- how many rows this
+        approval added, how many the script promised, whether the scheduler was
+        asked and found quiet -- because "submitted" on its own is the claim
+        that was being made without proof, and the next reader deserves to see
+        what it rests on.
+        """
+        fields = {
+            "status": outcome.status,
+            "jobs_seen": outcome.jobs_seen,
+            "expected_jobs": outcome.expected,
+            "retry_safe": bool(outcome.retry_safe),
+            "outcome_detail": outcome.detail or "",
+            "reconciled_at": _now(),
+        }
+        if outcome.job_list and os.path.exists(outcome.job_list):
+            fields["job_list"] = outcome.job_list
+        if workdir:
+            fields["workdir"] = workdir
+        if proposal:
+            fields["proposal"] = proposal
+        return self.update(name, **fields)
+
     def track(self, name, job_list):
         """Register a run launched outside the agent -- no thread, no gate, no
         conversation -- so it can be checked and analysed by name like any other."""
@@ -500,7 +591,11 @@ class Registry:
         """
         changed = False
         for r in records:
-            if r["status"] != SUBMITTED or not r["job_list"]:
+            # Any run that got as far as running its command and left a job
+            # list behind, not only a cleanly submitted one: a partial or
+            # unreconciled submission whose artifacts were purged is just as
+            # gone, and leaving it in /list forever was the same bug.
+            if r["status"] not in AFTER_APPROVAL or not r["job_list"]:
                 continue
             if not os.path.exists(r["job_list"]):
                 r["status"] = GONE
@@ -529,6 +624,20 @@ def _normalise(record):
     record.setdefault("proposal", None)
     record.setdefault("gone", False)
     record.setdefault("hidden", False)
+    # Submission evidence. Absent on every record written before reconcile()
+    # existed, and absent is not zero: `jobs_seen` None means nobody counted,
+    # which is exactly right for a run recorded when nothing did.
+    record.setdefault("jobs_seen", None)
+    record.setdefault("expected_jobs", None)
+    record.setdefault("retry_safe", False)
+    record.setdefault("outcome_detail", "")
+    # The measurement taken before an approved command ran, kept so a crash
+    # between /approve and the reconciliation can still be resolved. Absent on
+    # every record written before it existed, and absent means "no baseline",
+    # which rows_added() reads as "cannot be established" rather than zero.
+    record.setdefault("job_list_baseline", None)
+    record.setdefault("submitted_script", None)
+    record.setdefault("submitted_since", None)
     if "status" not in record:
         record["status"] = GONE if record["gone"] else SUBMITTED
     # Keep the two representations agreeing, whichever way the record arrived.
@@ -656,6 +765,392 @@ def find_job_list(workdir, since, output_dir=None, script=None):
             except OSError:
                 continue
     return max(found, key=os.path.getmtime) if found else None
+
+
+# ===========================================================================
+#  Did the submission happen? The evidence, and what it is worth.
+#
+#  Everything in this section exists to answer one question mechanically, so
+#  that no model is ever asked "did you submit?" and no exception can turn a
+#  real submission into a lost one.
+#
+#  WHAT THE EXECUTION LAYER ACTUALLY GIVES US, verified against biomni 0.0.8
+#  and against five real generated scripts (dnaseq somatic_fastpass, dnaseq
+#  germline_sv, ampliconseq):
+#
+#    biomni's run_bash_script returns `result.stdout` on success, and on
+#    failure returns "Error running Bash script (exit code N):\n{stderr}"
+#    -- DISCARDING STDOUT. So on the failure path every "Submitted job with
+#    ID:" line is destroyed by the runner. That is why the job list on disk,
+#    not the observation, is the authority on what was submitted: GenPipes
+#    appends to it with >> immediately after each sbatch, so a run that died
+#    half way leaves the rows for the jobs it did create.
+#
+#    The scripts open with `set -eu -o pipefail` and submit with
+#        JOB_ID=$(sbatch $SUBMISSION_FILE | awk '{print $4}')
+#    A command substitution inside a pipeline. `pipefail` is the single token
+#    that makes a failed sbatch abort the script: without it awk exits 0, the
+#    pipeline exits 0, the failure is invisible and the script runs to
+#    completion emitting an EMPTY job id. Verified both ways. It is present in
+#    every script seen so far -- and it is written by GenPipes, not by us, so
+#    it is checked rather than assumed, and exit 0 is never trusted on its own.
+# ===========================================================================
+
+# `# TOTAL: 46 jobs`, from the header GenPipes writes above every script. The
+# script's own count of what it intends to submit, which is what makes "exit 0"
+# checkable instead of merely hopeful.
+_TOTAL_JOBS = re.compile(r"^#\s*TOTAL:\s*(\d+)\s+jobs?\s*$", re.M)
+
+# The four header assignments that decide where the job list lands. All literal
+# in the header except for the $-references between them, which resolve against
+# each other and nothing else.
+_HEADER_VAR = re.compile(r"^\s*(OUTPUT_DIR|JOB_OUTPUT_DIR|TIMESTAMP|JOB_LIST)="
+                         r"(\S+)\s*$", re.M)
+
+# What biomni prints instead of the output when the block exits non-zero. A
+# string in a pinned dependency, so it is matched loosely and, more to the
+# point, is never the only thing consulted -- reconcile() also requires the job
+# count to agree with the script's declared total before it will say SUBMITTED.
+_RUNNER_ERROR = re.compile(r"Error running Bash script \(exit code\s*(\d+)")
+
+# `Submitted job with ID: 17784414`. The id is captured separately because an
+# EMPTY one is itself a finding: it is what a failed sbatch leaves behind in a
+# script that lacks pipefail, and counting it as a submission would turn the
+# one case exit-status cannot see into a false success.
+_SUBMITTED_LINE = re.compile(r"^\s*Submitted job with ID:\s*(\S*)\s*$", re.M)
+
+
+def _header(script):
+    """The literal header assignments of a generated script, as a dict."""
+    if not script or not os.path.exists(script):
+        return {}
+    try:
+        with open(script) as f:
+            head = f.read(8192)
+    except OSError:
+        return {}
+    return {m.group(1): m.group(2).strip("\"'")
+            for m in _HEADER_VAR.finditer(head)}
+
+
+def declared_job_list(script):
+    """The exact job list path a generated script will append to, or None.
+
+    Resolved from the script's own header rather than found by globbing, and
+    that is what makes a BASELINE possible: the file has to be identified
+    before the submission runs, and find_job_list() cannot do that because it
+    selects on a modification time that has not happened yet.
+
+    It matters for a second reason. The TIMESTAMP is baked in at generation
+    time, so re-running one script appends to ONE file -- a retry after a
+    partial failure lands in the same list as the attempt that failed. Without
+    a baseline those earlier rows would be counted as this approval's work.
+    """
+    head = _header(script)
+    listed = head.get("JOB_LIST")
+    if not listed:
+        return None
+    resolved = listed
+    for _ in range(4):                     # OUTPUT_DIR -> JOB_OUTPUT_DIR -> JOB_LIST
+        before = resolved
+        for key in ("JOB_OUTPUT_DIR", "OUTPUT_DIR", "TIMESTAMP"):
+            if head.get(key):
+                resolved = resolved.replace(f"${key}", head[key])
+                resolved = resolved.replace(f"${{{key}}}", head[key])
+        if resolved == before:
+            break
+    if "$" in resolved:                    # an unresolved reference is not a path
+        return None
+    if not os.path.isabs(resolved):
+        base = head.get("OUTPUT_DIR") or os.path.dirname(os.path.abspath(script))
+        resolved = os.path.join(base, resolved)
+    return os.path.normpath(resolved)
+
+
+def expected_jobs(script):
+    """How many jobs the script says it will submit, or None if it does not say.
+
+    None is not zero and must never be treated as it: a script whose header
+    could not be read gives no basis for saying a submission was complete.
+    """
+    if not script or not os.path.exists(script):
+        return None
+    try:
+        with open(script) as f:
+            head = f.read(8192)
+    except OSError:
+        return None
+    m = _TOTAL_JOBS.search(head)
+    return int(m.group(1)) if m else None
+
+
+def has_pipefail(script):
+    """Whether the script's `set` line makes a failed sbatch abort it.
+
+    Consulted so that "exit 0" is believed only where the script's own
+    semantics support it. Where it is absent, a clean exit proves nothing and
+    reconcile() falls through to the job count instead.
+    """
+    head = _header(script) if script else {}
+    if not head and not (script and os.path.exists(script)):
+        return False
+    try:
+        with open(script) as f:
+            text = f.read(8192)
+    except OSError:
+        return False
+    return bool(re.search(r"^\s*set\s+-[a-z]*e[a-z]*\s+-o\s+pipefail", text, re.M)
+                or re.search(r"^\s*set\s+-o\s+pipefail", text, re.M))
+
+
+def job_list_state(path):
+    """A snapshot of one job list: (rows, identity), for comparing later.
+
+    `identity` is (device, inode, size). It is carried so that a file REPLACED
+    between the two readings -- a different run writing the same path, a
+    cleanup, a restore -- is detected rather than silently differenced, and so
+    that a file that got SMALLER cannot yield a negative count.
+
+    A path that does not exist yet is a legitimate baseline: rows 0, identity
+    None. That is the ordinary case for a first submission.
+    """
+    if not path:
+        return {"path": None, "rows": 0, "identity": None}
+    try:
+        st = os.stat(path)
+        identity = (st.st_dev, st.st_ino, st.st_size)
+    except OSError:
+        return {"path": path, "rows": 0, "identity": None}
+    rows = sum(1 for job in parse_job_list(path) if job.job_id)
+    return {"path": path, "rows": rows, "identity": identity}
+
+
+def rows_added(baseline, after):
+    """Job rows this approval is responsible for, or None if that is not knowable.
+
+    The delta, never the absolute count. GenPipes appends, an output directory
+    is routinely reused, and a retry of the same script writes into the same
+    file -- so the rows already present when /approve was typed belong to
+    somebody else's submission and must not be credited to this one.
+
+    Returns None rather than a number whenever the comparison is unsound:
+
+      the two readings are of different files   (inode or device changed)
+      the file shrank                           (replaced, truncated, rotated)
+      no path could be identified at all
+
+    None means "cannot be established", which reconcile() reads as unknown --
+    never as zero.
+    """
+    if not baseline or not after:
+        return None
+    if not baseline.get("path") or baseline.get("path") != after.get("path"):
+        return None
+    before_id, after_id = baseline.get("identity"), after.get("identity")
+    if before_id and after_id:
+        if before_id[:2] != after_id[:2]:      # different file at the same path
+            return None
+        if after_id[2] < before_id[2]:         # shrank
+            return None
+    delta = after.get("rows", 0) - baseline.get("rows", 0)
+    return delta if delta >= 0 else None
+
+
+def execution_failed(observation):
+    """Did the runner report a non-zero exit? True/False, or None if unreadable.
+
+    None for an observation we never captured, which is a different thing from
+    a clean run and is classified as such.
+    """
+    if observation is None:
+        return None
+    return bool(_RUNNER_ERROR.search(str(observation)))
+
+
+def submitted_ids(observation):
+    """Non-empty job ids the submission announced.
+
+    Success-path corroboration only, and deliberately not the primary count:
+    biomni discards stdout when the block exits non-zero, so on exactly the
+    partial-submission path these lines do not survive to be counted.
+
+    An empty id after the label is not counted, and that omission is the point:
+    `Submitted job with ID:` with nothing after it is what a failed sbatch
+    leaves in a script without pipefail.
+    """
+    if not observation:
+        return []
+    return [m.group(1) for m in _SUBMITTED_LINE.finditer(str(observation))
+            if m.group(1)]
+
+
+def scheduler_quiet_since(since, user=None):
+    """True if Slurm shows no jobs for this user since `since`. None if unknown.
+
+    The ONLY admissible evidence that a retry cannot double-submit. It exists
+    because a job list with no new rows does not prove no job was created:
+    GenPipes runs `sbatch` and appends the row as two separate statements, and
+    a kill, a full disk or a quota rejection in between leaves a real job on
+    the scheduler with nothing written down for it.
+
+    Deliberately over-broad -- it asks about the user, not about this run,
+    because a run whose rows were never written has no ids to ask about. An
+    unrelated job submitted in the same window therefore reports "not quiet",
+    which suppresses an offer to retry. That is the safe direction: the cost is
+    one manual check, and the cost of the other direction is submitting a
+    pipeline twice.
+
+    None (sacct missing, unreachable, or erroring) is never read as quiet.
+    """
+    try:
+        start = datetime.datetime.fromtimestamp(float(since))
+    except (TypeError, ValueError, OSError):
+        return None
+    who = user or os.environ.get("USER") or ""
+    if not who:
+        return None
+    raw, code = _run(
+        f"sacct -u {who} -S {start:%Y-%m-%dT%H:%M:%S} "
+        f"--parsable2 --noheader --format=JobID 2>/dev/null")
+    if code != 0:
+        return None
+    for line in raw.splitlines():
+        line = line.strip()
+        # Top-level ids only; `12345.batch` is an accounting row for one of them.
+        if line and "." not in line:
+            return False
+    return True
+
+
+class Outcome:
+    """What reconcile() decided, and the evidence it decided from."""
+
+    __slots__ = ("status", "jobs_seen", "expected", "job_list", "retry_safe",
+                 "detail")
+
+    def __init__(self, status, jobs_seen=None, expected=None, job_list=None,
+                 retry_safe=False, detail=""):
+        self.status = status
+        self.jobs_seen = jobs_seen
+        self.expected = expected
+        self.job_list = job_list
+        self.retry_safe = bool(retry_safe)
+        self.detail = detail
+
+    def __repr__(self):
+        return (f"<Outcome {self.status} jobs={self.jobs_seen}/{self.expected} "
+                f"retry_safe={self.retry_safe}>")
+
+
+def reconcile(script=None, observation=None, baseline=None, after=None,
+              quiet=None):
+    """Classify what an approved submission actually did. Pure, no IO.
+
+    Every argument is evidence gathered elsewhere, so this is testable without
+    a cluster and cannot be wrong about something it did not look at.
+
+        script       the approved script, for its declared total and its `set`
+                     line. None where it could not be read.
+        observation  what the execute node returned, or None if never captured.
+        baseline     job_list_state() taken BEFORE the submission ran.
+        after        job_list_state() taken after.
+        quiet        scheduler_quiet_since(), or None. Positive evidence only.
+
+    THE RULE THIS IS ARRANGED AROUND: exit 0 is never sufficient on its own.
+    It is accepted only when the number of job rows this approval added equals
+    the number the script said it would submit. That is what catches the case
+    exit status structurally cannot see -- a script without pipefail, whose
+    failed sbatch leaves it running to a clean exit having submitted fewer jobs
+    than it meant to.
+
+    And the mirror of it: a failure with no new rows is NOT evidence that
+    nothing reached Slurm, so `retry_safe` is never inferred from a count. It
+    is true only when the scheduler itself was asked and came back empty.
+    """
+    failed = execution_failed(observation)
+    expected = expected_jobs(script)
+    added = rows_added(baseline, after)
+    path = (after or baseline or {}).get("path")
+    ids = submitted_ids(observation)
+    safe = quiet is True
+
+    # Nothing was captured and nothing was written. This is the shape a turn
+    # takes when it died before the command ran -- but it is also the shape it
+    # takes when the command ran and the process was killed before either the
+    # observation or the append landed, so it is unknown rather than harmless.
+    if failed is None and not added and not ids:
+        return Outcome(SUBMIT_UNKNOWN, jobs_seen=added, expected=expected,
+                       job_list=path, retry_safe=safe,
+                       detail="the outcome of the submission was never "
+                              "established")
+
+    # NO OBSERVATION, BUT THE JOB LIST ADDS UP. The shape a killed process
+    # leaves behind: the exit status is gone with the terminal, and the job
+    # list is still on disk.
+    #
+    # This is a promotion without an exit status, so it is worth being explicit
+    # about why it is not a guess. GenPipes appends a row only AFTER the sbatch
+    # that created that job returned, so N rows is direct evidence of N
+    # successful submissions; `# TOTAL: N` is the script's own statement of how
+    # many it intended. The two together say every intended submission
+    # occurred, which is the same standard the exit-status path is held to --
+    # the exit status simply is not the thing that establishes it.
+    #
+    # Requires a real declared total and an exact match. Fewer rows than
+    # promised, more than promised, or no total at all all fall through to
+    # unknown below.
+    if failed is None and expected is not None and added == expected and added:
+        return Outcome(SUBMITTED, jobs_seen=added, expected=expected,
+                       job_list=path,
+                       detail="established from the job list alone — the "
+                              "session that submitted it did not survive to "
+                              "report back")
+
+    if failed:
+        return Outcome(SUBMIT_FAILED, jobs_seen=added, expected=expected,
+                       job_list=path, retry_safe=safe,
+                       detail="the submission command reported a failure")
+
+    if failed is False:
+        if expected == 0 and not added:
+            return Outcome(SUBMITTED, jobs_seen=0, expected=0, job_list=path,
+                           detail="no jobs — everything was already up to date")
+        if expected is not None and added == expected:
+            # The ONLY route to SUBMITTED on a non-empty run: the script said
+            # how many jobs it would submit, and exactly that many rows
+            # appeared. Two independent facts agreeing.
+            return Outcome(SUBMITTED, jobs_seen=added, expected=expected,
+                           job_list=path, detail="")
+        # Clean exit that cannot be checked, or that does not add up.
+        #
+        # PIPEFAIL IS NOT ENOUGH ON ITS OWN, and this used to promote on it.
+        # `set -e -o pipefail` establishes that no sbatch the script actually
+        # RAN returned non-zero -- it establishes nothing about whether the
+        # script contained every submission it was supposed to. A truncated
+        # generation, a step loop that emitted no sbatch at all, or a script
+        # this tool has never seen the shape of all exit 0 having submitted
+        # less than intended. Without a declared total there is no second fact
+        # to check the exit status against, so the honest answer is that the
+        # outcome is unestablished.
+        #
+        # pipefail is still worth SAYING, because it changes what the person
+        # should suspect: with it, whatever did run ran cleanly.
+        if expected is None:
+            why = ("the script declares no job total, so a clean exit cannot "
+                   "be checked for completeness")
+            if has_pipefail(script):
+                why += " (it does use pipefail, so no submission it ran failed)"
+        else:
+            why = (f"the run reported success but "
+                   f"{added if added is not None else 'an unknown number'} of "
+                   f"{expected} jobs were recorded")
+        return Outcome(SUBMIT_UNKNOWN, jobs_seen=added, expected=expected,
+                       job_list=path, retry_safe=safe, detail=why)
+
+    # An observation we could not classify, with rows or ids to show for it.
+    return Outcome(SUBMIT_UNKNOWN, jobs_seen=added, expected=expected,
+                   job_list=path, retry_safe=safe,
+                   detail="the outcome of the submission could not be read")
 
 
 def parse_job_list(path):
@@ -1378,6 +1873,11 @@ def list_bucket(record, status):
     """
     if record.get("status") == HELD:
         return HELD_BUCKET
+    # Checked before `status is None`, which would otherwise file an unresolved
+    # submission under FINISHED and report a run that may have half a pipeline
+    # on the cluster as though it had completed cleanly.
+    if record.get("status") in (SUBMITTING, SUBMIT_FAILED, SUBMIT_UNKNOWN):
+        return ATTENTION_BUCKET
     if status is None:
         return FINISHED_BUCKET
     if status.source == "unavailable":

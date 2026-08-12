@@ -639,18 +639,25 @@ def _cmd_approve(agent, args):
     if not args:
         display.problem("usage: /approve <name>")
         return
-    # resume() renders each step as it streams, but reports its outcome only as
-    # a returned status dict -- the old raw Python REPL printed returned values
-    # for free, and this loop doesn't, so the confirmation is explicit here.
+    # THE CONFIRMATION COMES FROM THE RECORD, NEVER FROM THE GRAPH.
     #
-    # Conditional on the outcome, which it was not: /approve on a name that does
-    # not exist printed "No run named 'rn'" and then, two lines later, "rn ·
-    # submitted". A confirmation that appears whatever happened is worse than
-    # none, because this is the one message that says something reached Slurm.
+    # This used to read `if status["status"] == "done"`, and "done" means only
+    # that the graph is not paused. It is true of a thread that finished, of one
+    # that died, and of one that was never resumed at all -- so /approve printed
+    # "<name> · submitted" for runs it had not touched. Meanwhile the run that
+    # really did submit 46 jobs on 2026-07-29 was never marked at all.
+    #
+    # agent.resume() now reconciles in a `finally` and writes what actually
+    # happened, so the honest thing to report is what it wrote.
+    name = args[0]
     with ui.Activity("submitting") as act:
-        status = agent.resume(args[0], approved=True, on_step=_narrate(act))
-    if (status or {}).get("status") == "done":
-        display.post_approve(args[0], True)
+        status = agent.resume(name, approved=True, on_step=_narrate(act))
+    if (status or {}).get("submitted") is False:
+        return                       # resume() has already said why
+    record = agent.registry.get(name) or {}
+    if record.get("status") == runs_store.HELD:
+        return                       # never resumed; resume() explained it
+    display.post_approve(name, record)
 
 
 def _cmd_reject(agent, args):
@@ -2618,6 +2625,12 @@ def main(argv=None):
     # startup. The visit is still recorded, so "unseen since you were last
     # here" stays meaningful for whatever asks later.
     agent.registry.mark_seen()
+    # Runs left mid-submission by a session that never came back. Almost always
+    # nothing, and silent when it is -- but this is the one startup check that
+    # can be holding news about work already on the cluster, so it runs before
+    # the prompt rather than waiting for somebody to type /list. It reads three
+    # things off disk and writes a status; it never retries anything.
+    agent.reconcile_stale()
     # Environment problems that only surface at submit time, surfaced now --
     # blockers only.
     #
