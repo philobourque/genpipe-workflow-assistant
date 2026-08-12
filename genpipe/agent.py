@@ -283,6 +283,19 @@ name what it is about. Do NOT write out the available options -- they are filled
 in from this tool's own tables, and any list you write would be ignored or,
 worse, wrong.
 
+THE WORDING IS YOURS. Add question= to a slot ask whenever you can put it
+better than a generic form would, and you usually can, because you know what
+this conversation is about and a fixed phrase does not:
+
+<execute>
+ask(slot="protocol", pipeline="dnaseq",
+    question="You have matched normals, so this is a paired somatic run. Quick pass, or the ensemble?")
+</execute>
+
+The options underneath stay exactly what the tables say, so a better question
+cannot introduce a protocol that does not exist. Leave question= off and you
+get the plain form, which is fine when the plain form is what you meant.
+
 For anything with no slot of its own, ask in your own words:
 
 <execute>

@@ -170,6 +170,49 @@ r.equal("a slotless, questionless ask has nothing to render",
 r.equal("and a protocol for a pipeline that takes none has nothing to ask",
         slots.gap_for("protocol", pipeline="covseq"), None)
 
+# ---------------------------------------------------------------------- #
+# THE WORDING IS THE AGENT'S; THE OPTIONS ARE THE TABLE'S.
+#
+# This used to be the other way round for any known slot -- the model's
+# question= was discarded, on the grounds that the table's phrasing was the
+# phrasing CI checks. That made CI the reason somebody got a worse question:
+# "Which dnaseq protocol?" is fine alone and useless as the third turn of a
+# conversation about tumour/normal pairs.
+#
+# What must NOT move with it is the option set. A model can phrase a question
+# better than a constant; it cannot be trusted to enumerate seven protocols
+# without eventually offering an eighth.
+asked = ("You have matched normals, so this is a paired somatic run. "
+         "Quick pass, or the ensemble?")
+gap = slots.gap_for("protocol", pipeline="dnaseq", question=asked)
+r.equal("the model's wording is used for a known slot", gap.question, asked)
+r.equal("while the options still come from the table",
+        [o.value for o in gap.options],
+        [p.name for p in slots.protocols("dnaseq")])
+r.equal("and free_text stays the table's call", gap.free_text, False)
+
+plain = slots.gap_for("protocol", pipeline="dnaseq")
+r.contains("no question= still gives the plain form", plain.question, "dnaseq")
+
+# A file slot keeps its factual note whoever worded the question -- the note is
+# a fact about GenPipes, not conversational framing.
+worded = slots.gap_for("design", pipeline="rnaseq", protocol="stringtie",
+                       question="Which contrasts file goes with these samples?")
+r.equal("a reworded file question keeps its wording", worded.question,
+        "Which contrasts file goes with these samples?")
+r.contains("and keeps the table's note", worded.note, "contrasts")
+r.equal("and stays free-text, because no table can list what is on disk",
+        worded.free_text, True)
+
+# Asking about a protocol without naming a pipeline is a different question --
+# the pipeline is the real gap -- so the wording written for the other one is
+# correctly dropped rather than pasted onto it.
+redirected = slots.gap_for("protocol", question="Which dnaseq protocol?")
+r.equal("a protocol ask with no pipeline redirects to the pipeline gap",
+        redirected.slot, "pipeline")
+r.check("and does not carry the wrong question with it",
+        redirected.question != "Which dnaseq protocol?")
+
 # gaps() and gap_for() must word the same question the same way -- they share
 # the builders precisely so that the sweep and a single ask cannot diverge.
 #

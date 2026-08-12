@@ -377,48 +377,76 @@ def gap_for(slot, pipeline=None, protocol=None, question=None,
     an eighth one and sound entirely confident doing it; a model asked only
     *when* to raise the question cannot.
 
-    `question` is the model's own wording. It is used as-is when there is no
-    slot -- an agent must be able to ask about things this table has never
-    heard of -- and ignored when there is one, because the table's wording is
-    the wording CI checks.
+    `question` is the model's own wording, and IT WINS when it is given.
+
+    That is a reversal. The wording used to be overridden for any known slot,
+    on the grounds that the table's phrasing was the phrasing CI checks -- which
+    made CI the reason a person got a worse question. "Which dnaseq protocol?"
+    is fine in isolation and useless as the third turn of a conversation about
+    tumour/normal pairs, where the model would have asked something like "you
+    have matched normals, so somatic_fastpass or somatic_ensemble -- which?".
+    The model can see the conversation; a constant cannot.
+
+    WHAT THE TABLE STILL OWNS, unconditionally, is everything a model can be
+    confidently wrong about: the option set, whether free text is admissible,
+    and the factual note attached to a slot. A model asked to list dnaseq's
+    protocols will eventually list an eighth and sound certain doing it; a
+    model asked only how to PHRASE the question cannot invent a value. So the
+    safety property survives the change intact -- a badly worded protocol
+    question still cannot produce a protocol that does not exist.
 
     Returns None only when there is genuinely nothing to ask, which happens for
     exactly one case worth guarding: a protocol for a pipeline that takes none.
     """
+    gap = None
     if slot == "pipeline":
-        return _pipeline_gap()
-    if slot == "protocol":
+        gap = _pipeline_gap()
+    elif slot == "protocol":
         if not pipeline:
             # Asked about a protocol without saying whose. The pipeline is the
             # real gap, and answering it first is what the ordering in gaps()
-            # exists to enforce.
+            # exists to enforce. The model's wording is dropped with it: it was
+            # written for a different question than the one being asked.
             return _pipeline_gap()
-        return _protocol_gap(pipeline)
-    if slot == "readset":
-        return _readset_gap(readset_candidates)
-    if slot == "design":
-        return _design_gap(pipeline or "", protocol or "", design_candidates)
-    if slot == "pairs":
-        return _pairs_gap(pipeline or "", protocol or "", pairs_candidates)
-    if question:
+        gap = _protocol_gap(pipeline)
+    elif slot == "readset":
+        gap = _readset_gap(readset_candidates)
+    elif slot == "design":
+        gap = _design_gap(pipeline or "", protocol or "", design_candidates)
+    elif slot == "pairs":
+        gap = _pairs_gap(pipeline or "", protocol or "", pairs_candidates)
+    elif question:
         return Gap(None, question, (), free_text=True)
-    return None
+
+    if gap is not None and question:
+        gap.question = question
+    return gap
 
 
 def gaps(pipeline=None, protocol=None, readset=None, design=None, pairs=None,
          readset_candidates=(), design_candidates=(), pairs_candidates=()):
-    """Everything still missing, in the order it should be asked.
+    """Everything a run still lacks. A COMPLETENESS CHECK, not a script.
 
-    Order is deliberate: pipeline, then protocol, then the files the protocol
-    turns out to require. Asking for a pairs file before knowing the protocol
-    would sometimes be asking for a file the run does not use.
+    THIS DOES NOT DECIDE WHAT TO ASK, and the ordering below is a report order,
+    not an asking order. It used to be described as "the order it should be
+    asked", which is what a caller reaching for `gaps()[0]` would act on; that
+    caller is gone and must not come back. The agent decides what it is stuck
+    on, and resolves what it can by looking first.
+
+    The order is still worth keeping for the one thing it is used for: naming
+    what is absent in a refusal. A dependency-respecting list -- pipeline, then
+    protocol, then the files that protocol turns out to require -- reads
+    correctly, because mentioning a pairs file before the protocol is settled
+    describes a requirement that may not exist.
+
+    The one caller that matters is gate.build_proposal, on the way OUT: empty
+    means the proposal is executable, non-empty means it is refused and handed
+    back to the model with the slot names. Nothing watches this and advances on
+    it -- a run becomes READY because the agent proposed it and this did not
+    object, never because the count reached zero.
 
     The *_candidates arguments are real paths the caller found on disk. They
     become the numbered options; the free-text entry covers everything else.
-
-    Still used on the way in to a conversation (as a brief for the model) and
-    on the way out of one (as the gate's completeness check), even though the
-    questions themselves are now asked by the agent through gap_for().
     """
     found = []
 
