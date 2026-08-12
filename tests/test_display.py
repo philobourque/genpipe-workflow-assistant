@@ -18,6 +18,7 @@ Stdlib only, so it runs in CI.
 Run:  python tests/test_display.py
 """
 import io
+import re
 import sys
 from contextlib import redirect_stdout
 
@@ -32,7 +33,6 @@ def drawn(fn, *args, **kwargs):
     buf = io.StringIO()
     with redirect_stdout(buf):
         fn(*args, **kwargs)
-    import re
     return re.sub(r"\033\[[0-9;]*[A-Za-z]", "", buf.getvalue())
 
 
@@ -81,7 +81,15 @@ def main():
                   "pairs": None, "readset": "readset.tsv", "output_dir": None},
     }
     out = drawn(display.gate, proposal, "patient-42")
-    r.contains("announces the hold", out, "HOLD")
+    # READY TO SUBMIT, not HOLD, and not red. This screen is a decision point
+    # for a complete run, not a failure -- red-reverse framed the tool's
+    # ordinary successful path as something going wrong, and spent the colour
+    # that should mean "you cannot proceed" on the screen where you usually
+    # can. The irreversibility moved to the /approve line, in amber.
+    r.contains("announces that the run is ready", out, "READY TO SUBMIT")
+    r.contains("and names the run it is about", out, "patient-42")
+    r.contains("with the irreversible verb still marked", out,
+               "cannot be undone")
     r.contains("shows the command", out, "bash cmd.sh")
     r.contains("the protocol", out, "stringtie")
     r.contains("the steps", out, "1-5")
@@ -875,7 +883,8 @@ def main():
     r.contains("and rejected", held, "/reject")
     # No red banner: nothing is being ASKED here. A box that shouts at somebody
     # who typed a read-only command teaches them to ignore the shout.
-    r.check("but nothing is being demanded", "HOLD" not in held)
+    r.check("but nothing is being demanded",
+            "READY TO SUBMIT" not in held)
 
     sent = drawn(display.run_view, viewed, "pouletrun", "submitted")
     r.check("a submitted run cannot be approved again",
@@ -1185,6 +1194,50 @@ def main():
     r.contains("and points at the scheduler", murky, "squeue")
     r.contains("stating plainly that nothing was retried", murky,
                "Nothing was retried")
+
+    # ------------------------------------------------------------------ #
+    r.section("red means blocked, and nothing else")
+    # Red was carrying three meanings at once: the row being edited, a row that
+    # must be answered, and an environment blocker. The first is the commonest
+    # thing on the screen and is not a problem at all, so a person learned to
+    # read red as decoration -- on the two screens where it is the only signal
+    # that something is actually wrong.
+    #
+    # Asserted on RAW output, not the ANSI-stripped view, because the escape
+    # code IS the claim being made.
+    def painted(fn, *args, **kwargs):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            fn(*args, **kwargs)
+        return buf.getvalue()
+
+    healthy = painted(display.gate, proposal, "patient-42")
+    r.check("a complete run with no blockers draws no red at all",
+            display.RED not in healthy,
+            healthy[:400])
+    r.contains("the header is not an error colour", healthy, display.REVERSE)
+    r.contains("but the irreversible verb is amber", healthy, display.AMBER)
+
+    # A blocker is what red is for, and it must still be unmistakable.
+    class Finding:
+        variable, problem, fix = "RAP_ID", "is not set", "export RAP_ID=def-xyz"
+    blocked = painted(display.gate, proposal, "patient-42",
+                      blockers=[Finding()])
+    r.contains("an environment blocker is red", blocked, display.RED)
+    r.check("and withholds /approve", "/approve" not in
+            re.sub(r"\033\[[0-9;]*[A-Za-z]", "", blocked))
+
+    # The mirror's pending state: bold+underline, never red.
+    from genpipe import mirror as _mirror
+    m = _mirror.from_slots(proposal, name="patient-42")
+    rows = "\n".join(display.mirror_lines(m, pending=["protocol"]))
+    r.check("a row about to change is not red", display.RED not in rows, rows)
+    r.contains("it is underlined instead", rows, display.UNDER)
+    r.contains("and carries its own glyph", rows, "◆")
+
+    moved = "\n".join(display.mirror_lines(m, changed=["protocol"]))
+    r.contains("a row that has changed stays green", moved, display.GREEN)
+    r.check("and is still not red", display.RED not in moved, moved)
 
     return r.finish()
 

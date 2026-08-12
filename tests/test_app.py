@@ -11,7 +11,7 @@ That distinction is the point. Everything here is invisible to an API-level test
   * the banner, and dev mode announcing itself
   * the completion menu appearing as you type, and Tab finishing a command
   * the suggested run name being pre-filled and editable
-  * the gate's HOLD box, and /approve from the prompt
+  * the gate's READY TO SUBMIT box, and /approve from the prompt
   * /list, /jobs, /diagnose and /where actually being wired to their handlers
   * a pasted multi-line string NOT executing its first line as a command
 
@@ -349,7 +349,7 @@ def main():
         # immediately, so a trailing Enter would leak into whatever prompt comes
         # next -- which is the name prompt, whose suggestion is pre-filled.
         _answer_slot_panels(app, since=asked)
-        r.check("reaches the gate", app.wait_for("HOLD", timeout=120,
+        r.check("reaches the gate", app.wait_for("READY TO SUBMIT", timeout=120,
                                                  since=asked),
                 app.text()[-800:])
         # Named here and only here, from what the run turned out to BE. Nobody
@@ -361,7 +361,9 @@ def main():
         r.check("and it was never asked for",
                 "name this run" not in app.emitted())
         screen = app.visible()
-        r.contains("says approval is required", screen, "requires approval")
+        # The irreversibility moved off the header and onto the verb that is
+        # actually irreversible, which is where a warning is read.
+        r.contains("says what approving does", screen, "cannot be undone")
         r.contains("shows the command to be approved", screen, "bash cmd.sh")
         r.contains("shows the protocol it parsed", screen, "stringtie")
         r.contains("offers the way to approve", screen, "/approve")
@@ -515,7 +517,7 @@ def main():
         app.line(f"run rnaseq stringtie steps 1-5, everything is in {workdir}")
         _answer_slot_panels(app, since=mark)
         r.check("the second run also reaches the gate",
-                app.wait_for("HOLD", timeout=120, since=mark),
+                app.wait_for("READY TO SUBMIT", timeout=120, since=mark),
                 app.text()[-800:])
         # A name has to identify exactly one run, because it is what /approve,
         # /check and /diagnose are given. The name is derived from the command, so a
@@ -525,13 +527,12 @@ def main():
         # what is being asserted is that the two differ, not what the second is
         # called, and the model's exact command is not this suite's business.
         #
-        # Read from the gate's `named <run>` line, not from the /approve line.
-        # The gate stopped spelling the run name beside its verbs once the
-        # prompt learned to complete it -- see display.gate -- so the name
-        # appears exactly once on that screen. It moved out of the flag table
-        # (where it sat wearing a "not a flag" disclaimer) and into the
-        # consequence lines at the top, which is what this now matches.
-        found = re.findall(r"named\s+(\S+)", app.emitted()[mark:])
+        # Read off the gate's headline. The name appears exactly once on that
+        # screen -- it moved out of the flag table (where it sat wearing a "not
+        # a flag" disclaimer), then out of the consequence lines, and is now the
+        # subject of the banner: READY TO SUBMIT <run>. That is where the thing
+        # being decided about belongs.
+        found = re.findall(r"READY TO SUBMIT\s+(\S+)", app.emitted()[mark:])
         second = found[-1] if found else None
         r.truthy("the second gate names a run", second)
         r.check("and it is not the first run's name", second != name,

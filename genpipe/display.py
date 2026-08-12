@@ -1295,9 +1295,12 @@ def defer_solution(on):
 # ---------------------------------------------------------------------------
 # The gate. The one moment the run stops and hands a decision to a human, so it
 # gets the loudest treatment on screen -- but "loudest" here means restraint, not
-# volume. HOLD is the only coloured word in the block, because it is the only
-# word that has to stop you. The command sits alone in whitespace because it is
-# the thing actually being approved, and nothing should compete with it.
+# volume. The banner is reversed rather than coloured -- READY TO SUBMIT is a
+# decision point, not a failure, and spending red on it left nothing to say
+# with when a run genuinely cannot proceed. The one amber thing on the screen
+# is the verb that cannot be undone. The command sits alone in whitespace
+# because it is the thing actually being approved, and nothing should compete
+# with it.
 #
 # No box, no borders, no rules. Whitespace does the framing. That keeps the
 # alignment from breaking on long paths, and it means the resume commands can be
@@ -1395,17 +1398,29 @@ def _mirror_state(row, active, pending, changed):
     whole point of the mirror is that somebody can SEE which line their cursor
     is about to change.
 
-        pending   selected, not yet applied. Red. Reads as "about to move".
+        pending   selected, not yet applied. Bold + underline.
         changed   applied, and this is the run coming back. Green.
         active    the row under the cursor. Bright. Implies nothing -- it is
                   where you are looking, not what you have chosen.
+
+    PENDING USED TO BE RED, and the docstring defended it as "reads as about to
+    move". It does not. Red was simultaneously carrying three meanings on these
+    screens -- the row you are editing, a row you are obliged to answer, and an
+    environment blocker that stops submission entirely -- so the one state that
+    is completely ordinary looked like the two that need attention. Editing a
+    field is not an error, and a screen where every edit glows red teaches
+    people to ignore the colour that means something is actually wrong.
+
+    Underline survives what colour does not: a screenshot, a light theme, a
+    colour-blind reader. So the change is more robust than what it replaces,
+    not merely calmer.
 
     Checked in that order, so a row that is both active and pending reads as
     pending: what a line is about to become matters more than where the cursor
     happens to be resting.
     """
     if row is not None and row in pending:
-        return RED, f"{RED}{BOLD}"
+        return WHITE, f"{BOLD}{UNDER}{WHITE}"
     if row is not None and row in changed:
         return GREEN, f"{GREEN}{BOLD}"
     if row is not None and row == active:
@@ -1486,8 +1501,10 @@ def _consequences(proposal, name):
     out.append(f"      {DIM}writes into {RESET}{WHITE}{where}{RESET}" if where else
                f"      {DIM}writes into {RESET}{AMBER}the current directory{RESET}"
                f"{DIM} — no -o was set{RESET}")
-    if name:
-        out.append(f"      {DIM}named {RESET}{WHITE}{name}{RESET}")
+    # The name used to be a third consequence line ("named test-now"). It is
+    # the headline's subject now -- READY TO SUBMIT <name> -- which is where
+    # the thing being decided about belongs, and printing it twice on the one
+    # screen whose job is to identify what you are launching was noise.
     return out
 
 
@@ -1519,7 +1536,10 @@ def mirror_lines(m, active=None, pending=(), changed=(), indent="      ",
         if not line.head and (line.row in hide or line.label in hide):
             continue
         tint, strong = _mirror_state(line.row, active, pending, changed)
-        mark = (f"{RED}●{RESET}" if line.row in pending else
+        # A different GLYPH per state, not only a different colour -- ◆ for a
+        # row about to move, ● for one that has. See _mirror_state for why red
+        # stopped being the pending colour.
+        mark = (f"{BOLD}◆{RESET}" if line.row in pending else
                 f"{GREEN}●{RESET}" if line.row in changed else
                 f"{GREEN}❯{RESET}" if line.row is not None and line.row == active
                 else " ")
@@ -1678,11 +1698,20 @@ def modify_panel(entries_of, changes=None, notes=None, required=None,
             moved = row in now
             open_here = row is not None and row == opened
 
-            # Three states and a default, each with a colour AND a marker, for
+            # Four states and a default, each with a colour AND a marker, for
             # the reason _mirror_state gives: colour alone is the first thing a
             # theme, a screenshot or a colour-blind reader flattens.
+            #
+            # RED IS RESERVED FOR THE ONE STATE THAT BLOCKS. The row being
+            # edited used to be red and the row you are OBLIGED to answer was
+            # red too, so the commonest thing on the screen looked identical to
+            # the only thing on it that stops you proceeding. Opening a row is
+            # not an error; being unable to regenerate without answering it is.
+            #
+            # So: bold+underline for the row you are in, red only for a row
+            # that must be answered before this change set can be applied.
             if open_here:
-                tint, strong = RED, f"{RED}{BOLD}"
+                tint, strong = WHITE, f"{BOLD}{UNDER}{WHITE}"
             elif moved:
                 tint, strong = GREEN, f"{GREEN}{BOLD}"
             elif row in must:
@@ -1692,7 +1721,7 @@ def modify_panel(entries_of, changes=None, notes=None, required=None,
             else:
                 tint, strong = DIM, ""
 
-            dot = (f"{RED}●{RESET}" if open_here
+            dot = (f"{BOLD}◆{RESET}" if open_here
                    else f"{GREEN}●{RESET}" if moved
                    else f"{RED}●{RESET}" if row in must else " ")
             arrow = f"{GREEN}❯{RESET}" if here else " "
@@ -1893,7 +1922,18 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     _flush_fold()
 
     print("\n")
-    print(f"  {RED}{REVERSE}{BOLD} HOLD {RESET}  {RED}{UNDER}submission requires approval{RESET}")
+    # READY TO SUBMIT, not HOLD, and not in red.
+    #
+    # Red-reverse reads as an error, and this is not one -- it is the moment a
+    # complete, correct run is waiting for a decision. Saying HOLD in the
+    # colour used for failed jobs and blocked environments framed the tool's
+    # ordinary successful path as something going wrong, and spent the one
+    # colour that should mean "you cannot proceed" on the screen where you
+    # usually can.
+    #
+    # The irreversibility has not been softened away with it: it has moved to
+    # where the irreversible thing actually is, in amber, on the /approve line.
+    print(f"  {REVERSE}{BOLD} READY TO SUBMIT {RESET}  {BOLD}{thread_id}{RESET}")
 
     # What this run DOES, before what it is spelled as. The flags are exact and
     # the box would be complete without this, but "8 samples" and "writes into
@@ -1964,7 +2004,10 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
         # part that only made sense when this state was routine.
         pass
     else:
-        print(_action("/approve", "submits to Slurm \u2014 cannot be undone"))
+        # The one irreversible verb on the screen, and the only amber on it.
+        # Amber where the risk actually is beats red across the whole header:
+        # a warning that covers everything marks nothing.
+        print(_action("/approve", f"{AMBER}submits to Slurm — cannot be undone{RESET}"))
 
     print(_action("/modify", "rewrites the command and asks you again"))
     print(_action("/reject", "abandons this run; nothing is submitted"))
@@ -1997,9 +2040,9 @@ def run_view(proposal, name, status, resources="", blockers=()):
     disagree, and the mirror's whole argument is that people know a GenPipes
     command by its shape.
 
-    What differs is the frame and the verbs. There is no red HOLD banner --
-    nothing is being asked here, and a box that shouts at somebody who typed a
-    read-only command teaches them to ignore the shout. The verbs come from the
+    What differs is the frame and the verbs. There is no READY TO SUBMIT
+    banner -- nothing is being asked here, and a box that announces a decision
+    to somebody who typed a read-only command teaches them to ignore it. The verbs come from the
     status, because offering /approve on a run that went to Slurm an hour ago
     is offering something that cannot happen.
     """
