@@ -407,6 +407,26 @@ def build_agent(path=None, llm=None, source=None):
                     "which one to use before generating a command that "
                     "submits.\n")
 
+    #    And the requirements table, generated from slots.py rather than
+    #    written into the document by hand.
+    #
+    #    The gate refuses a proposal that lacks a design or a pairs file, using
+    #    that table; until now the model could not read it, so it was being
+    #    judged against a constraint it had no way to have anticipated. Its
+    #    only route to the knowledge was to propose something and be told.
+    #
+    #    Generated, in this process, from the same objects gaps() consults --
+    #    so the facts the model is given and the check that enforces them are
+    #    incapable of disagreeing. A copy pasted into genpipes.md would be a
+    #    second source, and every second source in this project has eventually
+    #    drifted from the first.
+    #
+    #    FACTS, NOT A PROCEDURE. See slots.requirements_note for what is
+    #    deliberately left out of it: no step numbers, no ordering, no "ask for
+    #    this next", nothing that would turn a reference table back into the
+    #    deterministic questionnaire this project removed.
+    content += "\n\n" + slots.requirements_note()
+
     # 3. Register the grammar as software; this also reconfigures the agent, which is
     #    what rebuilds the gated graph. Biomni's add_software prints the full
     #    description it registers (a1.py:799) -- here, the entire grammar -- so
@@ -712,22 +732,34 @@ def _modify_direct(agent, name, change):
     _rework(agent, name, change, warnings=risks)
 
 
-def _step_risks(agent, name, change):
-    """Tier 3, for a change that mentions steps. Returns (risks, hard_stop).
+def _step_risks(agent, name, change, wanted=None):
+    """Tier 3, for a change that is actually about steps. Returns (risks, stop).
 
-    Only fires when the change actually names a step range -- reading --help
-    costs a subprocess and a module load, and paying that to validate a protocol
-    swap would put a two-second pause in front of every modify.
+    `wanted` is the range when the caller KNOWS it -- the guided panel and the
+    fork both do, because it came off a row. Prose does not, and reading a step
+    range out of a sentence is modify.steps_meant's job: it requires the
+    sentence to say "step"/"steps" or "-s", so a walltime of 24 hours is not
+    read as step 24. See _STEPS_MEANT for why that scoping is load-bearing.
+
+    Only fires when there is a range to check -- reading --help costs a
+    subprocess and a module load, and paying that to validate a protocol swap
+    would put a two-second pause in front of every modify.
+
+    The protocol is passed through, and that is not a detail: `genpipes dnaseq
+    --help` describes seven protocols whose step numbers all restart at 1 and
+    whose ranges run from 1-14 to 1-39. Validating against the wrong one is
+    worse than not validating at all.
     """
-    m = re.search(r"\b(\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)\b", change or "")
-    if not m or not modify.valid_steps(m.group(1)):
+    wanted = wanted or modify.steps_meant(change)
+    if not wanted:
         return [], None
     record = agent.registry.get(name) or {}
     values = (record.get("proposal") or {}).get("slots") or {}
-    help_text = agent.step_help(values.get("pipeline"), values.get("protocol"))
+    protocol = values.get("protocol") or slots.DEFAULTS.get(values.get("pipeline") or "")
+    help_text = agent.step_help(values.get("pipeline"), protocol)
     if not help_text:
         return [], None
-    return modify.step_risk(m.group(1), help_text)
+    return modify.step_risk(wanted, help_text, protocol)
 
 
 def _cmd_modify(agent, args):
@@ -742,15 +774,31 @@ def _cmd_modify(agent, args):
     still are -- but that is what a second VERB is for, not a confirmation
     screen on the first one. /fork keeps both. See _cmd_fork.
 
-    A SUBMITTED RUN IS REDIRECTED, NOT SILENTLY FORKED. This used to fork it
-    and say so afterwards, which was the right instinct when there was no other
-    way to get a variant: refusing outright made the commonest thing anybody
-    wants to do with a finished run -- run it again against a different readset
-    -- impossible. Now /fork exists and is tab-completable, so the redirect
-    costs one keystroke and buys /modify a single meaning. Rewriting a
-    submitted run in place stays forbidden for the reason abandon() and
-    rename() give: its name is tied to a job list and to jobs that may still be
-    on the scheduler.
+    A SUBMITTED RUN IS EDITED AND FORKED, not refused. Its name is still tied
+    to a job list and to jobs that may still be on the scheduler, so it is not
+    rewritten in place -- that stays forbidden for the reason abandon() and
+    rename() give. What changes is who does the work: the panel opens on the
+    submitted command, the edits are made there, and what comes out is a new run
+    with the original untouched.
+
+    This replaces a redirect to /fork, and the redirect was the wrong trade. It
+    was defended as costing one keystroke and buying /modify a single meaning,
+    but the meaning it bought was the wrong one -- /modify meant "rewrite this
+    record" when what a person means by it is "change this run". Both readings
+    produce a run with the change in it; only one of them makes the commonest
+    thing anybody does with a finished run -- run it again with one thing
+    different -- into an error message plus a re-typed command. The single
+    meaning survives intact and is better stated: /modify gives you a run with
+    your change in it. Whether that is this run or a copy is decided by whether
+    this one can still be rewritten, which is a fact about the run and not a
+    decision to hand back.
+
+    The name is asked at the END here, not up front as /fork asks it. That is
+    the difference between the two verbs now: /fork is "make me a copy", so the
+    name is the first thing you know and the collision has to be visible before
+    Enter; /modify is "change this", where the copy is a consequence of the
+    run's state, and being asked to name a variant before deciding what makes it
+    different is a question nobody can answer yet.
     """
     if not args:
         held = agent.registry.held()
@@ -777,11 +825,17 @@ def _cmd_modify(agent, args):
                 "It was found on disk rather than built here, so there is "
                 "nothing to copy. Describe the run you want instead.")
             return
-        display.problem(
-            f"'{name}' has already been through /approve — it is "
-            f"{record['status'].replace('_', ' ')}.",
-            f"Its name is tied to a job list, so it cannot be rewritten.  ·  "
-            f"/fork {name}" + (f" {' '.join(rest)}" if rest else ""))
+        # Said BEFORE the panel opens, not after the fork exists. Somebody
+        # typing /modify on a launched run is asking to change that run, and
+        # what they are about to get is a different one -- announcing it first
+        # turns a surprise into an answer, and it is the honest framing anyway:
+        # the original is not being edited, it is being copied from.
+        status = runs_store.resolve(record) if record.get("job_list") else None
+        display.forking_from(name, runs_store.list_tag(record, status))
+        if rest:
+            _fork_prose(agent, name, record, " ".join(rest))
+        else:
+            _modify_guided(agent, name, record, fork_as=True)
         return
 
     if rest:
@@ -846,15 +900,73 @@ def _cmd_fork(agent, args):
 
     change = " ".join(rest)
     if change:
-        request = modify.fork_prose(proposal, change)
-        agent._gate_note = {"warnings": [], "changed": []}
-        thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
-        with ui.Activity("building the variant") as act:
-            agent.run(request, thread, on_step=_narrate(act), name=new_name)
-        display.forked(name, new_name)
+        _fork_prose(agent, name, record, change, wanted=new_name)
         return
     # No prose: pick the changes in the panel, then fork with them.
     _modify_guided(agent, name, record, fork_as=new_name)
+
+
+def _standing(record):
+    """How to describe the run a variant was made FROM, once the variant exists.
+
+    "held" is true of a run still parked at the gate and of nothing else, and it
+    was the only thing display.forked could say. Forking from a launched run is
+    now the ordinary path (see _cmd_modify), so a confirmation reading "the
+    original is unchanged and still held" would be reassuring somebody about a
+    state their run left an hour ago -- and the whole reason to read that line
+    is to check nothing happened to the original.
+
+    The same words /list uses, via runs.list_tag: live, completed, needs
+    attention, status unavailable.
+    """
+    if not record or record.get("status") == runs_store.HELD:
+        return "held"
+    status = runs_store.resolve(record) if record.get("job_list") else None
+    return runs_store.list_tag(record, status)
+
+
+def _fork_prose(agent, name, record, change, wanted=None):
+    """Build a variant of `name` from a sentence, in its own conversation.
+
+    The prose half of forking, shared by /fork and by a /modify on a run that
+    has already been submitted. One function because they differ in exactly one
+    thing -- whether the new name is already known -- and two copies of a model
+    call that mints a run is two places for the thread id, the gate note or the
+    name to drift.
+
+    `wanted` is the name when the caller has already asked for it (/fork asks
+    before opening anything). Absent, it is asked here, which is the /modify
+    order: what the variant IS gets decided before what it is called.
+
+    No `changed` rows on the gate note. A prose fork has no row list -- the
+    person described the change in a sentence and the model decided which flags
+    that touches -- so there is nothing to mark green, and guessing would put a
+    tick beside a row that may not have moved.
+    """
+    proposal = record.get("proposal") or {}
+    if not wanted:
+        try:
+            wanted = ui.ask("What should the new run be called?",
+                            default=agent.registry.unique_name(name))
+        except (EOFError, KeyboardInterrupt):
+            return
+    verdict = modify.check("name", str(wanted or ""), proposal,
+                           registry=agent.registry)
+    if not verdict:
+        display.problem(verdict.message, f"'{name}' is unchanged.")
+        return
+    new_name = agent.registry.unique_name(str(wanted).strip())
+
+    request = modify.fork_prose(proposal, change)
+    if not request:
+        display.problem("There is no generation command to copy from.",
+                        "Describe the run you want instead.")
+        return
+    agent._gate_note = {"warnings": [], "changed": []}
+    thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
+    with ui.Activity("building the variant") as act:
+        agent.run(request, thread, on_step=_narrate(act), name=new_name)
+    display.forked(name, new_name, _standing(record))
 
 
 def _run_panel(agent, name, proposal, m, offered, candidates, changes,
@@ -1013,14 +1125,28 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
         # place the consequence appears -- and the two consequences are
         # genuinely different runs being written.
         if fork_as:
-            return (f"↑↓ · enter opens a row · d creates {fork_as} · "
+            # Named when the name is known, and described when it is not: a
+            # /modify on a submitted run forks because the original cannot be
+            # rewritten, and it asks what to call the variant after this panel
+            # closes. "creates a new run" is the honest version of that, and it
+            # still says the thing that matters -- this key does not touch the
+            # run whose command is on screen.
+            made = fork_as if isinstance(fork_as, str) else "a new run"
+            return (f"↑↓ · enter opens a row · d creates {made} · "
                     f"esc creates nothing")
         return ("↑↓ · enter opens a row · d applies to this run · "
                 "esc discards the changes")
 
+    # Digits are TEXT while a free-text row is open, and row selectors
+    # otherwise. Without this the steps row could not be filled in at all: its
+    # values are only ever digits, and every one of them fired Enter on another
+    # row. Scoped to rows with no choices, so `1-9 to pick` still works where
+    # it is advertised -- see keys() above, which draws exactly this
+    # distinction one line at a time.
     picked = ui.choose(question, options, free_text=False, draw=draw,
                        cursor=modify.cursor_of(entries(), "name"),
                        on_enter=on_enter, on_escape=on_escape, on_text=on_text,
+                       typing=lambda: bool(state["open"]) and not choices(),
                        note=keys)
     if state["out"]:
         return state["out"], state["row"]
@@ -1048,10 +1174,17 @@ def _modify_guided(agent, name, record, fork_as=None):
     an edit twice before the authorisation screen is not caution; it is three
     chances to lose track of which screen is the one that matters.
 
-    `fork_as` makes this build a SECOND run under that name instead of
-    replacing this one. It arrives from /fork, which asked for the name up
-    front -- see _cmd_fork for why the two are different verbs rather than a
-    question at the end of one.
+    `fork_as` makes this build a SECOND run instead of replacing this one. Two
+    shapes, because its two callers know different amounts:
+
+        a name   /fork, which asked for it before opening anything
+        True     /modify on a run that has already been submitted, where the
+                 fork is a consequence of the run's state rather than something
+                 anybody asked for. The name is asked once the changes are
+                 settled -- being asked to name a variant before deciding what
+                 makes it different is a question nobody can answer yet.
+
+    Falsy means rewrite this run in place, which only a held run allows.
     """
     proposal = record.get("proposal") or {}
     directory = record.get("workdir") or os.getcwd()
@@ -1159,7 +1292,19 @@ def _modify_guided(agent, name, record, fork_as=None):
         break
 
     if fork_as:
-        _fork_run(agent, name, record, proposal, changes, wanted=fork_as)
+        # `True` carries no name, and _fork_run asks for one when `wanted` is
+        # falsy -- which is exactly the /modify order, so nothing else is needed
+        # to make the two callers differ.
+        #
+        # Except for the `name` row, which the panel offers on every run. On a
+        # fork _fork_run pops it, because renaming belongs to the run being
+        # copied FROM and applying it there would rename the original as a side
+        # effect. That is right for /fork, where the new name was settled before
+        # the panel opened -- and silently wrong here, where the name has not
+        # been asked yet: somebody typing one into the row is naming the thing
+        # they are making, and dropping it would then ask them for it again.
+        wanted = fork_as if isinstance(fork_as, str) else changes.get("name")
+        _fork_run(agent, name, record, proposal, changes, wanted=wanted)
         return
     _apply_changes(agent, name, proposal, changes)
 
@@ -1248,16 +1393,21 @@ def _fill_resources(agent, name, proposal, directory):
             display.overrides(name, override.describe(sections), path)
             return override.write(path, sections, run=name)
 
-    help_text = agent.step_help(values.get("pipeline"), values.get("protocol"))
-    known = modify.steps_from_help(help_text)
-    # When --help cannot be reached the panel has no step list to offer and
-    # degrades to free text. It used to do that SILENTLY, which is how somebody
-    # faced with "its --help name, e.g. gatk_sam_to_fastq" and no list typed
-    # `--help` -- twice -- trying to get the thing the prompt was quoting. A
-    # step name is not something anybody knows by heart, and a prompt that
-    # cannot offer them owes an explanation for why.
+    protocol = (values.get("protocol")
+                or slots.DEFAULTS.get(values.get("pipeline") or ""))
+    help_text = agent.step_help(values.get("pipeline"), protocol)
+    status, known = modify.step_list(help_text, protocol)
+    # When there is no list the panel degrades to free text. It used to do that
+    # SILENTLY, which is how somebody faced with "its --help name, e.g.
+    # gatk_sam_to_fastq" and no list typed `--help` -- twice -- trying to get
+    # the thing the prompt was quoting.
+    #
+    # And then it did the opposite: it said "--help could not be read" about
+    # help that had been read in full and simply printed a shape the parser did
+    # not know. Both are unhelpful, and they call for different sentences, so
+    # the reason is passed through rather than inferred from an empty list.
     if not known:
-        display.no_step_list(values.get("pipeline"), values.get("protocol"))
+        display.no_step_list(values.get("pipeline"), protocol, status)
 
     while True:
         step = _ask_step(known, sections)
@@ -1422,7 +1572,7 @@ def _fork_run(agent, name, record, proposal, changes, wanted=None):
 
     risks = []
     if "steps" in changes:
-        risks, stop = _step_risks(agent, name, changes["steps"])
+        risks, stop = _step_risks(agent, name, "", wanted=changes["steps"])
         if stop:
             display.problem(stop, f"Nothing was changed; '{name}' is unchanged.")
             return
@@ -1431,7 +1581,7 @@ def _fork_run(agent, name, record, proposal, changes, wanted=None):
     thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
     with ui.Activity("building the variant") as act:
         agent.run(request, thread, on_step=_narrate(act), name=new_name)
-    display.forked(name, new_name)
+    display.forked(name, new_name, _standing(record))
 
 
 def _apply_changes(agent, name, proposal, changes):
@@ -1452,7 +1602,7 @@ def _apply_changes(agent, name, proposal, changes):
     if sentence:
         risks, stop = [], None
         if "steps" in changes:
-            risks, stop = _step_risks(agent, name, changes["steps"])
+            risks, stop = _step_risks(agent, name, "", wanted=changes["steps"])
             if stop:
                 display.problem(stop, "Nothing was changed.")
                 return
@@ -1510,6 +1660,12 @@ def _cmd_view(agent, args):
     if record is None:
         display.problem(f"No run named '{name}'.", "/list shows what there is.")
         return
+    # Reconciled before it is drawn, for the same reason /list is: the verbs
+    # printed under this box are the ones somebody is about to type, and
+    # offering /approve on a run that would refuse it is the contradiction
+    # this whole change exists to remove. One record, one checkpoint read.
+    agent.reconcile_registry([record])
+    record = agent.registry.get(name) or record
     proposal = record.get("proposal") or {}
     if not proposal:
         display.problem(f"'{name}' has no command on record.",
@@ -1522,7 +1678,12 @@ def _cmd_view(agent, args):
         resources=override.summary(override.read(
             override.path_for(name, workdir, proposal))),
         blockers=agent._blockers() if record["status"] == runs_store.HELD
-        else ())
+        else (),
+        # The whole record, so the verbs can be chosen from what this run can
+        # actually support rather than from its status word alone. A submitted
+        # run with no manifest is still `submitted`, and /check on it can only
+        # report that it cannot look.
+        record=record)
 
 
 def _cmd_check(agent, args):
@@ -1860,7 +2021,27 @@ def _cmd_verbose(agent, args):
 
 
 def _cmd_jobs(agent, args):
-    """/jobs <name> [failed] -- the individual Slurm jobs inside a run."""
+    """/jobs <name> [failed] -- the individual Slurm jobs inside a run.
+
+    ITS OWN VERB, NOT A DETAIL LEVEL OF /check, and the distinction that
+    settles it is worth writing down because it was nearly got wrong.
+
+    /check answers "how is this run doing". /jobs answers "which jobs are in
+    it". Those are different QUESTIONS about the same subject, and a different
+    question wants its own word. Compare `/check all`, which is genuinely an
+    argument: the same question, asked of a different subject.
+
+        same question, different subject   ->  an argument      /check all
+        different question, same subject   ->  its own verb     /jobs
+
+    Folding this in as `/check <name> jobs` was proposed and rejected on the
+    evidence. It costs a completion vocabulary (`/jobs <TAB>` completes run
+    names; `/check <name> <TAB>` would have to complete mode words after one),
+    it makes the /help row read as `/check <name>|all [jobs]` where the bracket
+    is skimmed past, and the modifier this command already takes turns into a
+    four-token sentence -- `/check x jobs failed`. That is a small command
+    language, invented to save one line of /help.
+    """
     if not args:
         display.problem("usage: /jobs <name> [failed]")
         return
@@ -1975,21 +2156,26 @@ COMMAND_SPECS = [
     ("new",      "",                   "start a fresh conversation",              "talking",  None),
     ("verbose",  "[off]",              "show or fold away the agent's working",   "talking",  _cmd_verbose),
     ("approve",  "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve),
-    ("modify",   "<name> [change]",    "change a held run and ask again",         "deciding", _cmd_modify),
+    ("modify",   "<name> [change]",    "change a run; submitted ones fork",       "deciding", _cmd_modify),
     ("fork",     "<name> [change]",    "build a second run from an existing one", "deciding", _cmd_fork),
     ("reject",   "<name> [why...]",    "abandon a held run; nothing submitted",   "deciding", _cmd_reject),
     ("view",     "<name>",             "the command a run is, and what it takes", "watching", _cmd_view),
     ("list",     "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list),
-    ("check",    "<name>|all",         "how a run is doing; all groups them",     "watching", _cmd_check),
-    ("monitor",  "<name> [seconds]",   "watch one run until it stops changing",   "watching", _cmd_monitor),
-    ("jobs",     "<name> [failed]",    "the individual jobs inside a run",        "watching", _cmd_jobs),
+    # These four answer four different questions about one run, and they are
+    # worded to read as a set: what is its overall state, what are its jobs,
+    # why did it break, and tell me when it changes. Each keeps its own verb
+    # and its own implementation -- see the note on _cmd_jobs for why "jobs"
+    # is not a detail level of "check".
+    ("check",    "<name>|all",         "show the run's overall status",           "watching", _cmd_check),
+    ("monitor",  "<name> [seconds]",   "watch a run until its state changes",     "watching", _cmd_monitor),
+    ("jobs",     "<name> [failed]",    "show every job and its state",            "watching", _cmd_jobs),
     ("history",  "",                   "every run recorded, live or gone",        "watching", _cmd_history),
     # One verb, not two. /why and /diagnose were the same function under two
     # names, and the only thing the pair achieved was making people wonder which
     # to reach for -- the two answers differed by model variance, never by
     # design. /check already gives the quick why, in its root cause block, for
     # free and with no model call. This is the one that reads the logs.
-    ("diagnose", "<name> [question]",  "read the logs and explain a failure",     "fixing",   _cmd_diagnose),
+    ("diagnose", "<name> [question]",  "investigate why a run failed",            "fixing",   _cmd_diagnose),
     ("hold",     "<name> [release]",   "stop a run's queued jobs being scheduled", "fixing",  _cmd_hold),
     ("cancel",   "<name>",             "scancel a run's remaining jobs",          "fixing",   _cmd_cancel),
     ("sort",     "[names...|show]",    "tick rows to hide from /list; show undoes", "fixing", _cmd_sort),

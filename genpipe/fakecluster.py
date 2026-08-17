@@ -280,6 +280,16 @@ with open(out, "w") as f:
     f.write("# Exit immediately on error\n\n")
     f.write("set -eu -o pipefail\n\n")
     f.write(f"# fake GenPipes submission script for {label}\n")
+    # The step range the script was built FOR, recorded in the script.
+    #
+    # Real GenPipes bakes the step selection into what it emits -- a script for
+    # -s 3-6 contains different jobs from one for -s 1-5 -- so a stub that
+    # wrote an identical script whatever it was asked for could not be used to
+    # check the one property the gate exists to guarantee: that the value shown
+    # at the gate is the value the launched script was generated from. Without
+    # this line that chain is untestable and the test can only assert that a
+    # file exists.
+    f.write(f"#   STEPS: {steps or 'all'}\n")
     f.write(f"#   TOTAL: {total} jobs\n\n")
     f.write(f"OUTPUT_DIR={outdir}\n")
     f.write("JOB_OUTPUT_DIR=$OUTPUT_DIR/job_output\n")
@@ -578,6 +588,23 @@ def build(root, state="happy"):
     # Truncate the job database so each activation starts from a clean cluster.
     open(os.path.join(root, "sacct.db"), "w").close()
 
+    # A config stack that EXISTS. Every real pipeline requires -c -- argparse
+    # says so on its own usage line, and the gate refuses a generation without
+    # one before it will draw a box. A fake LLM that emitted commands with no
+    # -c was modelling something GenPipes would reject, so dev mode and the
+    # mock suite were exercising a path a real run can never take.
+    #
+    # Written here rather than left to each caller because the stub validates
+    # that every .ini on the command line is on disk, which is the check that
+    # makes the fixture honest in the first place.
+    inis = os.path.join(root, "inis")
+    os.makedirs(os.path.join(inis, "common_ini"), exist_ok=True)
+    for pipeline in PIPELINES:
+        _write(os.path.join(inis, f"{pipeline}.base.ini"),
+               "[DEFAULT]\ncluster_server=rorqual\n", executable=False)
+    _write(os.path.join(inis, "common_ini", "rorqual.ini"),
+           "[DEFAULT]\ncluster_server=rorqual\n", executable=False)
+
     # Sourced by every non-interactive bash the fake cluster's commands run in.
     # See the module docstring: this is what actually keeps Lmod out of the way.
     _write(os.path.join(root, "bashenv.sh"), f"""\
@@ -608,6 +635,10 @@ def env_for(root, state="happy", env=None):
     env["PATH"] = os.path.join(root, "bin") + os.pathsep + env.get("PATH", "")
     env["GENPIPE_FAKE_STORE"] = root
     env["GENPIPE_FAKE_STATE"] = state
+    # Where the fake config stack lives, under the same name the real module
+    # exports -- so a generated command reads the way a real one does and the
+    # shell resolves it to files that are actually there.
+    env["GENPIPES_INIS"] = os.path.join(root, "inis")
     # See the module docstring. All three are needed: the inherited function
     # entries, and the BASH_ENV that would put the function back regardless.
     for key in list(env):
@@ -629,7 +660,8 @@ def activate(state="happy", root=None):
     root = root or tempfile.mkdtemp(prefix="genpipe_fake_")
     build(root, state)
     prepared = env_for(root, state)
-    for key in ("PATH", "GENPIPE_FAKE_STORE", "GENPIPE_FAKE_STATE", "BASH_ENV"):
+    for key in ("PATH", "GENPIPE_FAKE_STORE", "GENPIPE_FAKE_STATE", "BASH_ENV",
+                "GENPIPES_INIS"):
         os.environ[key] = prepared[key]
     for key in [k for k in os.environ if k.startswith("BASH_FUNC_")]:
         del os.environ[key]
@@ -994,12 +1026,17 @@ def _gen_block(task, feedback=(), answers=()):
     # request's mark and throws the answers away with the context.
     files = _intake_files(_spoken_join([task, *feedback, *answers]))
 
+    # The -c stack, first on the line and never omitted. See build() for why
+    # a generation without one is not a command GenPipes would accept.
+    inis = ("$GENPIPES_INIS/" + pipeline + ".base.ini "
+            "$GENPIPES_INIS/common_ini/rorqual.ini")
     flag = f"-t {protocol} " if protocol else ""
     readset = f"-r {files['readset']} " if files.get("readset") else ""
     design = f"-d {files['design']} " if files.get("design") else ""
     pairs = f"-p {files['pairs']} " if files.get("pairs") else ""
     return ("<execute>\n#!BASH\n"
             f"module load {GENPIPES_MODULE} && genpipes {pipeline} "
+            f"-c {inis} "
             f"{flag}{readset}{design}{pairs}-s {steps} -g cmd.sh\n"
             "</execute>")
 

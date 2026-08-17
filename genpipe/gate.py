@@ -29,9 +29,26 @@ reasons.
 The functions take plain data -- strings, and lists of objects with a .content
 attribute -- rather than LangGraph state, so nothing here needs a graph to run.
 """
+import hashlib
 import re
 
 from . import slots
+
+# The phrase a rejection always renders into the transcript.
+#
+# Named, and living HERE rather than in agent.py, for two reasons. It is the
+# gate's vocabulary -- what the gate says when a decision comes back negative
+# -- and this module is stdlib-only, so the offline test harness can import it
+# without pulling in biomni.
+#
+# Two things depend on recognising one phrase: the model, which has to
+# understand that a decision was refused, and the scripted model in the test
+# harness, which switches onto its retry script when it sees this. Both used to
+# depend on a literal typed out in two places, so rewording the sentence broke
+# every rejection test silently -- the scripts ran straight past the branch
+# they existed to exercise and the suite reported a stale value instead of a
+# failure.
+REJECTION_MARK = "did not approve"
 
 # Text that means "this really submits". Searched against executable_lines(),
 # never the raw block -- see that function for why.
@@ -369,6 +386,64 @@ _SHELL_WORDS = frozenset("""
 """.split())
 
 
+# A named call with keyword arguments, e.g. `check_run(name="x")`. Anchored on
+# a word boundary so `my_check_run(...)` is not one, and non-greedy to the first
+# closing bracket, which is enough for the flat argument lists these calls take.
+_CAPABILITY_CALL = re.compile(r"\b([a-z_][a-z0-9_]*)\s*\(\s*(.*?)\s*\)", re.DOTALL)
+
+# Values a capability argument can take. Strings share ask()'s quoting rules --
+# including the f"..." prefix a model reaches for out of habit -- plus the two
+# bare words that mean something: booleans, for `failed=True`.
+_CAP_ARG = re.compile(r"(\w+)\s*=\s*(?:" + _QUOTED + r"|(True|False|true|false))")
+
+
+def capability_request(code, names=()):
+    """A capability call the MODEL wrote, as {"capability", "args"}, or None.
+
+    THE INPUT IS ALWAYS THE MODEL'S OWN CODE BLOCK. Never a user message,
+    never the conversation, never prose. Callers hand this
+    extract_pending_code(), which reads the <execute> block out of the LAST
+    message -- and the last message at this point in the graph is the model's
+    reply. That is what makes this a dispatcher rather than an intent
+    classifier: there is no path by which a sentence somebody typed reaches
+    this function, so there is nothing here that could map "why did it fail" to
+    an action even if somebody wanted it to. The model decides; this reads what
+    it decided.
+
+    `names` is the closed set of recognised capabilities -- capabilities.NAMES.
+    A call to anything else is not a capability and falls through to the
+    interpreter exactly as it always has, so ordinary Python the model writes
+    is unaffected. Passing an empty set makes this function inert, which is how
+    it stays switched off until the table is wired up.
+
+    Matched against executable_lines(), for the same reason ask_request() and
+    is_submission() are: the model narrates its own work constantly, and
+    `print("check_run(name='x')")` inside an explanation must not run anything.
+
+    Returns None for anything that is not one of these calls. Deliberately
+    strict -- a malformed capability call should reach the interpreter and come
+    back as a plain Python error the model can read, rather than being guessed
+    at here.
+    """
+    if not code or not names:
+        return None
+    runnable = executable_lines(code)
+    if not runnable:
+        return None
+    for match in _CAPABILITY_CALL.finditer(runnable):
+        name = match.group(1)
+        if name not in names:
+            continue
+        args = {}
+        for key, quoted, boolean in _CAP_ARG.findall(match.group(2)):
+            if boolean:
+                args[key] = boolean.lower() == "true"
+            else:
+                args[key] = quoted[1:-1]
+        return {"capability": name, "args": args}
+    return None
+
+
 def needs_bash_marker(code):
     """Should this block be run as shell even though it is not marked as such?
 
@@ -511,6 +586,42 @@ _CONTINUATION = re.compile(r"\\[ \t]*\n")
 # shell writes it deliberately, and the only thing that produces it is a
 # continuation whose newline has been flattened away.
 _STRANDED = re.compile(r"(?:^|(?<=\s))\\(?=\s|$)")
+
+def tidy(generated):
+    r"""A generation block, cleaned up but with its STATEMENT BOUNDARIES intact.
+
+    What gets stored on the proposal as `generated`, and the one thing that has
+    to survive the trip is the newline between one statement and the next.
+
+    This used to be `" ".join(text.split())`, which flattens the block onto a
+    single line -- and a generation is routinely a small script:
+
+        genpipes ampliconseq ... -g ampliconseq_cit_cmd.sh
+        echo "---exit $?---"
+        ls
+
+    Flattened, the newline that ended the genpipes call becomes an ordinary
+    space, and nothing downstream can tell it from the space before a flag.
+    invocation() below cuts on newlines for exactly this reason and had none
+    left to cut on, so mirror._groups appended every token up to the next flag
+    -- there being no next flag -- onto `-g`. /modify then drew
+
+        script       -g  ampliconseq_cit_cmd.sh
+                         echo
+                         ---exit $?---
+                         ls
+
+    three lines of shell spilling out of a field on the screen somebody reads
+    to decide what to change. The write side was destroying the boundary; the
+    read side had been taught to respect one it was never given.
+
+    Continuations are still resolved first, and each line is still
+    whitespace-normalised -- those were always right. Only the join changed.
+    """
+    text = _CONTINUATION.sub(" ", generated or "")
+    lines = (" ".join(line.split()) for line in text.split("\n"))
+    return "\n".join(line for line in lines if line)
+
 
 def invocation(generated):
     """The bare genpipes call, cut out of whatever block it arrived in.
@@ -714,7 +825,7 @@ def build_proposal(messages, code):
     if missing:
         lines.append(f"  MISSING (required): {', '.join(missing)}")
     lines.append("Approve to submit, or request an adjustment (protocol, steps, config).")
-    return {
+    proposal = {
         "command": cmd,
         "missing": missing,
         # The generation command itself, kept so the gate can show what the
@@ -737,10 +848,112 @@ def build_proposal(messages, code):
         # offered, for a command that had a readset, a design file and three
         # inis in it. The slots were parsed correctly the whole time; only the
         # string kept for the mirror was mangled.
-        "generated": " ".join(_CONTINUATION.sub(" ", gen or "").split()) or None,
+        "generated": tidy(gen) or None,
+        # The exact string every flag above was read out of -- the genpipes call
+        # alone, with the surrounding shell stripped off. Kept because it is
+        # what with_usage() has to ask "was -c given" of, and reconstructing it
+        # there from `generated` would get a different answer in the one case
+        # that matters: a proposal whose generation was never captured falls
+        # back to the submission block here, and `generated` is then None.
+        "invocation": src or None,
         "explanation": "\n".join(lines),
         "script": script_name(code or ""),
         "slots": {"pipeline": pipeline, "protocol": protocol, "steps": steps,
                   "inis": inis, "design": design, "pairs": pairs,
                   "readset": readset, "output_dir": output_dir},
     }
+    # Stamped here, where the proposal is finished, and never recomputed
+    # downstream. with_usage() adds flag metadata afterwards and deliberately
+    # does not touch this: what argparse accepts is not part of what executes,
+    # and a revision that moved because --help became readable would invalidate
+    # a gate for no reason anybody could see.
+    proposal["revision"] = revision(proposal)
+    return proposal
+
+
+def revision(proposal):
+    """A short, stable identity for ONE EXACT EXECUTABLE PROPOSAL.
+
+    What an approval authorises. The box on screen and the command that runs
+    have to be the same thing, and until now nothing said so -- /approve
+    checked that a decision was open, never that the open decision was about
+    the command it was going to run.
+
+    WHY NOT THE CHECKPOINT ID. LangGraph stamps every superstep with a
+    monotonic id, and the interrupt lives at one. It fails all three tests an
+    identity has to pass here: it changes on every superstep rather than when
+    the proposal changes, so re-parking the same command would look like a
+    different decision; it is not comparable to anything on the registry
+    record, so the approval could not be checked against the box; and it is an
+    internal detail of a pinned library that would not survive a checkpoint
+    migration.
+
+    WHAT GOES IN. The three strings that decide what executes, and nothing
+    else:
+
+        generated   the shell block re-run to rebuild the script
+        command     the line that launches it
+        script      the path both of them are about
+
+    NOT `slots`. Slots are a PARSE of `generated` -- they cannot disagree with
+    it, so including them adds no information and one more way for a re-parse
+    to shift an identity that should have been stable.
+
+    WHAT IS NOT CANONICALISED AWAY, and why that is the right direction. The
+    text is used as `tidy()` left it: whitespace normalised per line, blank
+    lines dropped, continuations resolved. Nothing further is stripped -- not
+    comments, not echoes, not a `$(date …)` inside an output path. The two
+    failure modes are not symmetrical. A revision that differs when it need
+    not costs a redundant re-gate, which nobody notices. A revision that
+    MATCHES when the commands differ approves one command having shown
+    another, which is the single failure this function exists to prevent. So
+    when in doubt, differ.
+
+    Twelve hex characters. Long enough that a collision is not a thing that
+    happens; short enough to sit on a record and in a log line and be compared
+    by eye when something goes wrong.
+    """
+    if not proposal:
+        return None
+    parts = [str(proposal.get(key) or "")
+             for key in ("generated", "command", "script")]
+    if not any(parts):
+        return None
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def with_usage(proposal, flags):
+    """The proposal, plus what `genpipes <pipeline> --help` says about its flags.
+
+    Three keys, all plain lists so the proposal stays JSON and survives the
+    checkpoint and the run record:
+
+        accepts   every flag this pipeline takes, canonical spelling
+        required  the subset argparse will not run without
+        lacking   the required flags this command did not write
+
+    Separate from `missing`, which stays exactly what it was: slots.gaps()'s
+    verdict, in SLOT names, about the files a run needs. These are FLAGS, from a
+    different authority, and merging them would put `-c` in a list whose other
+    entries are `readset` and `design` and leave every reader guessing which
+    vocabulary it was looking at.
+
+    `lacking` is the one that earns its keep. slots.gaps() has no entry for the
+    config stack -- there is no table of which inis a run needs, because that
+    depends on the machine -- so a generation with no `-c` at all passed every
+    check this project had and was drawn as READY TO SUBMIT. It then failed at
+    generation, after somebody had approved it, with an argparse error. --help
+    knew the whole time.
+
+    A falsy `flags` (no GenPipes on this machine, or an unreadable --help)
+    leaves the proposal alone rather than writing empty lists into it. That
+    distinction matters downstream: an absent `accepts` means "no opinion, show
+    what the tables say", while an empty one would mean "this pipeline takes no
+    flags" and would empty the gate.
+    """
+    if not proposal or not flags:
+        return proposal
+    proposal["accepts"] = list(flags.flags)
+    proposal["required"] = list(flags.required)
+    proposal["lacking"] = list(flags.lacking(proposal.get("invocation") or ""))
+    return proposal

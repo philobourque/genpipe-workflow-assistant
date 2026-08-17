@@ -423,6 +423,34 @@ def gap_for(slot, pipeline=None, protocol=None, question=None,
     return gap
 
 
+def needs_of(pipeline, protocol=None):
+    """The extra file this pipeline/protocol combination requires: DESIGN,
+    PAIRS, or None.
+
+    A protocol's demand where there is one, the pipeline's where there is no
+    protocol to carry it. Both tables are consulted, rather than either, because
+    they describe different pipelines and never the same one: _PIPELINE_NEEDS
+    holds only pipelines whose PIPELINES entry is empty.
+
+    Extracted from gaps() because a SECOND caller was reimplementing it and
+    getting it wrong. modify.rows_for() decides which rows /modify offers, and
+    it asked only `proto.needs`, with `chipseq` hardcoded beside it -- so on the
+    three pipelines that take no `-t` at all, `_PIPELINE_NEEDS` was never
+    consulted. An ampliconseq run needs a design file (it is in that table), and
+    a `/modify` panel for one that lacked a `-d` would not offer to add it: the
+    one row the run could not be generated without was the row that was hidden.
+
+    One function, so "what does this pipeline need" has one answer wherever it
+    is asked -- the check that refuses a proposal and the panel that repairs it
+    cannot disagree about the same run.
+    """
+    if not pipeline:
+        return None
+    protocol = protocol or DEFAULTS.get(pipeline)
+    proto = find_protocol(pipeline, protocol) if PIPELINES.get(pipeline) else None
+    return proto.needs if proto else _PIPELINE_NEEDS.get(pipeline)
+
+
 def gaps(pipeline=None, protocol=None, readset=None, design=None, pairs=None,
          readset_candidates=(), design_candidates=(), pairs_candidates=()):
     """Everything a run still lacks. A COMPLETENESS CHECK, not a script.
@@ -469,11 +497,7 @@ def gaps(pipeline=None, protocol=None, readset=None, design=None, pairs=None,
     if not readset:
         found.append(_readset_gap(readset_candidates))
 
-    # A protocol's demand where there is one, the pipeline's where there is no
-    # protocol to carry it. Both, rather than either, because the two tables
-    # describe different pipelines and never the same one: _PIPELINE_NEEDS
-    # holds only pipelines whose PIPELINES entry is empty.
-    needs = proto.needs if proto else _PIPELINE_NEEDS.get(pipeline)
+    needs = needs_of(pipeline, protocol)
     named = proto.name if proto else None      # nothing to name; see _who
     if needs == DESIGN and not design and pipeline not in _DESIGN_OPTIONAL:
         found.append(_design_gap(pipeline, named, design_candidates))
@@ -499,3 +523,116 @@ _BLURBS = {
 
 def _pipeline_blurb(name):
     return _BLURBS.get(name, "")
+
+
+def requirements_note():
+    """This module's tables, rendered for the model. FACTS ONLY.
+
+    WHY THIS EXISTS. Deterministic code knew that somatic_fastpass needs a
+    pairs file and that ampliconseq's `asva` reads a design; the model did not,
+    because slots.py is Python and nothing ever showed it to anyone. So the
+    gate could refuse a proposal for a reason the model had no way to have
+    anticipated, and the only way it learned was by being told after the fact.
+    A constraint you are judged against and cannot read is not a constraint,
+    it is a trap.
+
+    Generated from PIPELINES, _PIPELINE_NEEDS and _DESIGN_OPTIONAL at
+    configure() time -- the same tables gaps() enforces, in the same process --
+    so the sentence the model reads and the check that refuses it cannot say
+    different things. That is the whole reason this is generated rather than
+    written into genpipes.md by hand: a hand-copied table is a second source
+    that drifts silently, which is the failure this project keeps finding.
+
+    WHAT IS DELIBERATELY NOT HERE, because the boundary matters more than the
+    content:
+
+      * No step numbers. They are version-exact, they belong to --help, and
+        this repo refuses to hold them (see modify.py).
+      * No protocol NAMES presented as the authority -- --help is that, and
+        it is one command away. What is listed here is only what --help
+        cannot say, which is what each protocol REQUIRES.
+      * No instructions. Not "ask for it", not "resolve it in this order",
+        not "you are ready when". Those are the model's decisions, and a
+        table that made them would be the deterministic questionnaire this
+        project deleted on purpose -- the one that read "I do NOT want
+        chipseq" as a request for chipseq.
+
+    The facts are stated; what to do about them is not.
+    """
+    lines = [
+        "## What each protocol requires",
+        "",
+        "Facts about this GenPipes, from the same table that refuses an "
+        "incomplete submission at the gate. `--help` cannot tell you any of "
+        "them: it reports what argparse parses, and every one of these files "
+        "is optional to argparse and required by a step.",
+        "",
+        "How to use them is yours to decide -- whether you can find the file, "
+        "whether the one you found is the right one, whether to ask. This is "
+        "only what is true.",
+        "",
+    ]
+
+    rows = []
+    for pipeline in sorted(PIPELINES):
+        protocols = PIPELINES[pipeline]
+        if not protocols:
+            need = _PIPELINE_NEEDS.get(pipeline)
+            if need:
+                rows.append((f"{pipeline} (no -t)", _flag_for(need), ""))
+            continue
+        for proto in protocols:
+            if not proto.needs:
+                continue
+            note = ""
+            if pipeline in _DESIGN_OPTIONAL:
+                note = "only for the differential step; the run is complete without it"
+            rows.append((f"{pipeline} -t {proto.name}", _flag_for(proto.needs), note))
+    # Named explicitly rather than left out, because "absent from the list"
+    # reads as "not checked yet" and this is a positive finding: peak calling
+    # without differential binding is an ordinary complete chipseq run.
+    for pipeline in sorted(_DESIGN_OPTIONAL):
+        rows.append((f"{pipeline} (any -t)", "-d design file",
+                     "only if the differential-binding step is in the -s "
+                     "range; generation FAILS if it is and there is no -d"))
+
+    width = max(len(name) for name, _, _ in rows)
+    for name, flag, note in rows:
+        lines.append(f"  {name:<{width}}  {flag}" + (f"  — {note}" if note else ""))
+
+    inis = [(f"{p} -t {x.name}", ", ".join(x.inis))
+            for p in sorted(PIPELINES) for x in PIPELINES[p] if x.inis]
+    if inis:
+        lines += [
+            "",
+            "## Feature inis these protocols expect on -c",
+            "",
+            "Between the base ini and the cluster ini. Also absent from "
+            "`--help`, and absent from the ini files themselves, which carry "
+            "no protocol declaration.",
+            "",
+        ]
+        width = max(len(name) for name, _ in inis)
+        for name, want in inis:
+            lines.append(f"  {name:<{width}}  {want}")
+
+    if DEFAULTS:
+        lines += [
+            "",
+            "## Protocol defaults GenPipes itself sets",
+            "",
+            "Read out of each pipeline's own `-t` argument. An omitted `-t` "
+            "on these runs the default rather than failing -- so it is not a "
+            "missing value, though it is an assumption worth stating out loud "
+            "when you make it.",
+            "",
+        ]
+        width = max(len(p) for p in DEFAULTS)
+        for pipeline in sorted(DEFAULTS):
+            lines.append(f"  {pipeline:<{width}}  {DEFAULTS[pipeline]}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _flag_for(need):
+    return "-d design file" if need == DESIGN else "-p pairs file"

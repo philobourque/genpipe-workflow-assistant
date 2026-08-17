@@ -931,7 +931,7 @@ def _text(value):
 
 def choose(question, options, note="", free_text=True, free_label="Something else",
            multi=False, draw=None, cursor=0, field=None,
-           on_enter=None, on_escape=None, on_text=None):
+           on_enter=None, on_escape=None, on_text=None, typing=None):
     """A numbered choice panel. Returns the chosen value, or None if cancelled.
 
     `options` are slots.Option-shaped: anything with .value, .label and
@@ -1003,9 +1003,17 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                           nothing is open.
         on_text(key)      a printable character or backspace that nothing else
                           claimed. /modify narrows an open row's choices with
-                          it. Digits are NOT offered here when they are picking
-                          rows -- a key cannot both choose option 3 and type a
-                          3, and picking is the older meaning.
+                          it.
+        typing()          True while a FREE-TEXT row is open, which makes the
+                          digits text instead of row selectors. Without it a
+                          row whose only legal values are numbers cannot be
+                          filled in at all: typing `3` into an open steps row
+                          fired Enter on row 3 instead. The same exemption has
+                          always existed for `field` (see on_field below); this
+                          extends it to the in-place row editor, which is what
+                          /modify actually uses. Only while the open row has no
+                          choices of its own -- when it does, `1-9 to pick` is
+                          the advertised behaviour and stays.
 
     Both are called between repaints, so a hook may change whatever `options`
     reads and the next paint will show it.
@@ -1187,7 +1195,7 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                 cursor = 0
             elif key in ("end", "\x05"):
                 cursor = len(rows) - 1
-            elif key.isdigit() and key != "0":
+            elif key.isdigit() and key != "0" and not _text(typing):
                 index = int(key) - 1
                 if index < len(rows):
                     cursor = index

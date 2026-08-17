@@ -77,7 +77,11 @@ GENERATE_STEP = (
     "Generating the run.\n"
     "<execute>\n"
     "#!BASH\n"
+    # -c is on this line because argparse requires it of every pipeline, and
+    # the gate refuses a generation without one before it will draw a box. A
+    # fixture missing it was modelling a command GenPipes would reject.
     "# module load mugqic/genpipes/6.1.1 && genpipes rnaseq -t stringtie -s 1-4 "
+    "-c rnaseq.base.ini common_ini/rorqual.ini "
     "-r readset.tsv -d design.tsv -g cmd.sh\n"
     "cat > cmd.sh << 'EOF'\n"
     "#!/bin/bash\n"
@@ -149,7 +153,22 @@ def main():
         expect("pauses at the gate", status["status"], "paused")
 
         status = agent.resume("mock-reject", approved=False, feedback="not now")
-        expect("finishes after rejection", status["status"], "done")
+        # THIS ASSERTION CHANGED, and the change is the fix rather than a
+        # concession to it. It used to read `"done"`: feedback consumed the
+        # interrupt, the model answered in prose without re-proposing, and the
+        # graph ended -- while the registry was written back to `held` anyway,
+        # so /list offered an approval /approve would refuse.
+        #
+        # The decision is restored for real now, with no model call, so a run
+        # that says it is waiting IS waiting. What the invariant demands is
+        # that these three agree, and agreeing is the whole of what is checked.
+        expect("the decision is restored, not faked", status["status"], "paused")
+        reject_name = agent.registry.held_for_thread("mock-reject")["name"]
+        expect("the record says held", agent.registry.get(reject_name)["status"],
+               runs_store.HELD)
+        expect("and the graph really is parked at a gate",
+               agent.gate_interrupt(agent._config("mock-reject")) is not None,
+               True)
 
         # ============================================================== #
         print("\n=== C. an exception AFTER the submission ran ===")
@@ -162,12 +181,28 @@ def main():
         status = agent.run("mock task", thread_id="mock-boom")
         expect("pauses at the gate", status["status"], "paused")
         boom = agent.registry.held_for_thread("mock-boom")["name"]
+        before = agent.llm.calls
         raised = None
         try:
             agent.resume(boom, approved=True)
         except Exception as e:                        # noqa: BLE001
             raised = e
-        expect("the reporting turn really did fail", raised is not None, True)
+        # THIS ASSERTION CHANGED, and it changed because the failure it used to
+        # provoke has been designed out rather than papered over.
+        #
+        # It read `raised is not None`: the third scripted reply was BOOM, the
+        # graph called the model after the submission to narrate it, and that
+        # call raised -- reproducing 2026-07-29 exactly. There is no such call
+        # any more. /approve regenerates the script and runs it itself, then
+        # releases the interrupt with a settled fact, so no inference happens
+        # anywhere between the person saying yes and the jobs existing.
+        #
+        # So the stronger property is asserted instead, and it is the one that
+        # makes the original defect unreachable: an approval spends ZERO model
+        # calls. A turn that never happens cannot die halfway through.
+        expect("an approval spends no model calls at all",
+               agent.llm.calls, before)
+        expect("so the reporting turn cannot fail", raised, None)
         expect("the submission really did run",
                os.path.exists(os.path.join(workdir, "mock-submission-ran")), True)
         record = agent.registry.get(boom)

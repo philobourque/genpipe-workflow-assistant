@@ -858,6 +858,79 @@ def _stale_submission_checks(r):
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    # ------------------------------------------------------------------ #
+    r.section("adoption mints a record; it never replaces one")
+
+    # Both of these were reachable, and the first is the serious one: a
+    # /track onto the name of a run waiting at the gate overwrote its status
+    # to `submitted` while the graph was STILL PARKED on that run's
+    # interrupt. The decision vanished from /list and /view stopped offering
+    # /approve, while the interrupt sat there live and unreachable -- an
+    # orphaned approval, which reconciliation does not undo because it treats
+    # a settled `submitted` record as authoritative.
+    work = tempfile.mkdtemp(prefix="genpipe_adopt_")
+    try:
+        reg = runs.Registry(work)
+        listing = os.path.join(work, "job_output", "P.p.job_list.T1")
+        make_job_list(listing, [("1", "trim.a", "job_output/a.o", "COMPLETED"),
+                                ("2", "trim.b", "job_output/b.o", "COMPLETED")])
+
+        # A clean adoption still works, and reports no reason.
+        record, why = reg.track("adopted", listing)
+        r.truthy("a real job list is adopted", record)
+        r.equal("with nothing to complain about", why, None)
+        r.equal("as a manual entry", reg.get("adopted")["source"], "manual")
+
+        # Re-pointing an ADOPTED run at another path is the legitimate repeat
+        # -- somebody fixing a path they typed wrong -- and stays allowed.
+        second = os.path.join(work, "job_output", "P.p.job_list.T2")
+        make_job_list(second, [("9", "trim.c", "job_output/c.o", "COMPLETED")])
+        record, why = reg.track("adopted", second)
+        r.equal("an adopted run can be re-pointed", why, None)
+        r.equal("and now names the new list", reg.get("adopted")["job_list"], second)
+
+        # THE SERIOUS ONE. A run waiting for a decision is not adoptable.
+        reg.hold("pending", "chat-9", {"command": "bash cmd.sh",
+                                       "generated": "genpipes rnaseq -c a -r b",
+                                       "slots": {"pipeline": "rnaseq"}}, work)
+        r.equal("the held run is held", reg.get("pending")["status"], runs.HELD)
+        record, why = reg.track("pending", listing)
+        r.equal("adopting onto it is refused", record, None)
+        r.contains("saying a decision is being held", why, "holding a decision")
+        r.equal("and the run is untouched",
+                reg.get("pending")["status"], runs.HELD)
+        r.truthy("with its proposal intact", reg.get("pending")["proposal"])
+
+        # A lapsed run still owns its proposal, so it is protected too.
+        reg.update("pending", status=runs.LAPSED)
+        record, why = reg.track("pending", listing)
+        r.equal("a lapsed run is protected as well", record, None)
+
+        # A run this tool built and submitted keeps its name: it has a command
+        # and a conversation behind it, and a typed job list is not worth
+        # discarding those for.
+        reg.mark_submitted("ours", listing, thread_id="chat-1")
+        record, why = reg.track("ours", second)
+        r.equal("an agent-built run is not adoptable onto", record, None)
+        r.contains("saying why", why, "already a run built here")
+
+        # And the file has to be a job list. `/track notes-1 ./notes.txt` used
+        # to create a permanent record with one UNKNOWN job in it.
+        notes = os.path.join(work, "notes.txt")
+        with open(notes, "w") as f:
+            f.write("hello, this is not a manifest\n")
+        record, why = reg.track("notes-1", notes)
+        r.equal("a text file is not a job list", record, None)
+        r.contains("and says what one looks like", why, "job rows")
+        r.equal("nothing was written", reg.get("notes-1"), None)
+
+        empty = os.path.join(work, "empty.job_list")
+        open(empty, "w").close()
+        record, why = reg.track("empty-1", empty)
+        r.equal("nor is an empty file", record, None)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
 
 if __name__ == "__main__":
     sys.exit(main())

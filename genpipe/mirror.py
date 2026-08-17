@@ -291,10 +291,67 @@ def _absent(row, required=False):
         return Line("resources", "resources", "", [],
                     note="no step tuned — walltime, cpu and memory as the "
                          "inis set them")
+    if row == "steps":
+        # Not merely "not set". An absent `-s` is GenPipes running the protocol
+        # end to end, which is the most consequential default on the screen and
+        # the one a person testing something is least likely to have meant. It
+        # is not a warning -- it is what the flag means when omitted -- so it
+        # says what will happen rather than colouring itself red.
+        return Line("steps", "steps", "-s", [],
+                    note="not set — every step in the protocol runs")
     if required:
         return Line(row, row, FLAG_OF.get(row, ""), [], warn=True,
-                    note="not set — required")
-    return Line(row, row, FLAG_OF.get(row, ""), [], note="not set")
+                    note=f"{_UNSET} — required")
+    return Line(row, row, FLAG_OF.get(row, ""), [], note=_UNSET)
+
+
+# What _absent() writes on a row with nothing to say beyond its own absence.
+# Named because mark_required has to recognise it as a placeholder rather than
+# as a note, and a second spelling of it would silently stop matching.
+_UNSET = "not set"
+
+
+def mark_required(m, flags):
+    """A copy of `m` whose lines say which flags GenPipes will not run without.
+
+    `flags` is proposal["required"] -- the unbracketed options on this
+    pipeline's `usage:` line, which is argparse stating its own preconditions.
+    Two shapes, because a required flag that is SET and one that is MISSING are
+    opposite facts and the gate had no way to say either:
+
+        config    -c   dnaseq.base.ini        required
+        readset   -r                          not set — required by genpipes
+
+    The second is the one worth having. Before this, a command with no `-c` drew
+    a box with no config row on it at all -- nothing absent, nothing red,
+    nothing to notice -- and the failure arrived after approval.
+
+    A note that says something is left alone; ensure()'s bare "not set"
+    placeholder is replaced. That distinction is the difference between this
+    working and not: `output` and `steps` carry sentences that already say more
+    than "required" does, and must survive -- but a required flag that was never
+    written reaches here as an ensure() placeholder reading exactly "not set",
+    and leaving THAT alone would draw a missing `-c` in the same quiet grey as a
+    `-p` the run has no use for. Which is the state this function was written to
+    end.
+
+    Flags rather than rows as the argument, translated here through _ROW_OF: the
+    proposal records what --help said, in --help's vocabulary, and this module
+    already owns the flag-to-row mapping in both spellings.
+    """
+    wanted = {_ROW_OF.get(flag) for flag in (flags or ())}
+    wanted.discard(None)
+    if not m or not wanted:
+        return m
+    lines = []
+    for line in m.lines:
+        if line.row in wanted and line.note in ("", _UNSET):
+            note = ("required" if line.values else
+                    "not set — required by genpipes")
+            line = Line(line.row, line.label, line.flag, line.values,
+                        note=note, warn=not line.values, head=line.head)
+        lines.append(line)
+    return Mirror(m.head, lines)
 
 
 # Rows the gate does not draw, because something directly above already said
@@ -407,8 +464,32 @@ def read(generated, name="", resources="", missing=()):
     for row in missing or ():
         seen.setdefault(row, _absent(row, required=True))
     if resources:
+        # THE NOTE IS EARNED, NOT ASSUMED.
+        #
+        # This line used to read "last in the -c stack, so it wins" whenever an
+        # override file existed on disk -- a claim about the COMMAND, made from
+        # the filesystem, without ever looking at the command. A run whose
+        # override ini the model failed to append therefore reported on the
+        # approval screen that its walltimes were in force when nothing on the
+        # -c line mentioned them.
+        #
+        # Three states, because there are three, and the middle one is a real
+        # and silent failure: modify._deltas says so itself -- an override ini
+        # that lands before the cluster ini is overruled by it and the run
+        # behaves as though nobody touched anything.
+        stack = [str(v) for v in (seen.get("config").values
+                                  if seen.get("config") else ())]
+        overrides = [v for v in stack if v.endswith(".override.ini")]
+        if not overrides:
+            note, warn = ("written, but not on the -c stack — it will not "
+                          "take effect"), True
+        elif stack[-1] != overrides[-1]:
+            note, warn = ("on -c but not last — the inis after it win "
+                          "instead"), True
+        else:
+            note, warn = "last in the -c stack, so it wins", False
         seen["resources"] = Line("resources", "resources", "", [resources],
-                                 note="last in the -c stack, so it wins")
+                                 note=note, warn=warn)
 
     lines = [seen[row] for row in ROWS if row in seen]
     lines += [line for key, line in seen.items() if key.startswith("\x00")]

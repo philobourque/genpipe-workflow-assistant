@@ -47,7 +47,10 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
+
+from . import usage
 
 # ---------------------------------------------------------------------------
 # Job states. Slurm's vocabulary, not ours -- these strings are what sacct
@@ -100,10 +103,35 @@ SUBMITTING = "submitting"
 SUBMIT_FAILED = "submit_failed"
 SUBMIT_UNKNOWN = "submit_unknown"
 
+# A proposal whose authorisation slot is gone.
+#
+# NOT a draft, and not an error: the command is complete and was good enough to
+# have been offered. What is missing is the live gate interrupt, without which
+# /approve has nothing to act on -- the graph consumed it (a question answered
+# at the gate), or the turn holding it died.
+#
+# This exists because `held` was carrying two meanings and only advertising one.
+# A record left saying `held` after its gate was gone put "waiting for approval"
+# in /list beside a run /approve would refuse, and there was no third word to
+# write instead. There is now, and it comes with its own next action: /modify
+# rebuilds the proposal and re-gates it.
+#
+# Reachable but rare by design -- see agent.regate(), which restores the real
+# decision point rather than the label whenever there is one to restore.
+LAPSED = "lapsed"
+
 # Statuses meaning "the command ran, or may have run". None of them may be
 # approved again, and every one of them wants reconciling against Slurm before
 # anything is retried.
 AFTER_APPROVAL = (SUBMITTING, SUBMITTED, SUBMIT_FAILED, SUBMIT_UNKNOWN)
+
+# Statuses nothing will reclassify. A person said no, or the artifacts are gone;
+# neither is a state evidence can talk anybody out of.
+TERMINAL = (ABANDONED, GONE)
+
+# Statuses that carry a durable proposal and no submission. The two states a
+# reconciler chooses BETWEEN, which is why they are named together.
+BEFORE_APPROVAL = (HELD, LAPSED)
 
 # GenPipes version whose `tools log_report` we call. Same pin as genpipes.md.
 GENPIPES_MODULE = "mugqic/genpipes/6.1.1"
@@ -249,17 +277,26 @@ class Registry:
         return sorted(records, key=lambda r: r.get("submitted_at") or "",
                       reverse=True)
 
-    def live(self):
+    def live(self, prune=True):
         """Runs still worth acting on: submitted and not purged, plus anything
-        held. This is /list.
+        held or lapsed. This is /list.
 
         Held runs belong here even though they have no job list and nothing on
         the scheduler -- a run waiting for your approval is the single most
         actionable thing the tool can be holding, so it cannot be the one thing
-        /list leaves out.
+        /list leaves out. AGE IS NOT A CRITERION: a proposal from three weeks
+        ago whose gate is still open has a real next action and belongs here
+        exactly as much as one from this morning.
+
+        Lapsed runs belong here for the same reason and a different action --
+        they cannot be approved, but /modify rebuilds them, and a proposal
+        somebody is still going to want is not history yet.
+
+        `prune=False` skips the gone-file sweep, for callers that are about to
+        reconcile the whole registry and do not want a save in the middle of it.
         """
         records = self.load()
-        if self._prune(records):
+        if prune and self._prune(records):
             self.save(records)
         current = {}
         for r in records:
@@ -311,10 +348,25 @@ class Registry:
         the gate on the same run (after a rejection and a rethink) updates the
         proposal in place rather than stacking near-identical records.
         """
+        revision = (proposal or {}).get("revision")
         existing = self.get(name)
-        if existing and existing["status"] == HELD:
-            return self.update(name, proposal=proposal, workdir=workdir,
-                               held_at=_now())
+        if existing and existing["status"] in BEFORE_APPROVAL:
+            fields = {"proposal": proposal, "workdir": workdir,
+                      "status": HELD, "held_at": _now(), "revision": revision}
+            # THE PROPOSAL THIS ONE REPLACES CAN NEVER COME BACK.
+            #
+            # Reaching the gate again on the same run means the command was
+            # rethought -- a /modify, or a rejection the model acted on. The
+            # old revision is not merely uninteresting: an interrupt raised
+            # for it may still be sitting in some checkpoint, and without this
+            # list nothing would stop that stale authorisation from being
+            # honoured. Recorded on the way past, which is the only moment
+            # both revisions are in the same place.
+            was = existing.get("revision")
+            if was and revision and was != revision:
+                fields["superseded"] = list(
+                    dict.fromkeys(list(existing.get("superseded") or ()) + [was]))
+            return self.update(name, **fields)
         return self._append({
             "name": str(name),
             "thread_id": str(thread_id) if thread_id is not None else None,
@@ -322,6 +374,7 @@ class Registry:
             "job_list": None,
             "workdir": workdir,
             "proposal": proposal,
+            "revision": revision,
             "submitted_at": None,
             "held_at": _now(),
             "source": "agent",
@@ -420,12 +473,76 @@ class Registry:
             fields["proposal"] = proposal
         return self.update(name, **fields)
 
+    def adoption_blocked(self, name):
+        """Why `name` cannot be adopted onto, as a sentence, or None if it can.
+
+        ADOPTION MINTS A RECORD; IT MUST NEVER SILENTLY REPLACE ONE. Without
+        this, `/track <the name of a run waiting at the gate> <any path>`
+        overwrote that record's status to `submitted` while the graph was
+        still parked on its interrupt -- so the run vanished from the pending
+        section of /list and /view stopped offering /approve, while the
+        decision itself sat there, live and unreachable. An orphaned approval
+        is the exact class of state-versus-display contradiction the lifecycle
+        work exists to close, and it does not self-heal: reconciliation treats
+        a settled `submitted` record as authoritative and leaves it alone.
+
+        Three rules, in order of how much is at stake:
+
+          a live decision   held or lapsed. This tool owns a proposal under
+                            that name and possibly an open gate. Refused.
+          our own run       source == "agent". Its name is tied to a
+                            conversation and a generation command, and
+                            overwriting it would throw both away for a job
+                            list somebody typed. Refused.
+          an adopted run    source manual or scan. Re-pointing one at a
+                            corrected path is the whole reason somebody types
+                            this twice. Allowed.
+
+        Returns a sentence rather than a boolean so the caller can say which
+        run is in the way -- "that name is taken" sends somebody to /list to
+        work out what by.
+        """
+        record = self.get(name)
+        if record is None:
+            return None
+        if record["status"] in BEFORE_APPROVAL:
+            return (f"'{name}' is a run this tool is holding a decision for "
+                    f"({record['status']}). Adopting onto it would discard "
+                    f"that proposal.")
+        if (record.get("source") or "agent") == "agent":
+            return (f"'{name}' is already a run built here — it has a command "
+                    f"on record and a conversation behind it.")
+        return None
+
     def track(self, name, job_list):
         """Register a run launched outside the agent -- no thread, no gate, no
-        conversation -- so it can be checked and analysed by name like any other."""
-        return self.mark_submitted(name, job_list,
-                                   workdir=os.path.dirname(os.path.dirname(job_list)),
-                                   source="manual")
+        conversation -- so it can be checked and analysed by name like any other.
+
+        Returns (record, reason). A record of None means nothing was written
+        and `reason` says why, which is the shape every caller needs: this is
+        reached from a command line where both the name and the path are typed
+        by hand, so both can be wrong and each is wrong in its own way.
+        """
+        blocked = self.adoption_blocked(name)
+        if blocked:
+            return None, blocked
+
+        # THE FILE HAS TO BE A JOB LIST. Not merely present -- present was the
+        # only check, so `/track notes-1 ./notes.txt` on a text file produced a
+        # permanent record with one UNKNOWN job in it, from a typo. job rows
+        # are counted with the same parser /check will use, so a file that
+        # passes here is a file the rest of the tool can read.
+        state = job_list_state(job_list)
+        if not state.get("rows"):
+            return None, (f"{os.path.basename(job_list)} has no GenPipes job "
+                          f"rows in it. A job list is tab-separated with a job "
+                          f"id in the first column.")
+
+        record = self.mark_submitted(
+            name, job_list,
+            workdir=os.path.dirname(os.path.dirname(job_list)),
+            source="manual")
+        return record, None
 
     def adopt(self, name, found):
         """Register a run that /scan discovered on disk.
@@ -460,9 +577,19 @@ class Registry:
         record = self.get(name)
         if record is None:
             return None
-        if record["status"] != HELD:
+        # Lapsed as well as held. A proposal whose gate is gone is exactly the
+        # kind somebody wants to be rid of -- it cannot be approved, so the
+        # only two things to do with it are rebuild it or drop it, and
+        # refusing the second would leave /list holding it forever.
+        if record["status"] not in BEFORE_APPROVAL:
             return record
         fields = {"status": ABANDONED, "abandoned_at": _now()}
+        # The proposal this rejection was about, so it can never come back
+        # through a re-gate. See classify()'s rule 4.
+        if record.get("revision"):
+            fields["rejected"] = list(
+                dict.fromkeys(list(record.get("rejected") or ())
+                              + [record["revision"]]))
         if reason:
             fields["abandoned_because"] = reason
         record = self.update(name, **fields)
@@ -547,6 +674,51 @@ class Registry:
         """
         return self.update(name, last_check={
             "at": _now(), "counts": counts, "total": total, "verdict": verdict})
+
+    def add_decision(self, name, decision, revision=None, outcome=None,
+                     feedback=None):
+        """Record what a human decided at the gate, as data. Returns the entry.
+
+        THE ONLY ACCOUNT OF A GATE DECISION THAT ANYTHING SHOULD TRUST, and
+        the reason it exists is a specific failure. What the model used to get
+        was a rewritten copy of its own message: the application replaced its
+        `propose_submission("cmd.sh")` with `bash cmd.sh` in place, so that
+        biomni's execute node would find something runnable. The transcript
+        that survived showed the assistant launching a script with no gate
+        anywhere in sight, and on the next turn it read that back and
+        apologised to the user for bypassing an approval that had in fact been
+        given:
+
+            "I have to flag something before anything else: I submitted that
+             run directly instead of putting it through the approval box
+             first. That was my mistake."
+
+        It had not. The evidence had been erased from the record it was
+        reading. So the decision is stored here, structurally, and the sentence
+        the model sees is RENDERED from it -- never hand-written, never edited
+        afterwards, and never attributed to the assistant. If the outcome is
+        later reconciled to something else, this changes and the rendering
+        changes with it.
+
+        Append-only, because a decision is a historical fact and a list of them
+        is the run's history. `by` is recorded and is always the user: nothing
+        in this application decides to submit.
+        """
+        record = self.get(name)
+        if record is None:
+            return None
+        entry = {"decision": decision, "revision": revision,
+                 "at": _now(), "by": "user"}
+        if feedback:
+            entry["feedback"] = feedback
+        if outcome is not None:
+            entry["outcome"] = {"status": outcome.status,
+                                "jobs": outcome.jobs_seen,
+                                "expected": outcome.expected,
+                                "job_list": outcome.job_list,
+                                "detail": outcome.detail}
+        self.update(name, decisions=list(record.get("decisions") or ()) + [entry])
+        return entry
 
     def add_note(self, name, text):
         """Attach a finding to a run -- what /diagnose concluded, in one line.
@@ -638,6 +810,19 @@ def _normalise(record):
     record.setdefault("job_list_baseline", None)
     record.setdefault("submitted_script", None)
     record.setdefault("submitted_since", None)
+    # Proposal identity. `revision` names the proposal this record currently
+    # holds; the two lists are the revisions that can never become actionable
+    # again. All absent on every record written before identity existed, and
+    # absent means NO OPINION -- classify() and the approval check both skip a
+    # comparison they cannot make, so nothing built earlier becomes
+    # unapprovable. See gate.revision().
+    record.setdefault("revision", None)
+    record.setdefault("superseded", [])
+    record.setdefault("rejected", [])
+    # What a human decided at the gate, as data. The model's account of an
+    # approval is RENDERED from this rather than written by hand, so the
+    # transcript cannot drift from what happened. See agent._record_decision.
+    record.setdefault("decisions", [])
     if "status" not in record:
         record["status"] = GONE if record["gone"] else SUBMITTED
     # Keep the two representations agreeing, whichever way the record arrived.
@@ -799,7 +984,28 @@ def find_job_list(workdir, since, output_dir=None, script=None):
 # `# TOTAL: 46 jobs`, from the header GenPipes writes above every script. The
 # script's own count of what it intends to submit, which is what makes "exit 0"
 # checkable instead of merely hopeful.
-_TOTAL_JOBS = re.compile(r"^#\s*TOTAL:\s*(\d+)\s+jobs?\s*$", re.M)
+#
+# GenPipes writes that line in TWO shapes, and missing the second one cost a
+# whole approval:
+#
+#     #   TOTAL: 46 jobs
+#     #   TOTAL: 0 job... skipping
+#
+# The second is what a pipeline emits when every output is already on disk --
+# an entirely ordinary thing to hit when re-running a test into a directory
+# that still holds yesterday's results. This pattern used to anchor `jobs?` to
+# end-of-line, so `0 job... skipping` did not match and expected_jobs() came
+# back None. None means "the script does not say", which sent a perfectly
+# well-understood outcome down reconcile()'s unestablished branch: the person
+# saw `the outcome is unknown  ·  the script declares no job total` for a
+# submission whose script said, in the clearest terms available, that it
+# contained nothing to submit.
+#
+# Both shapes exactly, rather than a loose tail. A third shape should come back
+# None and be called unknown, which is the honest answer for a header this code
+# has never seen -- see expected_jobs on why None must never soften into zero.
+_TOTAL_JOBS = re.compile(
+    r"^#\s*TOTAL:\s*(\d+)\s+jobs?(?:\.\.\.\s*skipping)?\s*$", re.M)
 
 # The four header assignments that decide where the job list lands. All literal
 # in the header except for the $-references between them, which resolve against
@@ -817,7 +1023,98 @@ _RUNNER_ERROR = re.compile(r"Error running Bash script \(exit code\s*(\d+)")
 # EMPTY one is itself a finding: it is what a failed sbatch leaves behind in a
 # script that lacks pipefail, and counting it as a submission would turn the
 # one case exit-status cannot see into a false success.
-_SUBMITTED_LINE = re.compile(r"^\s*Submitted job with ID:\s*(\S*)\s*$", re.M)
+# The `(?:^|<observation>)` alternation is not defensive dressing -- it is an
+# off-by-one that cost a job on every single count. An observation is stored as
+# one string with the tag glued to the first line:
+#
+#     <observation>Submitted job with ID: 17784414
+#     Submitted job with ID: 17784415
+#
+# so `^\s*` matched every line except the first, and a 46-job submission
+# reported 45 ids. Harmless while ids were only corroboration; not harmless now
+# that they are the evidence recovering a lost outcome, where 45-of-46 reads as
+# a partial submission and 46-of-46 reads as a clean one.
+_SUBMITTED_LINE = re.compile(
+    r"(?:^|<observation>)\s*Submitted job with ID:\s*(\S*)\s*$", re.M)
+
+
+def expand(path):
+    r"""A path as the SHELL would read it: `~` and `$VARS` resolved.
+
+    Nothing in os.path does this, and the omission is silent rather than loud.
+    `os.path.isabs("~/run/cmd.sh")` is False -- as far as os.path is concerned
+    that is a relative path beginning with a directory literally named `~` --
+    and `os.path.exists()` on it goes looking for one. A model writes these
+    constantly, because they are what a person writes:
+
+        -g ~/ampliconseq_cit_test/ampliconseq_cit_cmd.sh
+        -r $MUGQIC_INSTALL_HOME/testdata/ampliconseq/readset.txt
+
+    What that cost: a run whose script was generated perfectly, at a path bash
+    would have expanded without comment, was refused at /approve as "not on
+    disk" -- and every run with a `~` or `$VAR` in its `-g` has been unable to
+    find its own job list, so a complete submission reconciled as
+    `submit_unknown` rather than as the success it was.
+
+    A `$` that survives is left standing rather than blanked. `expandvars`
+    leaves an unset variable as written, and that distinction is the whole
+    point: a path still holding a `$` is one this process CANNOT check -- the
+    variable is set by `module load` in the shell that runs the command, not
+    here -- and a caller must read that as "unverifiable", never as "absent".
+    See resolvable().
+    """
+    return os.path.expanduser(os.path.expandvars(str(path or "")))
+
+
+def resolvable(path):
+    """Can this process check whether `path` exists at all?
+
+    False for a path still carrying an unexpanded `$VAR` after expand(). The
+    honest answer about such a path is "I don't know", and the one thing a
+    caller must not do is turn "I don't know" into "it isn't there" -- that is
+    a refusal aimed at a run that is probably fine.
+    """
+    return bool(path) and "$" not in expand(path)
+
+
+def resolve_path(path, *bases):
+    """`path` as an absolute path that EXISTS, or None.
+
+    Tries it as written (after expand()), then against each base directory in
+    turn for a relative path. Bases are given most-authoritative first by the
+    caller; None and "" are skipped so callers can pass optional fields
+    straight through.
+    """
+    if not path:
+        return None
+    expanded = expand(path)
+    candidates = [expanded]
+    if not os.path.isabs(expanded):
+        candidates = [os.path.join(expand(base), expanded)
+                      for base in bases if base] + [expanded]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def observation(output, code):
+    """An <observation> for a command this tool ran itself, in the one shape
+    the reconciliation already reads.
+
+    Deliberately imitates what biomni's execute node prints, rather than
+    inventing a second format. execution_failed() and reconcile() decide
+    whether a submission failed by looking for _RUNNER_ERROR, and a submission
+    run outside the graph -- see agent._perform_submission -- has to be
+    gradeable by exactly the same standard as one run inside it. Two formats
+    would be two parsers that have to agree forever about what a failure looks
+    like.
+    """
+    body = str(output or "")
+    if code:
+        return (f"<observation>Error running Bash script (exit code {code}):\n"
+                f"{body}</observation>")
+    return f"<observation>{body}</observation>"
 
 
 def _header(script):
@@ -1153,6 +1450,234 @@ def reconcile(script=None, observation=None, baseline=None, after=None,
                    detail="the outcome of the submission could not be read")
 
 
+# ===========================================================================
+#  Classification: which status a record's EVIDENCE supports.
+#
+#  The registry caches a status because reading one should not cost a
+#  deserialised message history per row. A cache is only safe if something can
+#  correct it, and this is that something: one pure function, over evidence
+#  gathered from every durable source, whose answer beats whatever happens to
+#  be written down.
+#
+#  Pure and stdlib-only on purpose. Deciding is a table; GATHERING needs the
+#  graph, the filesystem and sometimes Slurm, and that half lives in
+#  agent.evidence_for(). Split this way the precedence rules -- the part that
+#  is easy to get subtly wrong and impossible to notice -- are testable in CI
+#  in milliseconds, against evidence dicts written by hand.
+# ===========================================================================
+
+# Evidence that was not gathered. Distinct from False, and the distinction is
+# the whole reason the sentinel exists: "no live gate interrupt" is grounds to
+# lapse a run, and "the checkpoint could not be opened" is grounds to change
+# nothing. Collapsing them would let a locked database retire every pending
+# decision in the registry.
+UNKNOWN = "?"
+
+
+class Standing:
+    """What a record's evidence supports: a status, and why it says so.
+
+    `why` is not decoration. It goes into the record as `reconciled_because`,
+    into /list's row, and into the migration report -- a status that changed
+    under somebody without saying what changed it is the failure this whole
+    mechanism exists to stop repeating.
+    """
+
+    __slots__ = ("status", "why", "outcome")
+
+    def __init__(self, status, why="", outcome=None):
+        self.status = status
+        self.why = why
+        self.outcome = outcome
+
+    def __eq__(self, other):
+        return (isinstance(other, Standing) and self.status == other.status
+                and self.why == other.why)
+
+    def __repr__(self):
+        return f"<Standing {self.status}: {self.why}>"
+
+
+def classify(record, evidence=None):
+    """The status this record's evidence supports, as a Standing.
+
+    PRECEDENCE, and the order is the design:
+
+      0. A terminal record is never reclassified. Somebody said no, or the
+         artifacts are gone. Neither is a state evidence can argue with.
+
+      1. A record nobody here proposed -- /scan, /track -- is left alone. It
+         has no thread and no gate, and "no live interrupt" is not news about
+         a run that never had one.
+
+      2. SUBMISSION EVIDENCE WINS OVER EVERYTHING BELOW IT. This is the rule
+         that `test-now` cost us: 46 jobs went to the scheduler, the turn that
+         would have recorded them died, and the record still said `held` three
+         weeks later because nothing ever asked whether it had run. A run that
+         has spent an approval cannot be awaiting one, whatever the checkpoint
+         looks like and whatever the registry last wrote down.
+
+      3. No proposal means nothing to approve.
+
+      4. A REJECTED revision can never come back. Checked before the gate,
+         because a live interrupt for a rejected proposal is exactly the shape
+         of the bug: the graph does not know a person said no, only the record
+         does.
+
+      5. A SUPERSEDED revision is not the current one. /modify moved on.
+
+      6. Then, and only then, the gate. It must exist AND authorise THIS
+         proposal -- an interrupt raised for an older revision is not a
+         decision about the one on the record, which is the difference between
+         "a gate exists" and "this proposal is awaiting approval".
+
+      7. Evidence that could not be gathered changes nothing.
+
+    `evidence` keys, all optional, all defaulting to UNKNOWN:
+
+        gate           True | False | UNKNOWN -- a live GATE-kind interrupt is
+                       parked on this run's thread
+        gate_revision  the revision that interrupt authorises, or None when it
+                       carries none (every interrupt raised before identity
+                       existed), or UNKNOWN when the gate was not inspected
+        outcome        an Outcome from reconcile(), when submission evidence
+                       was found and graded
+        submitted      True when something proves the command ran, even if the
+                       outcome could not be graded
+    """
+    evidence = evidence or {}
+    status = record.get("status")
+
+    if status in TERMINAL:
+        return Standing(status, "terminal — nothing reclassifies it")
+
+    if (record.get("source") or "agent") != "agent":
+        return Standing(status, f"adopted from {record.get('source')} "
+                                f"— never had a gate")
+
+    # ---- 2. submission evidence, ahead of everything else ---------------- #
+    #
+    # RECONCILIATION ADVANCES A RECORD; IT DOES NOT CHURN ONE. A record that
+    # has already been graded keeps its verdict, and the single exception is
+    # SUBMITTING -- the one status that means "this was in flight when we last
+    # looked", which is the only claim about the past that goes stale.
+    #
+    # Without that exception this pass re-grades every settled run on every
+    # startup, from evidence that has aged: a job list purged from scratch, a
+    # `# TOTAL: 0 jobs` header, an accounting record beyond sacct's retention.
+    # It demoted a correctly-submitted run to `submit_unknown` the first time
+    # it was tried, on the strength of a job list that was no longer there.
+    settled = status in AFTER_APPROVAL and status != SUBMITTING
+    outcome = evidence.get("outcome")
+    if outcome is not None and not settled:
+        return Standing(outcome.status,
+                        outcome.detail or "reconciled from submission evidence",
+                        outcome)
+    if evidence.get("submitted") is True and not settled:
+        return Standing(SUBMIT_UNKNOWN,
+                        "the command ran, but the outcome could not be graded")
+    if status in AFTER_APPROVAL:
+        # Already past the gate and nothing new to say about it. Left exactly
+        # as it is rather than being re-graded from silence.
+        return Standing(status, "already submitted")
+
+    # ---- 3-5. the proposal itself ---------------------------------------- #
+    if not record.get("proposal"):
+        return Standing(LAPSED, "no proposal on record")
+
+    revision = record.get("revision")
+    if revision:
+        if revision in (record.get("rejected") or ()):
+            return Standing(ABANDONED, "this proposal was rejected")
+        if revision in (record.get("superseded") or ()):
+            return Standing(LAPSED, "this proposal was superseded by a change")
+
+    # ---- 6-7. the gate ---------------------------------------------------- #
+    gate = evidence.get("gate", UNKNOWN)
+    if gate is UNKNOWN:
+        return Standing(status, "the checkpoint could not be consulted")
+    if not gate:
+        return Standing(LAPSED, "no live gate — the decision was not left open")
+
+    gate_revision = evidence.get("gate_revision", UNKNOWN)
+    if (gate_revision is not UNKNOWN and gate_revision and revision
+            and gate_revision != revision):
+        return Standing(LAPSED, "the open gate is for an earlier version of "
+                                "this run")
+
+    return Standing(HELD, "a decision is open for this exact proposal")
+
+
+def jobs_are_unreachable(record):
+    """This run submitted jobs, and none of them can be looked at. True/False.
+
+    The state `test-now` and `ampliconseq_demo` are in, and it needed a name
+    because three different screens were each inventing their own wrong answer
+    for it.
+
+    What is KNOWN: the command ran and put N jobs on the scheduler. Reconciling
+    them recovered the count from the conversation's own record of the launch.
+    What is NOT known: anything about the individual jobs -- there is no
+    manifest on disk, so there is no list of ids to ask Slurm about, and after
+    this long sacct would not remember them anyway.
+
+    The three wrong answers this replaces, all from the same missing
+    distinction -- "no job list" being read as "no jobs":
+
+      /list    "nothing to run", which says GenPipes generated no work.
+               46 jobs is not no work.
+      /check   "either every step was already up to date, or GenPipes wrote its
+               list outside the directories searched" -- a guess between two
+               possibilities, offered after the answer had been established.
+      /view    offered /check and /diagnose, neither of which can do anything
+               without a manifest.
+
+    Distinct from a GONE run, and the difference is real rather than
+    bookkeeping: GONE means a list existed at a path we recorded and has since
+    been purged. This means one was never recorded in the first place, which is
+    what happened to every run submitted before begin_submission() existed.
+    """
+    if record.get("status") not in AFTER_APPROVAL:
+        return False
+    if record.get("job_list"):
+        return False
+    seen = record.get("jobs_seen")
+    return bool(seen)
+
+
+def ran_already(record):
+    """Durable, filesystem-only proof that this run's command has run.
+
+    True, or UNKNOWN. Never False -- and that asymmetry is the point. A run
+    with no job list anywhere may have submitted nothing, or may have been a
+    submission where every step was already up to date, which writes no list at
+    all and is a real successful outcome. Absence of a manifest is not evidence
+    of absence of a submission, so this reports only what it can prove.
+
+    Deliberately does not touch the checkpoint or Slurm. This is the half of
+    the evidence that survives a lost conversation and an aged-out accounting
+    database, which is what makes it worth asking first.
+    """
+    path = record.get("job_list")
+    if path and os.path.exists(path):
+        return True
+    script = record.get("submitted_script")
+    if script:
+        declared = declared_job_list(script)
+        if declared and os.path.exists(declared):
+            after = job_list_state(declared)
+            added = rows_added(record.get("job_list_baseline"), after)
+            if added:
+                return True
+            # The file exists and this approval added nothing to it. That is
+            # evidence the command RAN -- GenPipes wrote the header -- and no
+            # evidence about what it submitted. Enough to stop calling the run
+            # pending; not enough to grade.
+            if after and after.get("rows"):
+                return True
+    return UNKNOWN
+
+
 def parse_job_list(path):
     """Read a GenPipes job_list file into Job objects.
 
@@ -1358,20 +1883,115 @@ def already_known(registry, found):
     return None
 
 
-def _run(cmd, env=None):
+def _run(cmd, env=None, cwd=None):
     """Run a shell command, returning (stdout+stderr, returncode).
 
     Every cluster call in this module funnels through here so a missing
     scheduler behaves like an empty answer rather than an exception: on a laptop
     there is no sacct, and the right response to that is "I don't know the
     states", not a traceback in the middle of the interface.
+
+    `cwd` matters for exactly one caller and matters absolutely there: a
+    generation and the submission that follows it have to run in the directory
+    the run was built in, or every relative `-o`, `-g` and `-c` on the command
+    line means a different file. See run_block.
     """
     try:
         out = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                             executable="/bin/bash", env=env)
+                             executable="/bin/bash", env=env, cwd=cwd or None)
     except OSError as e:
         return f"{e}", 127
     return out.stdout + (("\n" + out.stderr) if out.stderr else ""), out.returncode
+
+
+def run_block(block, cwd=None):
+    """Run a recorded command block, as written, where it was written.
+
+    (output, exit code). Used to re-run a proposal's own generation and then to
+    launch the script it produces -- the two halves of what /approve does --
+    and it is deliberately dumb: the block already ran once, from this process,
+    in this directory, so re-running it byte-for-byte is the version least
+    likely to do something different the second time.
+
+    The one addition is a `module load` fallback, for the case where the model
+    loaded GenPipes in an EARLIER block than the one recorded here. That load
+    lived in a shell that is long gone, so the recorded block alone would come
+    back `genpipes: command not found`. Prepended only when the block does not
+    load anything itself and genpipes is not already on PATH, and its failure
+    is swallowed (`;`, not `&&`) so that a machine with no module system runs
+    the block exactly as it would have anyway.
+    """
+    text = str(block or "").strip()
+    if not text:
+        return "", 0
+    if "module load" not in text and shutil.which("genpipes") is None:
+        text = f"module load {GENPIPES_MODULE} >/dev/null 2>&1; {text}"
+    return _run(text, cwd=cwd)
+
+
+# `genpipes <pipeline> --help` output, and the flag surface parsed out of it,
+# both keyed and both kept for the life of the process.
+#
+# Caching is safe for exactly one reason and it is worth naming: the module
+# version is PINNED (GENPIPES_MODULE above), so within one process --help is a
+# constant. It is worth doing because the callers are interactive. The step
+# panel asks for it on every /modify, the gate asks for the flag surface on
+# every proposal, and a quarter-second of subprocess under a keystroke is the
+# difference between a panel that opens and a panel that hesitates.
+_HELP_CACHE = {}
+_USAGE_CACHE = {}
+
+
+def pipeline_help(pipeline, protocol=None):
+    """`genpipes <pipeline> [-t <protocol>] --help`, as text.
+
+    The only authority on what a protocol's steps are, what flags it takes, and
+    which of those flags argparse will not run without. There is no step table
+    in this repo and there must not be one: genpipes.md says so outright,
+    because the numbered list is version-exact and a copy here would be wrong on
+    the next GenPipes release while looking authoritative.
+
+    Returns "" when it cannot be reached -- on a laptop, or with no module
+    system -- and every caller must treat that as "no opinion", never as "no
+    problem". A "" is cached like any other answer: a machine with no GenPipes
+    on it will not acquire one mid-session, and retrying the failure under every
+    keystroke is how a missing module system turns into a slow interface.
+    """
+    if not pipeline:
+        return ""
+    key = (str(pipeline), str(protocol or ""))
+    if key in _HELP_CACHE:
+        return _HELP_CACHE[key]
+    proto = f" -t {protocol}" if protocol else ""
+    raw, code = _run(f"module load {GENPIPES_MODULE} >/dev/null 2>&1; "
+                     f"genpipes {pipeline}{proto} --help")
+    # argparse exits non-zero on some installs after printing perfectly good
+    # help, so the text is trusted whenever it looks like help -- a usage line
+    # or a step list -- rather than only when the exit code was clean.
+    text = raw if (code == 0 or "Steps:" in raw or "usage:" in raw) else ""
+    _HELP_CACHE[key] = text
+    return text
+
+
+def pipeline_usage(pipeline):
+    """Which flags this pipeline takes and which it requires, as a usage.Usage.
+
+    Falsy when --help could not be read, which callers must let through
+    untouched: an unreadable install is not evidence that a command is missing
+    a flag, and manufacturing a refusal from a missing module system would make
+    the tool unusable in exactly the place it is hardest to debug.
+
+    No protocol is passed. `-t` changes the STEP list and not the flag surface
+    -- checked across all ten pipelines on 6.1.1 -- so one lookup per pipeline
+    serves every protocol, and the step panel's own per-protocol fetch stays
+    separate.
+    """
+    if not pipeline:
+        return usage.Usage()
+    key = str(pipeline)
+    if key not in _USAGE_CACHE:
+        _USAGE_CACHE[key] = usage.read(pipeline_help(pipeline), pipeline)
+    return _USAGE_CACHE[key]
 
 
 def query_states(job_ids):
@@ -1844,6 +2464,10 @@ def resolve_all(records):
 # ===========================================================================
 
 HELD_BUCKET = "held"
+# A proposal with no live gate. Its own bucket rather than a flavour of HELD,
+# because the two differ in the only way a /list row has to get right: what you
+# can do about it. HELD offers /approve; this one cannot, and says so.
+LAPSED_BUCKET = "lapsed"
 ACTIVE_BUCKET = "active"
 ATTENTION_BUCKET = "attention"
 FINISHED_BUCKET = "finished"
@@ -1873,6 +2497,8 @@ def list_bucket(record, status):
     """
     if record.get("status") == HELD:
         return HELD_BUCKET
+    if record.get("status") == LAPSED:
+        return LAPSED_BUCKET
     # Checked before `status is None`, which would otherwise file an unresolved
     # submission under FINISHED and report a run that may have half a pipeline
     # on the cluster as though it had completed cleanly.
@@ -1944,6 +2570,7 @@ def list_line(status):
 # from here, so the two can never end up calling the same run different things.
 LIST_TAG = {
     HELD_BUCKET: "held",
+    LAPSED_BUCKET: "needs rebuilding",
     ACTIVE_BUCKET: "live",
     ATTENTION_BUCKET: "needs attention",
     FINISHED_BUCKET: "completed",

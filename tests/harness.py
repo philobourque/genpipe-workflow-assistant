@@ -51,6 +51,21 @@ class Report:
         return 0 if self.failed == 0 else 1
 
 
+# How a scripted model notices it has been rejected: the phrase the gate node
+# renders into the transcript when a decision comes back not-approved.
+#
+# IMPORTED FROM THE PRODUCTION SOURCE rather than retyped, and that is the
+# whole point of it having a name. It lives in gate.py because that module is
+# stdlib-only: importing it from agent.py would drag biomni into every offline
+# suite, which is exactly what these tests exist to avoid. This used to be the literal "was not
+# approved" inlined in invoke(), so rewording the message the model actually
+# receives silently stopped every rejection test from rejecting -- the scripts
+# ran on past the branch they existed to exercise and the suite reported a
+# stale value instead of a failure. A fixture that quietly agrees with itself
+# is worse than one that breaks loudly.
+from genpipe.gate import REJECTION_MARK as _REJECTION_MARK
+
+
 class ScriptedLLM:
     """Stands in for agent.llm: returns canned responses instead of calling a model.
 
@@ -84,7 +99,7 @@ class ScriptedLLM:
         self.calls += 1
         text = "\n".join(str(getattr(m, "content", "")) for m in messages)
         self.seen.append(text)
-        if self.on_reject and "was not approved" in text:
+        if self.on_reject and _REJECTION_MARK in text:
             self.script, self.on_reject, self.i = self.on_reject, None, 0
         reply = self.script[min(self.i, len(self.script) - 1)]
         self.i += 1

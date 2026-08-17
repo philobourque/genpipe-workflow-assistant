@@ -43,6 +43,7 @@ on every push.
 import os
 import re
 
+from . import gate
 from . import slots
 
 # Rows the gate will offer to change, in the order they are offered. `name`
@@ -245,7 +246,11 @@ def rows_for(proposal, name="", resources=""):
     slot_values = (proposal or {}).get("slots") or {}
     pipeline = slot_values.get("pipeline")
     protocol = slot_values.get("protocol") or slots.DEFAULTS.get(pipeline or "")
-    proto = slots.find_protocol(pipeline, protocol) if pipeline else None
+    # slots.needs_of, not a second reading of the same tables. This used to ask
+    # `proto.needs` with `chipseq` hardcoded beside it, which never consulted
+    # slots._PIPELINE_NEEDS -- so ampliconseq and rnaseq_light, which take no
+    # `-t` and DO require a design, were offered no design row to add one with.
+    needs = slots.needs_of(pipeline, protocol) if pipeline else None
 
     out = []
     for row in ROWS:
@@ -256,14 +261,45 @@ def rows_for(proposal, name="", resources=""):
             out.append((row, resources or ""))
             continue
         if row == "design" and not current(proposal, row):
-            if not (proto and proto.needs == slots.DESIGN) and pipeline not in ("chipseq",):
+            # chipseq is the one pipeline where a design is genuinely optional
+            # -- it turns peak calling into differential binding -- so it is
+            # offered there without being required. See slots._DESIGN_OPTIONAL.
+            if needs != slots.DESIGN and pipeline not in slots._DESIGN_OPTIONAL:
                 continue
         if row == "pairs" and not current(proposal, row):
-            if not (proto and proto.needs == slots.PAIRS):
+            if needs != slots.PAIRS:
                 continue
         if row == "protocol" and pipeline and not slots.protocols(pipeline):
             continue          # this pipeline takes no -t at all
         out.append((row, name if row == "name" else current(proposal, row)))
+
+    # Last, and only ever to REMOVE. `accepts` is the flag list from this
+    # install's own `--help` (gate.with_usage), and it is the final say on
+    # whether a flag exists at all -- a row for a flag argparse would reject is
+    # not a change anybody can make.
+    #
+    # The direction is the safety argument, and it is why this is a filter over
+    # the tables rather than a replacement for them. --help knows what argparse
+    # PARSES and nothing about what the pipeline does with it: `-d` is on
+    # covseq's usage line and no covseq step reads a design. Building rows from
+    # --help would offer a design on every pipeline in the install; filtering
+    # with it only drops the ones that could not have been questions.
+    #
+    # Absent when --help could not be read, and that must stay a no-op rather
+    # than an empty list, or a laptop with no GenPipes on it gets a /modify
+    # panel with no rows in it.
+    #
+    # A row that HAS a value is kept whatever --help says, and that exception is
+    # not a hedge against a bad parse -- it is the more important half. If a
+    # command somehow carries `-p` on a pipeline with no `-p`, that is a real
+    # error sitting in a real command, and dropping its row would take it off
+    # the panel that exists to fix it while leaving it on the command that runs.
+    # The flag surface suppresses OFFERS. It never conceals what was written.
+    accepts = (proposal or {}).get("accepts")
+    if accepts:
+        keep = set(accepts)
+        out = [(row, value) for row, value in out
+               if value or row not in FLAG_OF or FLAG_OF[row] in keep]
     return out
 
 
@@ -549,6 +585,77 @@ def check(row, value, proposal, directory=".", registry=None, name=None,
 # they can happen.
 # ---------------------------------------------------------------------------
 
+# What a comparison of two proposals can find about one row.
+#
+# THREE ANSWERS, NOT ONE, and the middle one is why this function exists.
+APPLIED = "applied"    # asked for, and the command moved
+IGNORED = "ignored"    # asked for, and the command did NOT move
+DRIFTED = "drifted"    # nobody asked, and the command moved anyway
+
+
+def compare(before, after, requested=()):
+    """{row: APPLIED | IGNORED | DRIFTED} between two proposals.
+
+    WHAT THIS REPLACES. The gate used to paint a row green when it appeared in
+    the list of rows somebody ASKED to change -- a list written before the
+    model ran, and never checked against what came back. So a /modify that the
+    model quietly dropped produced a box showing the old value with a green
+    tick beside it, which is the worst arrangement available: the value was
+    always truthful, and the mark that people read INSTEAD of re-reading the
+    value was not.
+
+    The gate has to answer "what will run if I approve now?". A green row that
+    means "what I asked for" answers a different question and looks like an
+    answer to this one.
+
+    DRIFTED is the half that never existed and is arguably worth more than the
+    other two. modify.sentence() spends most of its length telling the model
+    what NOT to touch, precisely because a regeneration can move a flag nobody
+    mentioned -- and until now nothing on the screen would have shown it.
+
+    Compares SLOTS, which are a parse of the generated command, so this is a
+    comparison of what executes and not of anything a caller asserted about it.
+    Rows are the mirror's vocabulary, so the answer can be handed straight to
+    the renderer.
+
+    `before` may be None -- a run reaching the gate for the first time has
+    nothing to differ from, and every row is then simply unremarkable rather
+    than drifted.
+    """
+    requested = set(requested or ())
+    if not after:
+        return {}
+    old = (before or {}).get("slots") or {}
+    new = (after or {}).get("slots") or {}
+
+    def value(slots, row):
+        got = slots.get(SLOT_OF.get(row, row))
+        if isinstance(got, (list, tuple)):
+            # `-c` is an ordered stack and its ORDER is its semantics, so this
+            # compares the sequence rather than the set. Re-ordering the same
+            # inis is a real change to what the run does.
+            return tuple(str(x) for x in got)
+        return "" if got is None else str(got)
+
+    out = {}
+    for row in ROWS:
+        if row not in SLOT_OF:
+            continue                       # name, resources: not in the command
+        moved = before is not None and value(old, row) != value(new, row)
+        if row in requested:
+            out[row] = APPLIED if moved else IGNORED
+        elif moved:
+            out[row] = DRIFTED
+    # A requested row with no slot of its own still deserves an answer, and
+    # `resources` is the case: it changes a FILE rather than a flag, so the
+    # comparison above cannot see it. Reported as applied, because the file was
+    # written before the model was ever asked -- whether it reached the -c
+    # stack is a separate question the mirror answers on its own line.
+    for row in requested - set(out):
+        out[row] = APPLIED
+    return out
+
+
 def required_after(proposal, changes):
     """Rows a change set has just made MANDATORY, as {row: why}.
 
@@ -669,22 +776,157 @@ def cross_check(proposal, changes):
 # steps; it reads them.
 # ---------------------------------------------------------------------------
 
-# `3- trimmomatic` / `12- gatk_haplotype_caller`, which is how GenPipes numbers
-# the step list in its own --help output.
-_HELP_STEP = re.compile(r"^\s*(\d+)-\s*(\S+)")
+# One numbered step in a `--help` step list.
+#
+# BOTH SPELLINGS, and the reason the old one alone was a silent failure is
+# worth stating. This pattern used to be `^\s*(\d+)-\s*(\S+)` -- a hyphen after
+# the number -- which is what GenPipes 4.x and earlier print:
+#
+#     4.6.1   1- trimmomatic16S          (and no `genpipes` entry point at all;
+#                                         the CLI was `ampliconseq.py`)
+#     5.x/6.x 1 trimmomatic16S
+#
+# runs.pipeline_help() shells `genpipes <pipeline> --help`, which does not
+# exist before 5.0 -- so the parser was written for a CLI this application
+# cannot invoke, and returned [] for every version it can. Nothing raised.
+# step_risk() answered "no opinion" to every question, the out-of-range hard
+# stop never fired, and the resources panel reported "--help could not be read"
+# about help it had read in full.
+#
+# The legacy form is still accepted because accepting it costs one character
+# and refusing it would be a second silent failure the day somebody runs this
+# against an older module.
+_HELP_STEP = re.compile(r"^\s*(\d+)-?\s+(\S+)\s*$")
+
+# `Protocol germline_snv` -- the header 5.x/6.x prints above each protocol's
+# step list. See steps_from_help for why finding these is not optional.
+_HELP_PROTOCOL = re.compile(r"^\s*Protocol\s+(\S+)\s*$")
+
+# What a step list request could not produce, and why. Four answers, not two,
+# because they call for four different things to be said to a person -- and
+# because "I could not read --help" is a lie when --help was read perfectly
+# and simply printed a shape this parser does not know.
+STEPS_OK = "ok"                    # parsed; the list is usable
+STEPS_UNAVAILABLE = "unavailable"  # --help could not be run or returned nothing
+STEPS_UNPARSEABLE = "unparseable"  # --help ran and printed no list we recognise
+STEPS_AMBIGUOUS = "ambiguous"      # several protocols, and none was named
 
 
-def steps_from_help(text):
-    """[(number, name)] as --help lists them. Empty if it did not list any."""
-    seen, out = set(), []
+def protocols_in_help(text):
+    """{protocol: [(number, name)]} for every protocol `--help` describes.
+
+    The sectioning is the part that matters. `genpipes dnaseq --help` with no
+    `-t` prints SEVEN protocols' step lists, every one of them starting at 1:
+
+        germline_snv 1-27   germline_sv 1-25   germline_high_cov 1-15
+        somatic_tumor_only 1-22   somatic_fastpass 1-23
+        somatic_ensemble 1-39     somatic_sv 1-14
+
+    A parser that merged them and deduplicated by number -- which is what this
+    module did -- answered "1-27" for all seven. Step 30 is valid for exactly
+    one of them and invalid for the other six, so the merged answer was wrong
+    in both directions at once: it would have refused a legitimate
+    somatic_ensemble range and waved through an impossible somatic_sv one.
+
+    A help text with no `Protocol` header at all (older layouts, or a pipeline
+    that takes no -t) puts its steps under the empty-string key, so a caller
+    that does not care about protocols still gets them.
+    """
+    sections, current = {}, ""
     for line in (text or "").splitlines():
+        header = _HELP_PROTOCOL.match(line)
+        if header:
+            current = header.group(1)
+            sections.setdefault(current, [])
+            continue
         m = _HELP_STEP.match(line)
-        if m:
-            n = int(m.group(1))
-            if n not in seen:
-                seen.add(n)
-                out.append((n, m.group(2)))
-    return out
+        if not m:
+            continue
+        rows = sections.setdefault(current, [])
+        number = int(m.group(1))
+        if number not in {n for n, _ in rows}:
+            rows.append((number, m.group(2)))
+    return {name: rows for name, rows in sections.items() if rows}
+
+
+def step_list(text, protocol=None):
+    """(status, [(number, name)]) for one protocol's steps.
+
+    The four-way answer. Callers must honour it rather than testing the list
+    for emptiness, because three of the four are empty and they mean different
+    things -- and one of them, UNPARSEABLE, is a bug report about this parser
+    rather than anything the person can act on.
+
+    `protocol` scopes the answer. Absent, a single-protocol help is returned as
+    the obvious answer and a multi-protocol one is refused as AMBIGUOUS: there
+    is no defensible way to pick, and picking silently is what produced a
+    validator that graded ampliconseq ranges against dnaseq numbers.
+    """
+    if not (text or "").strip():
+        return STEPS_UNAVAILABLE, []
+    sections = protocols_in_help(text)
+    if not sections:
+        return STEPS_UNPARSEABLE, []
+    if protocol and protocol in sections:
+        return STEPS_OK, sections[protocol]
+    if protocol:
+        # Named a protocol this help does not describe. Usually because the
+        # help was fetched without `-t` for a pipeline that has several; the
+        # honest answer is that this text cannot settle it.
+        return (STEPS_AMBIGUOUS, []) if len(sections) > 1 else (
+            STEPS_OK, next(iter(sections.values())))
+    if len(sections) == 1:
+        return STEPS_OK, next(iter(sections.values()))
+    return STEPS_AMBIGUOUS, []
+
+
+def steps_from_help(text, protocol=None):
+    """[(number, name)], or [] when the list could not be established.
+
+    The thin form, for callers that only want the rows. Anything that reports
+    to a person should use step_list() and say WHICH kind of nothing it got.
+    """
+    return step_list(text, protocol)[1]
+
+
+# A step range somebody actually asked for, in prose.
+#
+# SEMANTICALLY SCOPED, and the previous version was not. cli._step_risks used
+# a bare `\b(\d+(?:-\d+)?...)\b` to decide whether a /modify mentioned steps,
+# which matches the first number in ANY sentence:
+#
+#     "set walltime to 24 hours"    -> 24    valid_steps -> True
+#     "raise mem_per_cpu to 8"      -> 8     valid_steps -> True
+#     "use the 2024 genome build"   -> 2024  valid_steps -> True
+#
+# Harmless only for as long as step_risk() was broken and answered nothing to
+# every question. The moment the parser works, `/modify x set walltime to 24
+# hours` hard-stops with "step 24 is not in this protocol -- it has 1-8", and a
+# walltime change becomes an error message about steps. That is why the parser
+# fix and this one are one change.
+#
+# So a number is a step range only when the sentence says so: the word `step`
+# or `steps`, or the flag `-s`, within a short reach of it. "steps 3-6",
+# "-s 1-4", "run steps 2 through 5" all match; nothing about walltime, memory
+# or genome builds does.
+_STEPS_MEANT = re.compile(
+    r"(?:\bsteps?\b|(?<![\w-])-s\b)[^.\n]{0,24}?"
+    r"(\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*)",
+    re.I)
+
+
+def steps_meant(text):
+    """The step range a prose change asks for, as written, or None.
+
+    None is the common and correct answer: most changes are not about steps,
+    and a change this cannot read as a step range is one that gets no step
+    validation rather than one that gets a guess.
+    """
+    m = _STEPS_MEANT.search(text or "")
+    if not m:
+        return None
+    wanted = re.sub(r"\s+", "", m.group(1))
+    return wanted if valid_steps(wanted) else None
 
 
 def expand(text):
@@ -701,7 +943,7 @@ def expand(text):
     return sorted(out)
 
 
-def step_risk(wanted, help_text):
+def step_risk(wanted, help_text, protocol=None):
     """Whether a step range skips something the requested steps depend on.
 
     Reported as a RISK with its reasoning, never as a certainty. What is being
@@ -718,8 +960,14 @@ def step_risk(wanted, help_text):
     Returns (risks, hard_stop). Both may be empty, which is the normal case.
     """
     numbers = expand(wanted)
-    known = steps_from_help(help_text)
-    if not numbers or not known:
+    if not numbers:
+        return [], None
+    # Scoped to ONE protocol, and silent unless the scoping succeeded. An
+    # ambiguous or unreadable help is no opinion -- never a hard stop, because
+    # refusing a step range on the strength of a list we could not identify
+    # would block a correct run to protect against a guess.
+    status, known = step_list(help_text, protocol)
+    if status != STEPS_OK or not known:
         return [], None
 
     valid = {n for n, _ in known}
@@ -805,6 +1053,24 @@ def sentence(proposal, changes):
     return "; ".join(parts) + tail + ". Regenerate the command and stop at the gate again."
 
 
+def _base_command(proposal):
+    """The one line a fork quotes as "the run you are making a variant of".
+
+    The GENPIPES CALL, not the block it arrived in. A generation is routinely a
+    small script -- an mkdir, the call, an echo of the exit status, an ls -- and
+    a fork prompt that quotes the whole thing as "this GenPipes run" is asking
+    the model to reproduce somebody's shell scaffolding along with the command.
+    gate.invocation() is the same cut the approval box and the mirror already
+    make, so what a fork is told the old command was is what the person was
+    shown it was.
+
+    Falls back to the block, flattened, when there is no genpipes call to find:
+    a rough base still beats sending a fork off with no base at all.
+    """
+    generated = (proposal or {}).get("generated") or ""
+    return gate.invocation(generated) or " ".join(generated.split())
+
+
 def fork_sentence(proposal, changes):
     """The same change set, addressed to a conversation that has not heard any
     of this before.
@@ -821,7 +1087,7 @@ def fork_sentence(proposal, changes):
     tells it what the old one was.
     """
     substantive = {r: v for r, v in changes.items() if r != "name"}
-    base = " ".join((proposal or {}).get("generated", "").split())
+    base = _base_command(proposal)
     if not base:
         return ""
     if not substantive:
@@ -845,7 +1111,7 @@ def fork_prose(proposal, text):
     fork_sentence(): a thread that has not read the original will invent the
     seven flags nobody mentioned.
     """
-    base = " ".join((proposal or {}).get("generated", "").split())
+    base = _base_command(proposal)
     if not base or not (text or "").strip():
         return ""
     return (f"Generate a variant of this GenPipes run:\n\n    {base}\n\n"

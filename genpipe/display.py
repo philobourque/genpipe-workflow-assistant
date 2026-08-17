@@ -1426,6 +1426,19 @@ _MIRROR_LABEL = 13
 _MIRROR_FLAG = 4
 
 
+def _verdicts(changed):
+    """`changed` as {row: verdict}, whatever shape it arrived in.
+
+    Callers hand this either a plain collection of rows -- every one of them
+    applied, which is what the panel means -- or the dict modify.compare()
+    returns. Normalising here rather than at each call site keeps the three
+    renderers below reading one shape.
+    """
+    if isinstance(changed, dict):
+        return dict(changed)
+    return {row: modify.APPLIED for row in (changed or ())}
+
+
 def _mirror_state(row, active, pending, changed):
     """Which of the four states a mirror line is in, as (tint, strong).
 
@@ -1459,6 +1472,15 @@ def _mirror_state(row, active, pending, changed):
     if row is not None and row in pending:
         return WHITE, f"{BOLD}{UNDER}{WHITE}"
     if row is not None and row in changed:
+        verdict = changed[row] if isinstance(changed, dict) else modify.APPLIED
+        # RED for a change that did not land, amber for one nobody asked for.
+        # A row is only green when the command actually moved the way it was
+        # asked to -- see modify.compare for why green used to mean "requested"
+        # and why that is the one thing this screen must not say.
+        if verdict == modify.IGNORED:
+            return RED, f"{RED}{BOLD}"
+        if verdict == modify.DRIFTED:
+            return AMBER, f"{AMBER}{BOLD}"
         return GREEN, f"{GREEN}{BOLD}"
     if row is not None and row == active:
         return WHITE, f"{BOLD}{WHITE}"
@@ -1509,7 +1531,35 @@ def _count_rows(path):
     return max(0, len(rows) - 1) or None          # minus the header
 
 
-def _consequences(proposal, name):
+def _flag_line_value(m, row):
+    """The value the command actually wrote for one mirror row, or ''.
+
+    Reads the parse rather than the proposal's slots, which is the point: the
+    two are independent readings of two different commands, and the only way to
+    notice they disagree is to hold both.
+    """
+    index = m.index_of(row) if m else None
+    return m.lines[index].value if index is not None else ""
+
+
+def _job_total(proposal):
+    """How many jobs the generated script says it will submit, or None.
+
+    None where the script cannot be found or its header cannot be read, and
+    every caller must say nothing rather than guess -- the same rule
+    _count_rows follows, for the same reason: a wrong number on the approval
+    screen is worse than an absent one.
+
+    Resolved against the same bases agent.submission_gate checks the script's
+    existence with, so the two cannot disagree about which file is meant.
+    """
+    slots = (proposal or {}).get("slots") or {}
+    script = runs.resolve_path((proposal or {}).get("script"),
+                               os.getcwd(), slots.get("output_dir"))
+    return runs.expected_jobs(script) if script else None
+
+
+def _consequences(proposal, name, total=None):
     """The two or three facts somebody actually approves on.
 
     The mirror below is exact and complete, and neither of these is legible
@@ -1528,11 +1578,48 @@ def _consequences(proposal, name):
     if slots.get("protocol"):
         what += f" {slots['protocol']}"
     steps = slots.get("steps")
+    # "all steps" is an INFERENCE from an absent `-s`, not a setting anybody
+    # chose. It says so on the `steps` ROW now -- the box draws that row even
+    # when the flag is absent -- rather than here, so the fact appears once.
+    # Contrast `output` below, which stays here and is hidden as a row: an
+    # unset `-o` is a hazard and earns the loudest line on the screen, while an
+    # unset `-s` is a default and earns a row.
     detail = [f"steps {steps}" if steps else "all steps"]
     samples = _count_rows(slots.get("readset") or "")
     if samples:
         detail.append(f"{samples} sample{'s' if samples != 1 else ''}")
+    # How much work this actually is, from the generated script's own header.
+    # The most decision-relevant number on the screen and the last one to get
+    # here: everything else describes what was ASKED for, while this is what
+    # GenPipes decided that amounts to after looking at what is already on disk.
+    # Passed in rather than read here, because gate() needs the same number to
+    # word the /approve line and the two must not disagree.
+    if total:
+        detail.append(f"{total} job{'s' if total != 1 else ''}")
     out.append(f"      {BOLD}{WHITE}{what}{RESET}{DIM}, {', '.join(detail)}{RESET}")
+
+    # And the case where it amounts to nothing.
+    #
+    # GenPipes skips any step whose outputs are already present, so re-running
+    # a pipeline into a directory that still holds the last run's results
+    # generates a script with no jobs in it -- `# TOTAL: 0 job... skipping`.
+    # That is an ordinary thing to hit and it is invisible everywhere else: the
+    # box lists a readset, a design, a full config stack and a step range, and
+    # every one of those is correct. Approving it spends nothing, submits
+    # nothing, and used to come back `the outcome is unknown`, which reads like
+    # a fault in the tool rather than the pipeline saying there was no work.
+    #
+    # Amber, not red: nothing is broken and the command is fine.
+    #
+    # ONE LINE, AND NO REMEDY. This carried a second line naming `-f` and a
+    # fresh `-o` as the ways out, which is the tool explaining GenPipes to
+    # somebody who runs GenPipes. The fact is not guessable from the box and is
+    # worth the line; what to do about it is theirs, they know the flags, and a
+    # gate that starts suggesting flags is back to lecturing at the one moment
+    # somebody is trying to read quickly.
+    if total == 0:
+        out.append(f"      {AMBER}nothing to submit{RESET}{DIM} — every step's "
+                   f"output is already on disk{RESET}")
 
     where = slots.get("output_dir")
     out.append(f"      {DIM}writes into {RESET}{WHITE}{where}{RESET}" if where else
@@ -1546,7 +1633,7 @@ def _consequences(proposal, name):
 
 
 def mirror_lines(m, active=None, pending=(), changed=(), indent="      ",
-                 hide=()):
+                 hide=(), wanted=None):
     """The command mirror as a list of printable lines, for the gate.
 
     Returned rather than printed because it is drawn in two very different
@@ -1557,7 +1644,8 @@ def mirror_lines(m, active=None, pending=(), changed=(), indent="      ",
     """
     if not m:
         return []
-    pending, changed = set(pending or ()), set(changed or ())
+    pending = set(pending or ())
+    changed = _verdicts(changed)
     hide = set(hide or ())
     out = []
     pad = " " * (_MIRROR_LABEL + _MIRROR_FLAG)
@@ -1576,8 +1664,16 @@ def mirror_lines(m, active=None, pending=(), changed=(), indent="      ",
         # A different GLYPH per state, not only a different colour -- ◆ for a
         # row about to move, ● for one that has. See _mirror_state for why red
         # stopped being the pending colour.
+        # A different GLYPH per verdict as well as a different colour, for
+        # the reason the whole mirror is marked twice over: colour is the first
+        # thing a screenshot, a light theme or a colour-blind reader loses, and
+        # "your change did not land" is the one thing on this screen that must
+        # survive all three.
+        verdict = changed.get(line.row)
         mark = (f"{BOLD}◆{RESET}" if line.row in pending else
-                f"{GREEN}●{RESET}" if line.row in changed else
+                f"{RED}✗{RESET}" if verdict == modify.IGNORED else
+                f"{AMBER}●{RESET}" if verdict == modify.DRIFTED else
+                f"{GREEN}●{RESET}" if verdict else
                 f"{GREEN}❯{RESET}" if line.row is not None and line.row == active
                 else " ")
         if line.head:
@@ -1588,6 +1684,22 @@ def mirror_lines(m, active=None, pending=(), changed=(), indent="      ",
         body, extras = _mirror_body(line, tint, strong)
         out.append(f"{indent[:-2]}{mark} {body}")
         out.extend(f"{indent}{pad}{extra}" for extra in extras)
+        # SAY WHAT WAS ASKED FOR. A red row on its own tells somebody the
+        # value is not what they wanted without telling them what they wanted,
+        # and they are reading this screen precisely because they cannot hold
+        # both in their head. Only when the value is known -- a change made
+        # through the panel carries it, one typed in prose does not, and
+        # inventing it would be the same sort of claim this whole change
+        # removes.
+        if verdict == modify.IGNORED:
+            asked = (wanted or {}).get(line.row)
+            out.append(f"{indent}{pad}{RED}not applied{RESET}{DIM}"
+                       + (f" — you asked for {asked}" if asked else
+                          " — the regenerated command still has the old value")
+                       + f"{RESET}")
+        elif verdict == modify.DRIFTED:
+            out.append(f"{indent}{pad}{AMBER}changed on its own{RESET}{DIM}"
+                       f" — this was not part of what you asked for{RESET}")
     return out
 
 
@@ -1907,7 +2019,7 @@ def fill_header(m, row, changes, current, step="", note=""):
 
 
 def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
-         resources=""):
+         resources="", wanted=None):
     """Print the submission gate: what is about to run, and how to answer it.
 
     The three commands are printed here on purpose. The moment you are asked to
@@ -1977,7 +2089,11 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     # the current directory" are the two facts somebody actually decides on,
     # and neither is legible from a path and an absent `-o`. See _consequence.
     print()
-    for line in _consequences(proposal, thread_id):
+    # Read once and used twice -- in the summary above and in the /approve line
+    # below, which has to stop promising an irreversible submission when the
+    # script it would run contains no jobs.
+    total = _job_total(proposal)
+    for line in _consequences(proposal, thread_id, total):
         print(line)
 
     # `bash cmd.sh` is what runs and says nothing on its own -- two runs a week
@@ -1993,6 +2109,40 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     m = (mirror.read(proposal.get("generated"), name=thread_id,
                      resources=resources)
          or mirror.from_slots(proposal, name=thread_id, resources=resources))
+
+    # EVERY FLAG THIS PIPELINE CAN TAKE, AND NO OTHERS.
+    #
+    # The box used to draw only the flags the command happened to WRITE, which
+    # answers "what will run" and silently declines to answer "what could I
+    # change". Those are both questions somebody has at the gate, and the second
+    # one was being sent to /modify to discover -- so an unset `-s` was invisible
+    # here and "all steps" appeared only as a phrase in the summary line.
+    #
+    # ensure() draws the absences, and modify.rows_for() decides which absences
+    # are real questions FOR THIS PIPELINE. That distinction is the whole reason
+    # this is safe to do: `-p` on a germline run is not a decision left unmade,
+    # it is a flag that does not apply, and listing it would be how a gate turns
+    # into a form. rows_for already filters by protocol -- pairs only where the
+    # protocol pairs, design only where the pipeline needs one, no `-t` row at
+    # all on a pipeline that takes none -- so what lands here is exactly the set
+    # this run could legally differ in.
+    #
+    # One source, shared with the panel that does the editing: the rows offered
+    # on this screen and the rows /modify will open are the same list, so
+    # nothing is shown as changeable that cannot be changed.
+    m = m.ensure([row for row, _ in modify.rows_for(proposal)])
+
+    # ...and which of them GenPipes will not run without. `required` is the
+    # unbracketed half of this pipeline's own `usage:` line -- argparse stating
+    # its preconditions -- so it is the one claim on this screen that cannot go
+    # stale against the install.
+    #
+    # After ensure(), not before, and the order is the point. ensure() draws the
+    # absences; this marks them. A required flag that was never written has no
+    # line until ensure() makes one, so marking first would annotate everything
+    # except the case that matters.
+    m = mirror.mark_required(m, proposal.get("required"))
+
     # `output` joins them only when it is UNSET, because the consequence line
     # above has just said where the run writes in words. Left in, the box says
     # "writes into the current directory" twice, three lines apart, which reads
@@ -2000,7 +2150,28 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     # actual choice and stays.
     hide = mirror._GATE_HIDDEN + (
         () if (proposal.get("slots") or {}).get("output_dir") else ("output",))
-    drawn = mirror_lines(m, changed=changed, hide=hide)
+    # ...and `script` stops being hidden the moment it stops being redundant.
+    # _GATE_HIDDEN drops the `-g` row on the reasoning that it is the same word
+    # as the `bash <script>` line below. When that is true it is noise. When it
+    # is NOT true it is the single most important thing on the screen, and the
+    # box was hiding it on the strength of an assumption it never checked:
+    #
+    #     script  -g   ampliconseq_cit_cmd.sh          <- what was built
+    #     runs    bash ampliconseq_cit_test/ampliconseq_cit_cmd.sh   <- what ran
+    #
+    # Two paths, one of them written by nobody, and the row that would have
+    # shown it was suppressed. The comparison has to be between the two
+    # INDEPENDENT readings -- the `-g` value parsed out of the generation, and
+    # the script named by the submission line -- since both are on the proposal
+    # but only one of them comes from each command. Comparing `proposal["script"]`
+    # against `proposal["command"]`, as this first did, compares a string with
+    # the string it was extracted from and can never disagree.
+    written = _flag_line_value(m, "script")
+    submitted = str(proposal.get("script") or "")
+    if written and submitted and (os.path.normpath(written)
+                                  != os.path.normpath(submitted)):
+        hide = tuple(row for row in hide if row != "script")
+    drawn = mirror_lines(m, changed=changed, hide=hide, wanted=wanted)
     if drawn:
         print()
         for line in drawn:
@@ -2011,6 +2182,14 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     # that submits what the call built.
     print(f"      {DIM}{'runs':<{_MIRROR_LABEL}}{RESET}"
           f"{BOLD}{WHITE}{proposal.get('command', '?')}{RESET}")
+    # Said because it is now true, and because it changes what the rows above
+    # mean. Approving does not run a file that is already sitting there -- it
+    # rebuilds it from the command in this box and then launches it, which is
+    # what makes the box and the submission the same thing rather than two
+    # things that are usually the same. A hand edit to the script does not
+    # survive it, and somebody has to be told that before they approve.
+    print(f"      {DIM}{'':<{_MIRROR_LABEL}}rebuilt from the command above, "
+          f"then run{RESET}")
     print()
 
     for text in warnings or ():
@@ -2044,7 +2223,18 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
         # The one irreversible verb on the screen, and the only amber on it.
         # Amber where the risk actually is beats red across the whole header:
         # a warning that covers everything marks nothing.
-        print(_action("/approve", f"{AMBER}submits to Slurm — cannot be undone{RESET}"))
+        #
+        # Unless it is not irreversible, which is the whole point of reading the
+        # job total. A script declaring no jobs cannot reach the scheduler, and
+        # "submits to Slurm — cannot be undone" printed three lines under
+        # "nothing to submit" is the screen contradicting itself at the exact
+        # moment somebody is deciding whether to trust it.
+        if total == 0:
+            print(_action("/approve", "runs the script — it has no jobs in it, "
+                                      "so nothing reaches Slurm"))
+        else:
+            print(_action("/approve",
+                          f"{AMBER}submits to Slurm — cannot be undone{RESET}"))
 
     print(_action("/modify", "rewrites the command and asks you again"))
     print(_action("/reject", "abandons this run; nothing is submitted"))
@@ -2054,22 +2244,61 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
     print("\n")
 
 
+# The verb key for a submitted run whose jobs cannot be reached. Not a status
+# -- the registry is right that the run is `submitted` -- but the verbs that
+# make sense for it are a different set, and _VERBS is keyed by what you can
+# DO rather than by what the record says.
+_UNREACHABLE = "submitted:no-jobs"
+
 # What each status lets you do, and what that costs. Held is the gate's own
 # list; the others are what remains once a name is tied to a job list.
 _VERBS = {
     "held": [("/approve", "submits to Slurm — cannot be undone"),
              ("/modify", "rewrites the command and asks you again"),
              ("/reject", "abandons this run; nothing is submitted")],
+    # NO /approve. This is the whole point of the status existing: the verbs
+    # under a run have to be the ones that will actually work, and offering an
+    # approval that /approve would refuse is the contradiction that started
+    # this. What is left is real -- the command is intact and /modify rebuilds
+    # it into a proposal that can be approved.
+    # /modify on a lapsed run FORKS it, the same way it forks a submitted one,
+    # and the wording says so rather than promising an in-place rebuild. There
+    # is no live gate to rework against, and a verb that describes a mechanism
+    # the code does not have is the same defect as a status that does.
+    "lapsed": [("/modify", "copies it into a new run and gates that"),
+               ("/reject", "abandons this run; nothing was submitted")],
     "submitted": [("/check", "how it is doing on the scheduler"),
                   ("/modify", "copies it into a new run; this one is untouched"),
                   ("/diagnose", "read the logs and explain a failure")],
+    # A run that submitted real jobs and left no manifest. NOT the same list as
+    # `submitted`, because two of those three verbs cannot do anything here:
+    # /check and /diagnose both need job ids to ask the scheduler about, and
+    # there are none. /modify is the one that still works -- the generation
+    # command is on the record, so a copy of this run can be built and gated
+    # like any other. See runs.jobs_are_unreachable.
+    _UNREACHABLE: [("/modify", "copies it into a new run; this one is untouched"),
+                   ("/track", "adopts a job list by hand, if you still have it"),
+                   ("/history", "what is recorded about it")],
     "abandoned": [("/modify", "copies it into a new run to try again")],
     "gone": [("/modify", "copies it into a new run"),
              ("/history", "what is recorded about it")],
 }
 
 
-def run_view(proposal, name, status, resources="", blockers=()):
+def _verbs_for(status, record=None):
+    """The actions worth offering for this run, as (verb, consequence).
+
+    Keyed off what the run can actually support rather than off its status
+    word alone. The two came apart the moment reconciliation started recovering
+    outcomes for runs with no manifest: their status is honestly `submitted`,
+    and /check on them can only report that it cannot look.
+    """
+    if record is not None and runs.jobs_are_unreachable(record):
+        return _VERBS[_UNREACHABLE]
+    return _VERBS.get(status, ())
+
+
+def run_view(proposal, name, status, resources="", blockers=(), record=None):
     """/view -- what a run IS, drawn for any status rather than only at the gate.
 
     The same mirror the gate draws, deliberately. A second layout for the same
@@ -2093,6 +2322,10 @@ def run_view(proposal, name, status, resources="", blockers=()):
     m = (mirror.read(proposal.get("generated"), name=name, resources=resources,
                      missing=missing)
          or mirror.from_slots(proposal, name=name, resources=resources))
+    # Same annotation the gate makes, for the same reason: /view is where
+    # somebody goes to ask what a run IS, and "this flag is required" is part of
+    # the answer whether or not a decision is being asked for.
+    m = mirror.mark_required(m, proposal.get("required"))
     drawn = mirror_lines(m)
     if drawn:
         print()
@@ -2105,7 +2338,7 @@ def run_view(proposal, name, status, resources="", blockers=()):
         print(f"      {DIM}{'fix':<17}{RESET}{WHITE}{finding.fix}{RESET}")
     if blockers:
         print()
-    for verb, consequence in _VERBS.get(status, ()):
+    for verb, consequence in _verbs_for(status, record):
         if verb == "/approve" and (blockers or missing):
             continue
         print(_action(verb, consequence))
@@ -2309,7 +2542,12 @@ _CAUSE_NAME_W = 34
 # forever and will not be. runs.py is stdlib-only, so this costs nothing.
 from .runs import (BAD_STATES as _BAD, BROKE_STATES as _BROKE,             # noqa: E402
                    ACTIVE_STATES)
-from .runs import (HELD_BUCKET, ACTIVE_BUCKET, ATTENTION_BUCKET,           # noqa: E402
+# The step-list statuses, imported rather than restated. no_step_list() picks
+# its first line from one of them, and a second copy of the vocabulary here
+# would be a second thing to keep in step with the parser that produces it.
+from .modify import (STEPS_AMBIGUOUS, STEPS_UNPARSEABLE)                 # noqa: E402
+from .runs import (HELD_BUCKET, LAPSED_BUCKET, ACTIVE_BUCKET,             # noqa: E402
+                   ATTENTION_BUCKET,
                    FINISHED_BUCKET, UNAVAILABLE_BUCKET, CANCELLED_TAG,
                    list_bucket, list_line, list_tag)
 
@@ -2585,6 +2823,23 @@ def problem(text, hint=None):
     print()
 
 
+def output(text):
+    """What a command printed, when a message about it is not enough.
+
+    Used where this tool ran something itself rather than through the graph --
+    a failed regeneration at /approve -- because the transcript's own OUT block
+    only exists for blocks the model executed. Clipped like every other piece
+    of machine output here, and silent when there is nothing to show: an empty
+    frame under an error message reads as output that was lost.
+    """
+    body = (text or "").strip()
+    if not body:
+        return
+    for line in _clipped(body).splitlines():
+        print(f"  {GREY}{line}{RESET}")
+    print()
+
+
 def nothing(text, hint=None):
     """A legitimately empty answer. Grey, not red -- an empty list is not an
     error, and colouring it like one trains people to ignore red."""
@@ -2634,6 +2889,10 @@ def cancelled(name, n, raw=""):
 
 _STATUS_TAG = {
     "held": lambda: f"{RED}{BOLD}held{RESET}",
+    # Grey and unbolded, because the one thing this state must not do is look
+    # like a decision waiting to be made. It is a proposal whose decision is
+    # gone; the verb underneath is /modify, and the tag has to agree with it.
+    "lapsed": lambda: f"{GREY}no longer at the gate{RESET}",
     "submitted": lambda: f"{GREEN}live{RESET}",
     "gone": lambda: f"{DIM}gone{RESET}",
     # Terminal, and grey rather than red: it is not a problem, it is a decision
@@ -2649,6 +2908,7 @@ def _tag(record):
 
 _TAG_COLOUR = {
     HELD_BUCKET: RED,
+    LAPSED_BUCKET: AMBER,
     ACTIVE_BUCKET: GREEN,
     ATTENTION_BUCKET: RED,
     FINISHED_BUCKET: DIM,
@@ -2681,6 +2941,10 @@ _UNKNOWN_MARK = "?"       # ? the scheduler would not say
 
 _MARKS = {
     HELD_BUCKET: (_HELD_MARK, AMBER),
+    # Grey, not amber. A lapsed proposal is not urgent and not broken -- it is
+    # simply not a decision any more, and colouring it like one that is would
+    # put it back in the queue this whole change exists to clear.
+    LAPSED_BUCKET: (_UNKNOWN_MARK, GREY),
     ACTIVE_BUCKET: (_LIVE_MARK, CYAN),
     ATTENTION_BUCKET: (_BROKE_MARK, RED),
     FINISHED_BUCKET: (_DONE_MARK, GREEN),
@@ -2688,7 +2952,7 @@ _MARKS = {
 }
 
 
-def _mark(bucket, status):
+def _mark(bucket, status, record=None):
     """Glyph and colour for one row.
 
     Held is amber rather than red. Red is for something that went wrong, and a
@@ -2706,6 +2970,11 @@ def _mark(bucket, status):
         if not status.counts:
             return _NOTHING_MARK, DIM
     if bucket == FINISHED_BUCKET and status is None:
+        # A run whose jobs cannot be reached is not "nothing happened here" --
+        # it ran, and the glyph should not say otherwise. Grey question rather
+        # than the dim dot: what is unknown is the jobs, not the run.
+        if record is not None and runs.jobs_are_unreachable(record):
+            return _UNKNOWN_MARK, GREY
         return _NOTHING_MARK, DIM
     return _MARKS[bucket]
 
@@ -2857,6 +3126,12 @@ def _row_status(bucket, record, status):
     """
     if bucket == HELD_BUCKET:
         return "waiting for approval"
+    if bucket == LAPSED_BUCKET:
+        # Worded as the next action rather than as the internal state. "lapsed"
+        # is what the registry calls it; what somebody reading a list needs to
+        # know is that this row will not approve and what to type instead.
+        why = (record.get("reconciled_because") or "").strip()
+        return f"needs rebuilding · {why}" if why else "needs rebuilding"
     if bucket == UNAVAILABLE_BUCKET:
         # The ? already says it could not be resolved, so the tail is spent on
         # the part it cannot carry: what the scheduler said the last time it
@@ -2889,6 +3164,17 @@ def _row_status(bucket, record, status):
     if counts.get("CANCELLED"):
         return "stopped"
     if status is None or not counts:
+        # KNOWN TO HAVE SUBMITTED, and no manifest to ask about it. Checked
+        # before the generic wording because the two are opposite claims made
+        # from the same absence: "nothing to run" says GenPipes generated no
+        # work, and this run generated 46 jobs. Reconciliation established the
+        # count from the conversation's own record of the launch, and a row
+        # that then reports zero is throwing away the only thing anybody knows
+        # about it.
+        if runs.jobs_are_unreachable(record):
+            seen = record.get("jobs_seen")
+            return (f"submitted · {seen} job{'s' if seen != 1 else ''} · "
+                    f"no job list on disk")
         # Never "no jobs". GenPipes creating no jobs means every output it was
         # asked for is already on disk, which is a successful outcome rather
         # than an absence of one.
@@ -2903,7 +3189,7 @@ def _row_status(bucket, record, status):
 # where the name is, and you never have to look up the screen to find out
 # which section you are reading.
 _SECTION_ORDER = [HELD_BUCKET, ACTIVE_BUCKET, ATTENTION_BUCKET,
-                  FINISHED_BUCKET, UNAVAILABLE_BUCKET]
+                  LAPSED_BUCKET, FINISHED_BUCKET, UNAVAILABLE_BUCKET]
 
 
 def _finished_line(status):
@@ -3023,7 +3309,7 @@ def run_list(rows):
                 f"  {'PROGRESS':>{w_prog}}  {'AGE':>{w_age}}  STATUS")
         print(f"  {DIM}{fit(head, cols - 3)}{RESET}")
     for bucket, record, status in ordered:
-        glyph, colour = _mark(bucket, status)
+        glyph, colour = _mark(bucket, status, record)
         name = str(record["name"])
         # Truncated with an ellipsis rather than allowed to push the columns
         # apart. A name too long for its column is a formatting problem; a table
@@ -3538,14 +3824,22 @@ def overrides(name, rows, path):
     print()
 
 
-def no_step_list(pipeline, protocol):
+def no_step_list(pipeline, protocol, why=None):
     """Why the step panel is offering nothing, and how to get the list.
 
     There is no step table in this repo and there must never be one --
     genpipes.md says so outright, because the numbered list for every protocol
     is version-exact and a copy here would be wrong on the next release. So
-    when `--help` cannot be reached, the honest thing is an empty panel plus
-    this, rather than a guess.
+    when the list cannot be established, the honest thing is an empty panel
+    plus this, rather than a guess.
+
+    `why` decides the first line, and getting it wrong is not cosmetic. This
+    said "--help could not be read" for every empty list, including the case
+    that was actually happening on this cluster: --help ran, printed eight
+    steps, and the parser did not recognise the format. Telling somebody their
+    GenPipes install is unreachable when it answered perfectly sends them to
+    debug the wrong thing -- and it hides a bug in here behind a complaint
+    about their environment.
 
     The command is printed in full because it is the answer: run it, read the
     names, come back. Somebody who cannot see a list will otherwise invent one,
@@ -3555,9 +3849,17 @@ def no_step_list(pipeline, protocol):
     where = f"genpipes {pipeline or '<pipeline>'}"
     if protocol:
         where += f" -t {protocol}"
+    reason = {
+        STEPS_UNPARSEABLE:
+            "--help was read, but this GenPipes prints its steps in a shape "
+            "this tool does not recognise",
+        STEPS_AMBIGUOUS:
+            f"--help covers several protocols and none was chosen — say which "
+            f"{pipeline or 'pipeline'} protocol this is",
+    }.get(why, "--help could not be read")
     print()
     print(f"  {AMBER}▌{RESET} {BOLD}no step list to offer{RESET}  {DIM}·{RESET}"
-          f"  {DIM}--help could not be read{RESET}")
+          f"  {DIM}{reason}{RESET}")
     print(f"  {AMBER}▌{RESET}")
     print(f"  {AMBER}▌{RESET}   {GREY}the names are version-exact, so they are "
           f"never kept in this tool{RESET}")
@@ -3591,20 +3893,32 @@ def forking_from(name, phrase):
     print()
 
 
-def forked(original, new):
+def forked(original, new, standing="held"):
     """A /modify that made a second run instead of rewriting the first.
 
     Both names are printed, and the original first, because the whole reason to
     fork is that you want to keep it -- and a confirmation that named only the
     new run would leave somebody wondering what happened to the old one at the
     exact moment they were trying not to lose it.
+
+    `standing` is where the ORIGINAL stands, in /list's words (cli._standing).
+    It used to be the constant "still held", which was true when a fork could
+    only come from a run parked at the gate. Forking from a launched run is the
+    ordinary path now, and telling somebody their live run is "still held" gets
+    wrong the one fact this line exists to confirm.
+
+    The closing line follows from it: two held runs are "both waiting", and a
+    variant of something already on the scheduler is not.
     """
+    waiting = standing == "held"
     print()
     print(f"  {DIM}▌{RESET} {BOLD}{new}{RESET}  {DIM}·{RESET}  "
           f"{DIM}held, a variant of {original}{RESET}")
     print(f"  {DIM}▌{RESET}")
-    print(f"  {DIM}▌{RESET}   {DIM}{original} is unchanged and still held{RESET}")
-    print(f"  {DIM}▌{RESET}   {DIM}both are waiting  ·  /list{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}{original} is unchanged — {standing}{RESET}")
+    print(f"  {DIM}▌{RESET}   {DIM}"
+          f"{'both are waiting' if waiting else f'{new} is waiting for you'}"
+          f"  ·  /list{RESET}")
     print()
 
 

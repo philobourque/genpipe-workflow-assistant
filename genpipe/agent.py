@@ -88,7 +88,9 @@ import json
 import datetime
 from . import diagnosis
 from . import display
+from . import capabilities as capability_table
 from . import gate
+from . import modify
 from . import intake
 from . import override
 from . import preflight
@@ -137,6 +139,33 @@ _UNSET = object()
 # three file roles -- as opposed to a free-form question like "which steps",
 # where declining and defaulting is the whole point (see prep.ASSUMED).
 _ESSENTIAL_SLOTS = {"pipeline", "protocol", "readset", "design", "pairs"}
+
+# Re-exported from gate.py, which owns it -- see gate.REJECTION_MARK. Kept
+# importable from here because this is where the sentence is rendered.
+REJECTION_MARK = gate.REJECTION_MARK
+
+
+class GatedState(AgentState):
+    """Biomni's state, plus the one channel the gate needs of its own.
+
+    `pending_proposal` is how a gate gets raised when there is no code block to
+    build one from -- see regate(). It is TRANSPORT, not storage: the durable
+    proposal lives on the registry record, which is what _perform_submission
+    executes, and this channel exists only to carry it into the node that
+    interrupts on it.
+
+    That distinction is deliberate and worth keeping. A second durable copy of
+    the proposal is exactly the parallel state this design is trying to remove;
+    what is needed is a way to re-enter the gate node without asking a model
+    for a code block, and one write-then-read channel is the whole of it.
+
+    A subclass rather than an edit to biomni's TypedDict: its own nodes read
+    only `messages` and `next_step` and are untouched by an extra key, while
+    StateGraph reads the annotations to build its channels and needs to see
+    this one.
+    """
+
+    pending_proposal: dict
 
 
 # The whole system prompt, replacing A1's rather than appending to it.
@@ -245,6 +274,23 @@ install talking about itself. Read it before generating a command for a
 pipeline, and never state a step number from memory -- the grammar document
 below contains none, by design. If a generation is rejected for an out-of-range
 step, re-read --help before changing anything else.
+
+Its FIRST line is the one people skip and it is the one that decides whether a
+command runs at all. argparse prints the required options bare and wraps every
+optional one in brackets:
+
+    usage: genpipes ampliconseq [-h] [--clean] -c CONFIG [CONFIG ...]
+                                [-o OUTPUT_DIR] [-s STEPS]
+                                -r READSETS_FILE [-d DESIGN_FILE]
+
+So -c and -r are mandatory here and -d is not. Read that line before writing a
+generation command, and put every unbracketed flag on it. A command missing one
+is refused before it reaches the gate, so the cost of skipping this is a whole
+turn spent being told what --help would have said for free.
+
+Bracketed does not mean unnecessary. -d is optional to argparse and mandatory
+for any run that includes the step which reads it -- argparse checks the command
+line, not the pipeline. The grammar document below covers what --help cannot.
 
 Reading costs nothing and needs no permission: --help, ls, hostname, reading a
 readset or an ini, squeue, sacct, log files. Generation costs nothing either.
@@ -386,17 +432,36 @@ in it wastes the one decision you are asking them to make.
 
 SUBMITTING IT
 
-Once all of the above holds, generate the script with -g and propose the
-submission in the same turn:
+Two blocks, in this order, never one. First the generation, on its own, and you
+wait for it to come back:
 
 <execute>
-propose_submission("ampliconseq_cit_cmd.sh")
+#!BASH
+genpipes ampliconseq -c ... -r ... -d ... -o $OUT -g $OUT/ampliconseq_cit_cmd.sh
 </execute>
 
-That does not submit. It is intercepted and turned into an approval box showing
-the exact command and the run's name, and that box is the only way they can say
-yes. Approval is typed by them, never inferred, and no prose from either of you
-can stand in for it.
+Then, once you have SEEN it succeed, the proposal, on its own:
+
+<execute>
+propose_submission("$OUT/ampliconseq_cit_cmd.sh")
+</execute>
+
+The path in propose_submission must be the SAME STRING you passed to -g,
+character for character. They are two names for one file, and a box that
+describes one while pointing at the other is the one thing this screen exists to
+prevent.
+
+Never put the generation and the proposal in the same block. A block containing
+a proposal is intercepted whole and nothing in it runs, so a generation written
+beside one is silently discarded -- you would be proposing a script that was
+never written.
+
+propose_submission does not submit. It is intercepted and turned into an
+approval box showing the exact command and the run's name, and that box is the
+only way they can say yes. Approval is typed by them, never inferred, and no
+prose from either of you can stand in for it. When they approve, the generation
+command is run again from the record and the script it produces is launched --
+so what runs is exactly what the box described.
 
   - Do NOT stop after generating to ask "shall I submit?", and do not say "let
     me know when you want me to submit". Neither of you can approve anything in
@@ -404,6 +469,9 @@ can stand in for it.
     record. It is the one way to make a run unapprovable.
   - Once the script exists, propose it. If they wanted a script and not a run,
     they reject it, which costs one keystroke.
+  - If the generation FAILED, do not propose anything. Say what GenPipes said
+    and fix it. A proposal whose script is not on disk is refused before it
+    reaches them, and you will simply be asked to do this instead.
   - Do not print or cat the generated script to prove it worked. The box states
     what will run, and the file is theirs to read.
 
@@ -440,9 +508,14 @@ MONITORING
 Reading the scheduler is free and ungated: squeue, sacct, GenPipes' own
 log_report, the .o log of a failed job. Use <execute> for those whenever they
 ask how something is going, and answer from what came back rather than from what
-you expect. Their runs are named, and they can type /list, /check <name>,
-/jobs <name> and /diagnose <name> at any time -- mention the one that fits when
-it saves them asking you.
+you expect.
+
+Their runs are named, and the application can answer about them directly -- see
+WHAT YOU CAN ASK THE APPLICATION FOR. When somebody asks you plainly how a run
+is doing, or why one broke, finding out is the answer; telling them which
+command to type instead is not. They can still type /list, /check <name>,
+/jobs <name> and /diagnose <name> whenever they would rather, and it is worth
+mentioning the one that fits when it would save them a sentence next time.
 
 
 RESTRAINT
@@ -644,6 +717,35 @@ def _never_prefill(node):
 
 
 class GenpipeA1(A1):
+    # Has this turn already let a submission through the gate? Declared on the
+    # class so the gate node can read it on a graph that has never been driven
+    # -- _drive() clears it at the top of every turn, and the answer before any
+    # turn has started is "no". See submission_gate.
+    _submitted_this_turn = False
+
+    # Whether the model may call the read-only capabilities. See
+    # _capability_names() for what "off" means -- the router branch is never
+    # taken and the node is unreachable, so this is a real switch rather than a
+    # suppressed feature.
+    #
+    # ON. The table holds nothing that mutates a run, the scheduler or the
+    # registry: every entry queries state and shows it. Approval, cancellation,
+    # holds, rejection and adoption are absent from the table entirely, so no
+    # setting here can reach them.
+    capabilities_enabled = True
+
+    # How many capability calls one turn may make before the loop is treated as
+    # stuck. Generous, because a real investigation legitimately chains a few
+    # -- check a run, then look at its jobs, then read the logs -- and stingy
+    # enough that a model calling the same thing forever ends with something a
+    # person can read instead of a recursion limit.
+    MAX_CAPABILITIES_PER_TURN = 8
+
+    # How many times in one turn the gate may hand a proposal back to be fixed
+    # before giving up and saying so. See send_back.
+    MAX_GATE_RETURNS = 3
+    _gate_returns = 0
+
     # --------------------------------------------------------------------- #
     #  Graph construction: reuse A1's nodes, splice in the submission gate.  #
     # --------------------------------------------------------------------- #
@@ -672,6 +774,7 @@ class GenpipeA1(A1):
         #    actually about GenPipes with it.
         self.system_prompt = (SYSTEM_PROMPT
                               + (PLAN_PROTOCOL if PLANS else NO_PLANS)
+                              + self._capability_prompt()
                               + self._grammar())
         # Who it is talking to. A1's prompt has no notion of a person on the
         # other end, and a conversational agent that cannot use your name is
@@ -731,20 +834,47 @@ class GenpipeA1(A1):
         #    a way to put work on the scheduler without approval.
         def routing_function(state):
             next_step = state.get("next_step")
+            # Set by regate(), never by the model. It means "a proposal is
+            # already in hand -- go and offer it" and is the only way into the
+            # gate node that does not begin with a code block. Checked first
+            # because it is unambiguous; is_submission keeps its priority over
+            # everything the MODEL can produce, which is the property that
+            # matters.
+            if next_step == "regate":
+                return "gate"
             if next_step == "execute":
                 code = self._extract_pending_code(state)
                 if code and self._is_submission(code):
                     return "gate"
                 if code and gate.ask_request(code):
                     return "ask"
+                # AFTER the two above, and that order is the safety property.
+                # is_submission keeps first place over everything the model can
+                # write, so a block that both submits and calls a capability is
+                # a submission. ask keeps second place because it predates this
+                # and its behaviour must not shift.
+                #
+                # self._capability_names() is empty until the table is wired
+                # up, which makes this branch inert rather than absent -- the
+                # mechanism can be reviewed and tested before anything can
+                # reach it.
+                if code and gate.capability_request(code, self._capability_names()):
+                    return "capability"
                 return "execute"
             if next_step in ("generate", "end"):
                 return next_step
             raise ValueError(f"Unexpected next_step: {next_step}")
 
-        # 5. Routing out of the gate: approve -> run it, adjust -> rethink.
+        # 5. Routing out of the gate: approve -> run it, adjust -> rethink,
+        #    and "end" for the one case that is neither -- a second proposal
+        #    arriving in a turn that has already spent its approval. See
+        #    submission_gate. The default stays `generate` rather than `end`,
+        #    because an unrecognised next_step here must never be a silent exit.
         def gate_routing(state):
-            return "execute" if state.get("next_step") == "execute" else "generate"
+            step = state.get("next_step")
+            if step in ("execute", "end"):
+                return step
+            return "generate"
 
         # 5b. The question node. Same shape as the gate and for the same reason:
         #     everything before interrupt() must be recomputable, because a node
@@ -805,10 +935,118 @@ class GenpipeA1(A1):
             state["next_step"] = "generate"
             return state
 
+        # 5c. The capability node. Same shape as ask_user, and deliberately so:
+        #     a call the model wrote, resolved by deterministic code, answered
+        #     as an observation, and the same turn carries on.
+        #
+        #     WHAT THIS NODE DOES NOT DO. It does not read the conversation, it
+        #     does not look at what the person typed, and it has no opinion
+        #     about which capability any sentence corresponds to. Everything it
+        #     acts on is in `request`, which gate.capability_request() parsed
+        #     out of the model's own <execute> block. The model decided; this
+        #     checks the decision is legal and carries it out.
+        def capability(state):
+            request = gate.capability_request(self._extract_pending_code(state),
+                                              self._capability_names()) or {}
+            name = request.get("capability")
+            # BOUNDED, because capability -> generate -> capability is a cycle
+            # with a model call in it. A real investigation chains a few of
+            # these legitimately; a model that has decided to call the same
+            # thing forever would otherwise end on a GraphRecursionError, which
+            # is not something a person can act on. The same argument as
+            # send_back's, for the same shape of loop.
+            self._capability_calls = getattr(self, "_capability_calls", 0) + 1
+            if self._capability_calls > self.MAX_CAPABILITIES_PER_TURN:
+                state["messages"].append(HumanMessage(content=(
+                    f"<observation>That is {self._capability_calls} lookups in "
+                    f"one turn and the answer is not getting closer. Stop "
+                    f"calling them and say what you have found, or what you "
+                    f"are stuck on.</observation>")))
+                state["next_step"] = "generate"
+                return state
+            spec, complaint = capability_table.validate(name, request.get("args"))
+            if complaint:
+                # Refused before any handler sees it, and the refusal goes back
+                # as an observation rather than as an exception -- a model that
+                # got an argument wrong should be able to read why and try
+                # again inside the same turn, which is how ask() already
+                # behaves for a malformed question.
+                note = complaint
+            else:
+                note = self._run_capability(spec, request.get("args") or {})
+            state["messages"].append(HumanMessage(
+                content=f"<observation>{note}</observation>"))
+            state["next_step"] = "generate"
+            return state
+
         # 6. The gate node. Pure before interrupt() (safe to re-run on resume).
+        def send_back(state, note):
+            """Refuse to draw a box, and tell the model what to fix.
+
+            The gate's way of saying "this is not a decision yet". It routes to
+            generate rather than execute, so nothing is submitted on the way
+            past, and it happens BEFORE the interrupt, so the node stays pure
+            and safe to re-run when the graph resumes.
+
+            BOUNDED, because the loop it sits in is not. generate -> gate ->
+            send_back -> generate is a cycle with a model call in it, and the
+            only thing that ever stopped it was LangGraph's recursion limit,
+            which _config sets to 500. A model that cannot find the readset it
+            is being asked for would burn hundreds of calls and end on a
+            GraphRecursionError, which is not something a person can read. Three
+            attempts is enough for a model that is going to get there; after
+            that the turn ends and says what it was stuck on, which is a thing
+            somebody can act on.
+            """
+            self._gate_returns += 1
+            if self._gate_returns > self.MAX_GATE_RETURNS:
+                display.problem(
+                    "The command could not be made ready to submit.",
+                    f"{note.rstrip('.')}. Nothing has reached the scheduler — "
+                    f"say what to do next, or start again with /new.")
+                state["next_step"] = "end"
+                return state
+            state["messages"].append(HumanMessage(content=note))
+            state["next_step"] = "generate"
+            return state
+
         def submission_gate(state):
             code = self._extract_pending_code(state)
-            proposal = self._build_proposal(state, code)
+
+            # ONE APPROVAL, ONE SUBMISSION, ONE TURN.
+            #
+            # A submission that fails comes back through execute to generate,
+            # and the model's honest reaction to `No such file or directory` is
+            # to fix the command and propose it again -- which arrived here, in
+            # the same turn, and pauses on a second approval box.
+            #
+            # What that looked like from the outside: /approve, a spinner, and
+            # then the same READY TO SUBMIT box that had just been approved,
+            # with the amber "the submission failed" notice printed BELOW it,
+            # because the box is drawn from inside resume() and the outcome is
+            # reported by its caller afterwards. The whole screen read as
+            # "/approve did nothing". It was worse than that -- see _settle's
+            # `held` argument for the second name the same turn minted.
+            #
+            # So the turn ends here instead. Nothing is submitted (END is not
+            # execute), the model's own account of the failure has already been
+            # rendered on its way past, and the person is left with the amber
+            # notice and a decision to make rather than with a box that has
+            # quietly become a retry. Say "go on" and the re-proposal comes
+            # back to the gate properly, in a turn of its own, with the failure
+            # still on screen above it.
+            if self._submitted_this_turn:
+                state["next_step"] = "end"
+                return state
+
+            # From the code block when there is one, and from the channel
+            # when this is a re-gate -- a decision being restored after a turn
+            # that consumed it without replacing it. See regate() for why the
+            # restoration is a real interrupt rather than a status word.
+            if state.get("next_step") == "regate" and state.get("pending_proposal"):
+                proposal = dict(state["pending_proposal"])
+            else:
+                proposal = self._build_proposal(state, code)
 
             # An incomplete proposal never reaches the person. The gate means
             # "you are one step from submitting"; a box you can only reject is
@@ -827,76 +1065,219 @@ class GenpipeA1(A1):
             # is submitted on the way past.
             missing = proposal.get("missing") or []
             if missing:
-                state["messages"].append(HumanMessage(content=(
-                    "That submission is not ready: "
-                    + ", ".join(missing)
-                    + " missing. Find or ask for what is missing, then "
-                      "regenerate the command and propose it again.")))
-                state["next_step"] = "generate"
-                return state
+                return send_back(state, "That submission is not ready: "
+                                 + ", ".join(missing)
+                                 + " missing. Find or ask for what is missing, "
+                                   "then regenerate the command and propose it "
+                                   "again.")
+
+            # AND SO IS A COMMAND THAT ARGPARSE ITSELF WILL NOT ACCEPT.
+            #
+            # `missing` above is slots.py's table talking: which FILES this
+            # pipeline and protocol need. This is the install talking, about the
+            # flags on the command line, and it catches a class the table
+            # structurally cannot -- there is no entry for `-c` in slots.gaps(),
+            # because which inis a run needs depends on the machine, so a
+            # generation with no config stack at all satisfied every check and
+            # was drawn as READY TO SUBMIT. Approving it spent nothing and
+            # achieved nothing: genpipes exited on `the following arguments are
+            # required: -c`, having been told so by its own --help all along.
+            #
+            # Named as flags, not as rows, because the model's job here is to
+            # edit a command line. Silent when --help could not be read (see
+            # gate.with_usage): an unreadable install is not evidence of a bad
+            # command, and refusing on it would break the tool hardest on the
+            # machines where it is least debuggable.
+            lacking = proposal.get("lacking") or []
+            if lacking:
+                pipeline = ((proposal.get("slots") or {}).get("pipeline")
+                            or "this pipeline")
+                required = " ".join(proposal.get("required") or lacking)
+                return send_back(state, (
+                    f"That command is missing {', '.join(lacking)}. "
+                    f"`genpipes {pipeline} --help` marks {required} as required "
+                    f"and argparse will refuse the command without them. Add "
+                    f"what is missing to the generation command, re-run it, and "
+                    f"propose the submission again."))
+
+            # AND THE SCRIPT HAS TO EXIST BEFORE ANYBODY IS ASKED ABOUT IT.
+            #
+            # Same rule as `missing`, applied to the artifact rather than to the
+            # flags: a box drawn for a script that was never written is not a
+            # decision, it is a form with a hole in it that only the model can
+            # fill. It means the generation did not run, or ran and failed, or
+            # wrote somewhere other than where the submission is pointing --
+            # every one of which is the model's to fix and none of which the
+            # person can do anything about from the gate.
+            #
+            # Checked only when it CAN be checked. runs.resolvable is false for
+            # a path still holding a `$VAR`, because that variable is set by
+            # `module load` in the shell that runs the command and not in this
+            # process -- and "I cannot check this" must never be reported as "it
+            # is not there". That confusion is exactly what refused a perfectly
+            # good ampliconseq run whose script was sitting on disk the whole
+            # time.
+            declared = proposal.get("script")
+            if declared and runs_store.resolvable(declared) and not (
+                    runs_store.resolve_path(
+                        declared, os.getcwd(),
+                        (proposal.get("slots") or {}).get("output_dir"))):
+                return send_back(state, (
+                    f"{declared} does not exist. The submission names a script "
+                    f"that has not been written: run the genpipes generation "
+                    f"command with -g {declared} first, check it succeeded, "
+                    f"and only then propose the submission."))
 
             reply = interrupt(proposal)                            # <-- PAUSES here
-            if reply.get("approved"):
-                # propose_submission("cmd.sh") is a request, not runnable code:
-                # handing it to the interpreter gets `NameError: name
-                # 'propose_submission' is not defined` and nothing submitted,
-                # having just told the person their run was approved. So the
-                # approved block is rewritten to the command it stood for.
+
+            # WHAT COMES BACK IS A DECISION A PERSON MADE, and it is reported
+            # to the model as exactly that: an observation about what the
+            # APPLICATION did, rendered from the structured record, never a
+            # sentence written by hand and never an edit to anything the model
+            # said. See _render_decision and registry.add_decision for the
+            # failure that rule comes from.
+            if reply.get("done"):
+                # ALREADY SUBMITTED, OUTSIDE THIS GRAPH.
                 #
-                # Rewritten HERE rather than where the box is built, because
-                # this is the only path on which the code is about to actually
-                # run, and it happens after the interrupt: the person approved
-                # the command shown in the box, which is the same string
-                # gate.submission_line() puts in it.
-                self._make_runnable(state, code)
-                state["next_step"] = "execute"                     # let it run
-            else:
-                note = reply.get("feedback") or "Adjust the command before resubmitting."
+                # resume() regenerates the script and launches it itself, as
+                # two recorded commands with no model call between the person
+                # saying yes and the jobs existing -- see _approve for why the
+                # irreversible span is model-free. By the time the graph is let
+                # go, the submission is over and reconciled.
+                #
+                # So there is nothing here to execute and nothing worth a model
+                # call to say: display.post_approve has already printed the
+                # reconciled outcome, and a turn that could only restate it,
+                # slowly, would be spending an inference to add nothing.
+                #
+                # The observation is still appended, and that is the half that
+                # matters later. The conversation now knows the submission
+                # happened, so the next question about this run is answered
+                # against what occurred rather than against a proposal the
+                # model still believes is pending -- which is what produced
+                # "let me know once you've approved it" from a model whose
+                # submission had already run.
+                self._submitted_this_turn = True
                 state["messages"].append(HumanMessage(
-                    content=(f"The proposed submission was not approved. {note} "
-                             f"Regenerate the command accordingly.")))
-                state["next_step"] = "generate"                    # loop back to rethink
+                    content=self._render_decision(reply.get("decision"),
+                                                  reply.get("name") or "this run")))
+                state["next_step"] = "end"
+                return state
+
+            # An approval that did NOT come from _approve() cannot reach here.
+            # It used to: the graph itself ran the submission, which is why
+            # _make_runnable existed to rewrite the model's block into
+            # something the interpreter would accept. Both are gone. If a
+            # caller ever resumes with approved=True and no `done`, that is a
+            # bug in the caller and the safe reading is "no decision was
+            # taken" -- so it falls through to the not-approved branch rather
+            # than submitting on an assumption.
+            note = reply.get("feedback") or "Adjust the command before resubmitting."
+            state["messages"].append(HumanMessage(
+                content=self._render_decision(
+                    {"decision": "rejected", "feedback": note,
+                     "revision": proposal.get("revision")},
+                    reply.get("name") or "this run")
+                + "\nRegenerate the command accordingly, or answer the "
+                  "question and propose the same submission again."))
+            state["next_step"] = "generate"                    # loop back to rethink
             return state
 
         # 7. Rebuild the graph with the gate on the path to submission only, and
         #    the question node on the path to an ask() only.
-        workflow = StateGraph(AgentState)
+        workflow = StateGraph(GatedState)
         workflow.add_node("generate", generate)
         workflow.add_node("execute", execute)
         workflow.add_node("submission_gate", submission_gate)
         workflow.add_node("ask_user", ask_user)
+        workflow.add_node("capability", capability)
         workflow.add_conditional_edges(
             "generate", routing_function,
             path_map={"execute": "execute", "generate": "generate",
                       "gate": "submission_gate", "ask": "ask_user",
-                      "end": END})
+                      "capability": "capability", "end": END})
         workflow.add_conditional_edges(
             "submission_gate", gate_routing,
-            path_map={"execute": "execute", "generate": "generate"})
+            path_map={"execute": "execute", "generate": "generate",
+                      "end": END})
         workflow.add_edge("ask_user", "generate")
+        workflow.add_edge("capability", "generate")
         workflow.add_edge("execute", "generate")
         workflow.add_edge(START, "generate")
 
         self.app = workflow.compile(checkpointer=self.checkpointer)
     
-    def _make_runnable(self, state, code):
-        """Turn an approved propose_submission() into the shell command it means.
+    # _make_runnable() lived here, and its removal is the point rather than a
+    # tidy-up.
+    #
+    # It rewrote the model's own <execute> block in place -- turning
+    # `propose_submission("cmd.sh")` into `bash cmd.sh` -- so that biomni's
+    # execute node, which re-reads the pending code out of the last MESSAGE,
+    # would find something runnable. That was a real constraint, and the
+    # solution was to edit history.
+    #
+    # The constraint is gone. _approve() runs both commands itself, outside the
+    # graph, and releases the interrupt with a settled fact; the graph never
+    # executes a submission any more, so nothing needs the block to be
+    # runnable. The branch that called this became unreachable at that point
+    # and is deleted with it.
+    #
+    # What it left behind was not harmless. The surviving transcript showed the
+    # assistant running a script with no gate in it, and the model -- reading
+    # its own history on the next turn -- apologised for bypassing an approval
+    # that had been given. See registry.add_decision for the replacement: the
+    # decision is stored as data and the sentence is rendered from it.
+    #
+    # THE RULE THIS ESTABLISHES: conversation history is never rewritten to
+    # make an application-side action look like a model action. Anything the
+    # application did is reported to the model as an observation about the
+    # application, in words generated from state that can be checked.
 
-        Edits the last message's <execute> block in place, so the execute node --
-        which reads the pending code back out of the message, not from anything
-        passed to it -- sees `#!BASH\\nbash cmd.sh`. A block that was already a
-        real submission (`bash cmd.sh`, chunk_genpipes) is left exactly as it is:
-        it needs no translation, and rewriting it would risk changing what runs
-        after somebody approved what they were shown.
+    @staticmethod
+    def _render_decision(entry, name):
+        """The observation text for one gate decision. Generated, never stored.
+
+        A projection of registry.add_decision's entry, rebuilt on every turn
+        from the record. That is what keeps it from drifting: there is no
+        sentence sitting in the history that can go on claiming something the
+        record no longer says.
+
+        Written to be unambiguous about the one thing the model kept getting
+        wrong -- that the decision has already been made and the work is done
+        -- because the raw output of a submission looks exactly like the
+        output of any other script, and for a run with nothing to do it is
+        nearly empty.
         """
-        if not gate.proposed_script(code or ""):
-            return
-        line = gate.submission_line(code)
-        for message in reversed(state.get("messages") or []):
-            content = getattr(message, "content", "") or ""
-            if code in content:
-                message.content = content.replace(code, f"\n#!BASH\n{line}\n")
-                return
+        decision = (entry or {}).get("decision")
+        revision = (entry or {}).get("revision") or "?"
+        if decision == "approved":
+            outcome = (entry or {}).get("outcome") or {}
+            jobs = outcome.get("jobs")
+            did = (f"{jobs} job{'s' if jobs != 1 else ''} were submitted"
+                   if jobs else "no jobs were created — every step was "
+                                "already up to date")
+            return (f"<observation>\n"
+                    f"THE USER APPROVED THIS SUBMISSION. The application then "
+                    f"regenerated the script from the recorded command and ran "
+                    f"it. Neither of those was your doing and neither needs "
+                    f"your confirmation.\n"
+                    f"  run:      {name}\n"
+                    f"  revision: {revision}\n"
+                    f"  result:   {outcome.get('status', 'unknown')} — {did}\n"
+                    f"  detail:   {outcome.get('detail') or '-'}\n"
+                    f"It is finished. Do not propose it again, do not ask for "
+                    f"approval, and do not say it is waiting for one.\n"
+                    f"</observation>")
+        if decision == "rejected":
+            feedback = (entry or {}).get("feedback") or ""
+            return (f"<observation>\n"
+                    f"The user {REJECTION_MARK} {name} "
+                    f"(revision {revision}).\n"
+                    f"They said: {feedback or '(nothing further)'}\n"
+                    f"</observation>")
+        return (f"<observation>\n"
+                f"The user changed {name}; revision {revision} is superseded.\n"
+                f"</observation>")
 
     def _grammar(self):
         """genpipes.md, as registered by cli.build_agent's add_software().
@@ -935,6 +1316,250 @@ class GenpipeA1(A1):
     #  Questions. The model decides when to ask; this decides what the       #
     #  question looks like, and the caller decides how it is rendered.       #
     # --------------------------------------------------------------------- #
+
+    # ------------------------------------------------------------------- #
+    #  Capabilities: the actions the model may ask the application to run.
+    #
+    #  EVERY ENTRY IS BACKED BY THE METHOD THE SLASH COMMAND ALREADY CALLS.
+    #  That is the rule, not a coincidence, and it is what makes "the two
+    #  routes share an implementation" true rather than aspirational --
+    #  cli._cmd_check is four lines around agent.check(), and so is this. A
+    #  capability that did its own work would be a second implementation of
+    #  something a person can also reach, and the two would drift.
+    # ------------------------------------------------------------------- #
+    def _capability_prompt(self):
+        """The section of the system prompt that lists the available actions.
+
+        WHAT THIS DELIBERATELY DOES NOT SAY. There is no line here of the form
+        "if they ask about status, call check_run". That mapping is the model's
+        to make, from the whole conversation, and writing it down would move
+        the decision into a lookup table -- the same deterministic
+        intent-routing this design refuses, relocated from Python into English
+        where it would be harder to see and impossible to test.
+
+        So the section states three things and stops: these actions exist, this
+        is what each one does, and whether to use one is your call. The
+        signatures and summaries are generated by capabilities.catalogue(), so
+        the actions the model is told about and the actions that exist cannot
+        diverge.
+
+        Empty when capabilities are switched off, which keeps 7A's inert state
+        genuinely inert -- a model told about calls it cannot make would try
+        them and read an error.
+        """
+        if not self._capability_names():
+            return ""
+        return f"""
+
+
+WHAT YOU CAN ASK THE APPLICATION FOR
+
+Besides shell commands, there are things only this application can do -- it
+holds the run registry, it knows which run has which job list, and it owns the
+renderers people are used to reading. Those are available to you as calls.
+
+Write one on its own in an <execute> block, exactly as you would an ask():
+
+<execute>
+check_run(name="ampliconseq-0813")
+</execute>
+
+{capability_table.catalogue()}
+
+The result comes back as an <observation> and you carry straight on in the same
+turn. The person also sees the real panel, the same one they would get from the
+matching command, so you do not need to reproduce it -- say what it means, not
+what it said.
+
+  - One call per block, and nothing else in the block.
+  - These read state. None of them changes a run, a file or anything on the
+    scheduler.
+  - The run's NAME is what they take. If you do not know it, list_runs() shows
+    what there is.
+
+WHETHER TO USE ONE IS YOUR JUDGEMENT, and it is a judgement, not a rule. Some
+things people say are requests to look at the state of their work; some are
+questions about how this tool or GenPipes behaves; some are neither. Only the
+first kind is a reason to call anything. A question about what a command does,
+or about why jobs time out in general, is answered by explaining -- reaching
+for a capability there would inspect a run nobody asked about and answer a
+question nobody asked.
+
+You are not obliged to use one because it exists. Answer from what you already
+know when you already know it, ask when you are genuinely unsure which run is
+meant, and look when looking is what would actually help.
+
+ONE LOOKUP USUALLY ANSWERS ONE QUESTION. Each of these already shows the person
+a full panel, so three of them is three screens to read for something they
+asked once. Chain a second only when the first genuinely left something open
+that the second can close.
+
+WHAT TO AVOID IS REPEATING AN IDENTICAL LOOKUP -- the same call, with the same
+arguments, whose answer you already have. That shows them a panel they have
+just read and tells you what you already know.
+
+Calling the same one again with DIFFERENT arguments is an ordinary thing to do
+and is often exactly right: "compare run-a and run-b" is two check_run calls,
+one per run, and "the failed jobs in both" is two inspect_jobs calls. So is
+going back to something once new information makes a second look worthwhile.
+The test is whether the next call can tell you something the last one did not.
+
+THE SLASH COMMANDS STILL EXIST and are not going anywhere: /check, /jobs,
+/diagnose, /monitor, /list, /view, /history. They are the same operations by
+another door, for somebody who would rather type than ask. Mention one when it
+saves them a sentence next time -- but when they have asked you plainly for
+something you can do, do it rather than telling them what to type.
+"""
+
+    def _capability_handlers(self):
+        """{name: callable}. Built per call so a swapped registry is honoured.
+
+        Signatures take the argument names the table declares, so validate()
+        and the handler cannot disagree about what a call looks like.
+        """
+        return {
+            "check_run": lambda name=None: self.check(name),
+            "inspect_jobs": lambda name=None, failed=False: self.jobs(
+                name, only_failed=bool(failed)),
+            "diagnose_run": lambda name=None, question=None: self.diagnose(
+                name, question=question),
+            "show_run": lambda name=None: self._show_run(name),
+            "list_runs": lambda: self.submissions(),
+            "run_history": lambda: self.history(),
+            "where": lambda: self._where(),
+        }
+
+    def _capability_names(self):
+        """The names the router will recognise, or an empty set when off.
+
+        EMPTY IS THE INERT STATE and it is deliberate. With no names,
+        gate.capability_request() returns None for everything, the router
+        branch is never taken, and the node is unreachable -- so the mechanism
+        can be built, reviewed and tested before any of it can affect a
+        conversation. Switching it on is one flag, in one place.
+        """
+        if not getattr(self, "capabilities_enabled", False):
+            return frozenset()
+        return frozenset(self._capability_handlers()) & capability_table.NAMES
+
+    def _run_capability(self, spec, args):
+        """Execute one validated capability and describe what it produced.
+
+        Two audiences, one action. The handler PRINTS -- the real panel, the
+        same one the slash command draws, because a person watching should see
+        what they would have seen either way. What comes back from here is a
+        text rendering of the same facts for the model, so it can talk about
+        them rather than re-deriving them.
+
+        Neither is a summary of the other and neither is invented: both are
+        made from the value the handler returned.
+        """
+        handler = self._capability_handlers().get(spec.name)
+        if handler is None:                      # pragma: no cover - table drift
+            return f"{spec.name} is not wired up here."
+        wanted = {k: v for k, v in (args or {}).items() if k in spec.args}
+        try:
+            result = handler(**wanted)
+        except Exception as e:                   # noqa: BLE001
+            # A capability that fails is a fact about the run, not a reason to
+            # end the turn. The model gets the failure and can say so.
+            return (f"{spec.name} could not be completed: "
+                    f"{type(e).__name__}: {e}")
+        return self._capability_note(spec, wanted, result)
+
+    def _capability_note(self, spec, args, result):
+        """The observation text for a finished capability.
+
+        TWO JOBS, AND THE SECOND ONE WAS MISSING AT FIRST. It has to carry
+        enough of the finding for the model to reason about, and it has to make
+        clear the work is DONE.
+
+        The first version said only "the diagnosis was produced and shown to
+        the user above" -- true, and content-free. A model given that has
+        nothing to explain, so it called diagnose_run again looking for
+        substance, and again: six capability calls for one question, three of
+        them the expensive one, and three near-identical panels for the person.
+        The fix is not a stricter limit. It is to answer the question the model
+        was still asking.
+
+        Still short. The full rendering is already on screen and repeating it
+        here would spend context on something the person can see -- and would
+        tempt the model to read numbers out of a table rather than out of a
+        fact it was handed.
+        """
+        subject = args.get("name") or ""
+        if result is None:
+            # Every handler that can refuse has already said why on screen --
+            # _need_run does it in four different wordings. Saying so plainly
+            # keeps the model from narrating a result it did not get.
+            return (f"{spec.name} found nothing to report for "
+                    f"{subject or 'that'}; the reason was shown to the user. "
+                    f"Do not call it again; say what happened.")
+
+        done = "This lookup is finished and its output is already on screen."
+        if hasattr(result, "counts") and result.counts is not None:
+            counts = ", ".join(f"{n} {s.lower()}"
+                               for s, n in sorted(result.counts.items())) or "no jobs"
+            facts = (f"{subject}: {result.verdict}. {counts}, "
+                     f"of {result.total} submitted.")
+            cause = getattr(result, "root_cause", None) or {}
+            if cause.get("step"):
+                facts += (f" Earliest independent failure: {cause['step']}"
+                          + (f", {cause['count']} job(s) {str(cause.get('state') or '').lower()}"
+                             if cause.get("count") else "") + ".")
+            if spec.name == "diagnose_run":
+                # The reasoning has ALREADY been produced and rendered by
+                # diagnose() on its own thread. What this turn owes the person
+                # is a sentence about it, not a second investigation.
+                return (f"{facts} The logs were read and the explanation has "
+                        f"been shown to the user. {done} You have this run's "
+                        f"diagnosis — comment on it rather than asking for it "
+                        f"again. (A different run is a different question.)")
+            return f"{facts} {done}"
+        if spec.name == "inspect_jobs" and isinstance(result, list):
+            shown = "failed " if args.get("failed") else ""
+            return (f"{subject}: {len(result)} {shown}job(s) listed for the "
+                    f"user, grouped by step. {done}")
+        if spec.name in ("list_runs", "run_history", "where"):
+            return f"{spec.name} was shown to the user. {done}"
+        return f"{spec.name} completed for {subject or 'this session'}. {done}"
+
+    def _show_run(self, name):
+        """/view's body, as a capability. Reconciles first, like the command."""
+        record = self.registry.get(name)
+        if record is None:
+            display.problem(f"No run named '{name}'.", "/list shows what there is.")
+            return None
+        self.reconcile_registry([record])
+        record = self.registry.get(name) or record
+        proposal = record.get("proposal") or {}
+        if not proposal:
+            display.problem(f"'{name}' has no command on record.",
+                            "It was adopted from a job list rather than built "
+                            "here. /check tells you how it is doing.")
+            return None
+        display.run_view(
+            proposal, name, record["status"],
+            resources=override.summary(override.read(override.path_for(
+                name, record.get("workdir") or ".", proposal))),
+            blockers=self._blockers() if record["status"] == runs_store.HELD
+            else (),
+            record=record)
+        return record
+
+    def _where(self):
+        """/where's body, as a capability."""
+        here = preflight.cluster()
+        rows = [
+            ("cluster", f"{here}  ({preflight.cluster_ini()})" if here
+             else "not a recognised Alliance login node"),
+            ("launched from", os.getcwd()),
+            ("agent workdir", self.path),
+            ("run registry", self.registry.path),
+            ("checkpoints", os.path.join(self.path, "genpipe_checkpoints.sqlite")),
+        ]
+        display.where(rows)
+        return rows
 
     def _gap_for(self, request):
         """Turn a parsed ask() call into a slots.Gap the caller can render.
@@ -1025,8 +1650,25 @@ class GenpipeA1(A1):
         if not os.path.exists(job_list_path):
             display.problem(f"'{job_list_path}' does not exist -- nothing tracked.")
             return
-        self.registry.track(name, job_list_path)
+        # Both refusals come back from the registry rather than being decided
+        # here, so they hold wherever adoption is reached from -- this method,
+        # /scan, or the capability layer that will eventually offer it in
+        # prose. A guard in the CLI would have protected exactly one door.
+        record, refused = self.registry.track(name, job_list_path)
+        if refused:
+            # The next step depends on WHICH of the two things was wrong, and
+            # both arguments are typed by hand so either can be. Offering
+            # "pick another name" for a file that is not a job list sends
+            # somebody to fix the half that was fine.
+            taken = self.registry.get(name) is not None
+            display.problem(
+                f"Not tracked -- {refused}",
+                "Pick another name  ·  /list shows what there is." if taken
+                else "Point it at the job_list GenPipes wrote — "
+                     "job_output/<Pipeline>.<protocol>.job_list.<timestamp>.")
+            return
         display.tracked(name, job_list_path)
+        return record
 
     def submissions(self):
         """List every run still worth acting on: held runs awaiting a decision,
@@ -1051,6 +1693,14 @@ class GenpipeA1(A1):
         failure would be a worse outcome than the query failing in the first
         place.
         """
+        # Reconciled BEFORE anything is rendered, not only at startup. A
+        # session can outlive the state it started in -- a run approved in
+        # another terminal, a proposal whose gate this session's own /modify
+        # consumed -- and /list is where a stale claim does the most damage,
+        # because it is the screen people act from. The pass is cheap: it
+        # reads a checkpoint per pending record and asks the scheduler
+        # nothing.
+        self.reconcile_registry()
         records = self.registry.live()
         if not records:
             display.nothing("No runs recorded yet.",
@@ -1151,7 +1801,16 @@ class GenpipeA1(A1):
         including every question answered in place -- because that whole span
         is what a person waits through between typing a line and seeing a
         reply.
+
+        This is also where a turn BEGINS, which is why the gate's
+        one-submission-per-turn flag is cleared here: every path into the graph
+        -- run(), resume(), and the questions answered in between -- goes
+        through this method exactly once per turn, and a flag left standing
+        would silently disarm the gate for the rest of the session.
         """
+        self._submitted_this_turn = False
+        self._gate_returns = 0
+        self._capability_calls = 0
         self.telemetry.start_turn()
         try:
             for _ in range(self.MAX_QUESTIONS_PER_TURN):
@@ -1320,14 +1979,13 @@ class GenpipeA1(A1):
         Returns "" when it cannot be reached -- on a laptop, or with no module
         system -- and the caller must treat that as "no opinion", never as "no
         problem".
+
+        A thin delegate now. The fetch moved to runs.pipeline_help so that this
+        and gate's flag-surface lookup share one cache: they ask the same
+        install the same question, and running the subprocess twice under a
+        keystroke was the only difference between them.
         """
-        if not pipeline:
-            return ""
-        proto = f" -t {protocol}" if protocol else ""
-        raw, code = runs_store._run(
-            f"module load {runs_store.GENPIPES_MODULE} >/dev/null 2>&1; "
-            f"genpipes {pipeline}{proto} --help")
-        return raw if code == 0 or "Steps:" in raw else ""
+        return runs_store.pipeline_help(pipeline, protocol)
 
     def resume(self, name, approved, feedback=None, on_step=None):
         """Continue a run paused at the gate. approved=True lets the command
@@ -1354,8 +2012,14 @@ class GenpipeA1(A1):
                 name = record["name"]
         thread_id = (record or {}).get("thread_id") or name
         config = self._config(thread_id)
-        snap = self.app.get_state(config)
-        if not (snap.next and snap.tasks and snap.tasks[0].interrupts):
+        # A GATE interrupt, not merely an interrupt. This used to accept any
+        # pause on the thread, which meant a run parked on a QUESTION -- an
+        # ask() the conversation never finished answering -- satisfied the one
+        # check standing between /approve and _perform_submission. The two
+        # pauses are the same LangGraph mechanism and only the payload tells
+        # them apart, so the payload is what gets checked.
+        pending = self.gate_interrupt(config)
+        if pending is None or pending is runs_store.UNKNOWN:
             if record is None:
                 display.problem(f"No run named '{name}'.",
                                 "/list shows what there is.")
@@ -1369,11 +2033,22 @@ class GenpipeA1(A1):
             status["submitted"] = False
             status["record_status"] = record.get("status")
             if approved:
-                if record.get("status") == runs_store.HELD:
+                # Reconciled BEFORE the refusal is worded, because the honest
+                # explanation is not "there is no gate" -- that is a symptom.
+                # It is whatever the evidence says actually happened, and for
+                # the run this check exists to protect (46 jobs submitted, the
+                # recording turn killed by an API error) the truthful answer
+                # is "it already ran, here is where it stands".
+                standing = self.standing_of(record)
+                if standing.status != record.get("status"):
+                    self.reconcile_registry([record])
+                    record = self.registry.get(name) or record
+                    status["record_status"] = record.get("status")
+                if record.get("status") in runs_store.BEFORE_APPROVAL:
                     display.problem(
                         f"'{name}' is not waiting at the gate any more.",
-                        "Its conversation ended without a pending decision — "
-                        f"/modify {name} to rebuild it, or /reject to drop it.")
+                        f"{standing.why.capitalize()} — /modify {name} to "
+                        f"rebuild it, or /reject to drop it.")
                 elif record.get("status") in runs_store.AFTER_APPROVAL:
                     display.problem(
                         f"'{name}' has already been through /approve — it is "
@@ -1382,6 +2057,32 @@ class GenpipeA1(A1):
                         f"submitted a second time.")
             return status
         if approved:
+            # AN APPROVAL AUTHORISES ONE EXACT PROPOSAL.
+            #
+            # The interrupt says which command was on screen when the decision
+            # was offered; the record says which command _perform_submission
+            # is about to run. Nothing compared them, and the whole "one
+            # proposal" property rests on somebody doing so -- a box drawn for
+            # steps 1-5 must not be able to launch a script built for 3-6,
+            # whatever sequence of /modify and re-gate got the two out of step.
+            #
+            # Both sides must be present. Falsy is no opinion, exactly as it is
+            # in usage.py: every proposal built before revisions existed
+            # carries none, and none of them may become unapprovable for it.
+            shown = pending.get("revision")
+            current = (record or {}).get("revision")
+            if shown and current and shown != current:
+                display.problem(
+                    f"Not approved -- '{name}' has changed since that box was "
+                    f"drawn.",
+                    f"The approval box described revision {shown}; the run now "
+                    f"holds {current}. Nothing has reached the scheduler.  ·  "
+                    f"/view {name} to see what it is now, then /approve it.")
+                status = self._gate_status(config)
+                status["submitted"] = False
+                status["revision_mismatch"] = (shown, current)
+                return status
+
             # Re-checked here, not just when the box was drawn. The box may have
             # been on screen for a day, and /approve is the irreversible act.
             blockers = self._blockers()
@@ -1408,47 +2109,56 @@ class GenpipeA1(A1):
                 status = self._gate_status(config)
                 status["missing"] = incomplete
                 return status
+            # THE SCRIPT THE BOX SAYS IT WILL RUN HAS TO BE THERE.
+            #
+            # `bash <script>` on a path that does not exist cannot do anything
+            # but fail, and it fails in the most expensive way this interface
+            # has: the person spends the one irreversible keystroke, the graph
+            # runs, the shell says `No such file or directory`, and what comes
+            # back is an amber notice about a submission that never had a
+            # chance. The 0812 ampliconseq run failed exactly here -- generated
+            # as `-g ampliconseq_cit_cmd.sh`, proposed as `bash
+            # ampliconseq_cit_test/ampliconseq_cit_cmd.sh`, two paths that were
+            # never the same file.
+            #
+            # _approved_script() already resolves the proposal's script against
+            # the run's workdir, the current directory and its output dir, and
+            # already returns None for "it is in none of them". That None was
+            # being read only as "no declared total to reconcile against"; it
+            # is also, and more usefully, a submission that is going to fail.
+            #
+            # Only when the proposal names a script at all. A chunk_genpipes /
+            # submit_genpipes pair names none, and refusing those would be a
+            # guess dressed up as a check.
+            declared = ((record or {}).get("proposal") or {}).get("script")
+            if (declared and not self._approved_script(record)
+                    and runs_store.resolvable(declared)
+                    and not ((record or {}).get("proposal") or {}).get("generated")):
+                display.problem(
+                    f"Not approved -- {declared} is not on disk.",
+                    f"There is no generation command on record to rebuild it "
+                    f"from, so there is nothing to submit. Nothing has reached "
+                    f"the scheduler.  ·  /reject {name}, or describe the run "
+                    f"again.")
+                status = self._gate_status(config)
+                status["missing_script"] = declared
+                status["submitted"] = False
+                return status
         self.log = []
-        command = Command(resume={"approved": bool(approved), "feedback": feedback})
 
-        # Everything irreversible happens between here and the finally below.
-        #
-        # The baseline is taken BEFORE the command runs, because the only
-        # honest measure of what this approval submitted is the number of job
-        # rows it ADDED: GenPipes appends with >>, an output directory is
-        # routinely reused, and a retry of the same script writes into the very
-        # same list as the attempt that failed.
-        #
-        # The record is moved to `submitting` before the resume, so a process
-        # killed mid-flight leaves a state that asks to be reconciled rather
-        # than one that invites a second approval.
-        #
-        # And the reconciliation is in a `finally`, which is the whole fix for
-        # the 2026-07-29 defect: 46 jobs were submitted and completed, the turn
-        # that would have recorded them died on an API error two nodes later,
-        # and the run still said `held` a fortnight afterwards. An exception in
-        # the REPORTING of a submission must never lose the submission.
-        script = baseline = None
         if approved:
-            script = self._approved_script(record)
-            baseline = runs_store.job_list_state(
-                runs_store.declared_job_list(script))
-            # Written to the record, not just held in this frame. The `finally`
-            # below covers an exception; it does not cover a kill, a closed
-            # terminal or a rebooted login node, and the baseline is the one
-            # piece of evidence that cannot be recovered afterwards. Persisting
-            # it is what lets reconcile_stale() answer for a session that never
-            # came back.
-            self.registry.begin_submission(name, workdir=os.getcwd(),
-                                           baseline=baseline, script=script,
-                                           since=started)
-        try:
-            self._drive(command, config, on_step)
-        finally:
-            if approved:
-                self._reconcile_submission(name, started, script, baseline,
-                                           config)
-        status = self._settle(thread_id, config, held=None if approved else name)
+            return self._approve(name, record, thread_id, config, started,
+                                 on_step)
+
+        command = Command(resume={"approved": False, "feedback": feedback,
+                                  "name": name})
+        self._drive(command, config, on_step)
+        # `held=name`, not None. `held` does not mean "is held", it means "the
+        # caller already knows which run this is", and resume() always does.
+        # Passing None let _run_name fall through to minting a fresh name off
+        # the pipeline, which is how one approval produced a phantom second run
+        # holding the same proposal on the same thread.
+        status = self._settle(thread_id, config, held=name)
 
         # A run that was NOT approved must still be waiting when this returns.
         # The turn just went back through generate, and the model was free to
@@ -1459,27 +2169,320 @@ class GenpipeA1(A1):
         # gate would have silently destroyed the decision it was asking about.
         #
         # The prompt tells the model to re-propose after answering, and when it
-        # does, _settle above has already re-held the run and there is nothing to
-        # do here. This is the floor under that instruction, not a substitute for
-        # it: the proposal is stored on the record and is restored unchanged, so
-        # what comes back is the same command they were already looking at.
+        # does, _settle above has already held the run at a NEW gate and there
+        # is nothing to do here. This is the floor under that instruction, not
+        # a substitute for it.
         if not approved and (status or {}).get("status") != "paused":
-            self._rehold(name, thread_id, record)
+            # Re-read: the turn just ran, and if the model re-proposed, the
+            # record now holds a newer proposal than the one this call started
+            # with. Re-gating the stale one would reinstate a command the
+            # conversation has already moved past.
+            fresh = self.registry.get(name) or record
+            if self.regate(name, thread_id, fresh):
+                # RECOMPUTED, because the status above was read before the
+                # gate came back and would report the hole this call just
+                # filled. Callers act on what is returned -- cli._cmd_approve
+                # reads it, and so does every test of this path -- so handing
+                # back "done" for a conversation that is demonstrably parked
+                # at an interrupt would be the same class of lie as the status
+                # word this whole change is about.
+                status = self._gate_status(config)
+                status["name"] = name
+            else:
+                self._lapse(name, "the decision was not left open and could "
+                                  "not be restored")
         return status
 
-    def _rehold(self, name, thread_id, record):
-        """Put a still-undecided run back in the registry after a turn that
-        answered rather than resubmitted. No-op if it is already held."""
-        if self.registry.held_for_thread(thread_id):
+    def _approve(self, name, record, thread_id, config, started, on_step=None):
+        """What /approve does: build the script, then launch it. No model call
+        anywhere between the person saying yes and the jobs being on Slurm.
+
+        THE SCRIPT IS REBUILT, NOT ASSUMED. The box describes a genpipes
+        GENERATION -- pipeline, protocol, -c, -r, -d, -o -- and what used to run
+        on approval was `bash cmd.sh`, a FILE. Nothing bound the two together:
+        gate.generation_command() parses the box out of the newest matching
+        block in the transcript, while the script on disk was written by
+        whatever happened to run last. Usually the same thing. Not necessarily.
+        Somebody read a description of one command and approved the execution of
+        a file that something else may have produced.
+
+        Regenerating from the recorded command closes that, and takes a whole
+        family of failures with it: a script that was never generated, one
+        generated into a different directory, a `-g` path and a `bash` path that
+        disagree, a stale script left over from an earlier attempt. None of them
+        are reachable when the thing that runs is built, at this moment, from
+        the text that was on screen.
+
+        AND NO MODEL IS INVOLVED. This used to resume the graph and let the
+        model's own <execute> block do the submitting, which put an inference
+        engine inside the one span in this product that cannot be undone -- and
+        it is how a single approval turned into a second approval box. Both
+        commands here are read off the record and run as written. The model is
+        told what happened afterwards and does not speak: the outcome is
+        reconciled from the job list and the exit code, and display.post_approve
+        prints it. See submission_gate's `done` branch for why a narrating turn
+        was removed rather than instructed better.
+
+        The reconciliation stays in a `finally` for the reason it always has:
+        an exception in the REPORTING of a submission must never lose the
+        submission.
+        """
+        script = baseline = None
+        observation = None
+        try:
+            script, baseline, observation = self._perform_submission(
+                name, record, started, on_step)
+        finally:
+            if observation is not None:
+                self._reconcile_submission(name, started, script, baseline,
+                                           config, observation=observation)
+        if observation is None:
+            # Refused before anything ran -- the regeneration failed, or the
+            # script it was supposed to produce is not there. _perform_submission
+            # has said which. The run is untouched and still waiting, so the
+            # gate stands and the person can modify it or drop it.
+            status = self._gate_status(config)
+            status["submitted"] = False
+            return status
+
+        # THE DECISION IS RECORDED BEFORE THE GRAPH IS TOLD ABOUT IT, and in
+        # that order for a reason: the record is the authority and the model's
+        # copy is a rendering of it. Written after the reconciliation above, so
+        # the outcome it carries is the graded one rather than a guess made
+        # while the command was still running.
+        settled = self.registry.get(name) or record or {}
+        decision = self.registry.add_decision(
+            name, "approved",
+            revision=(settled.get("proposal") or {}).get("revision")
+                     or settled.get("revision"),
+            outcome=runs_store.Outcome(
+                settled.get("status") or runs_store.SUBMIT_UNKNOWN,
+                jobs_seen=settled.get("jobs_seen"),
+                expected=settled.get("expected_jobs"),
+                job_list=settled.get("job_list"),
+                detail=settled.get("outcome_detail") or ""))
+
+        # The graph is still parked on the interrupt this approval answered, and
+        # it has to be let go or the conversation can never take another turn.
+        # It resumes with the DECISION rather than with an instruction: nothing
+        # is left to execute, so the gate node renders what happened and ends
+        # the turn without a model call. See submission_gate's `done` branch.
+        self._drive(Command(resume={"approved": True, "done": True,
+                                    "decision": decision, "name": name}),
+                    config, on_step)
+        return self._settle(thread_id, config, held=name)
+
+    def _perform_submission(self, name, record, started, on_step=None):
+        """Generate the script and run it. Returns (script, baseline, observation).
+
+        An observation of None means NOTHING WAS SUBMITTED and the caller must
+        not reconcile: the record is left exactly as it was, still held, rather
+        than being moved to `submitting` for a command that never ran.
+
+        Both commands run in the run's own workdir. That is not a detail: every
+        relative `-o`, `-g` and `-c` on the command line means a different file
+        from a different directory, and a held run is explicitly designed to be
+        approved from a session that started somewhere else, days later.
+        """
+        proposal = (record or {}).get("proposal") or {}
+        workdir = (record or {}).get("workdir") or os.getcwd()
+        if not os.path.isdir(workdir):
+            workdir = os.getcwd()
+
+        generation = proposal.get("generated")
+        if generation:
+            self._narrating(on_step, generation, "GENERATE")
+            out, code = runs_store.run_block(generation, cwd=workdir)
+            if code != 0:
+                display.problem(
+                    f"Not submitted -- the command could not be generated.",
+                    f"GenPipes exited {code} rebuilding the script. Nothing has "
+                    f"reached the scheduler.  ·  /modify {name}, or /reject it")
+                display.output(out)
+                return None, None, None
+
+        script = self._approved_script(record)
+        declared = proposal.get("script")
+        if not script and runs_store.resolvable(declared):
+            display.problem(
+                f"Not submitted -- {declared} is still not there.",
+                f"The generation reported success but did not write the script "
+                f"the submission names. Nothing has reached the scheduler.  ·  "
+                f"/modify {name}, or /reject it")
+            return None, None, None
+
+        # The baseline is taken BEFORE the command runs, because the only honest
+        # measure of what this approval submitted is the number of job rows it
+        # ADDED: GenPipes appends with >>, an output directory is routinely
+        # reused, and a retry writes into the very same list as the attempt that
+        # failed. Persisted to the record as well as held here -- the `finally`
+        # in the caller covers an exception, it does not cover a kill or a
+        # closed terminal, and the baseline is the one piece of evidence that
+        # cannot be recovered afterwards.
+        baseline = runs_store.job_list_state(
+            runs_store.declared_job_list(script))
+        self.registry.begin_submission(name, workdir=workdir,
+                                       baseline=baseline, script=script,
+                                       since=started)
+
+        command = proposal.get("command") or ""
+        self._narrating(on_step, command, "SUBMIT")
+        out, code = runs_store.run_block(command, cwd=workdir)
+        return script, baseline, runs_store.observation(out, code)
+
+    def _narrating(self, on_step, code, _label):
+        """Keep the spinner honest while a command runs outside the graph.
+
+        on_step is the same callback the graph's own messages drive, and it
+        classifies what it is handed -- so what it is handed is a message of the
+        shape the classifier already reads, rather than a second vocabulary of
+        labels that would drift from the first.
+        """
+        if not on_step:
             return
+        try:
+            on_step(AIMessage(content=f"<execute>\n#!BASH\n{code}\n</execute>"))
+        except Exception:                       # noqa: BLE001
+            pass                                # a spinner label is never worth a turn
+
+    def regate(self, name, thread_id, record):
+        """Restore the DECISION after a turn that consumed it without replacing it.
+
+        WHAT THIS REPLACES, AND WHY THE OLD VERSION WAS WRONG.
+
+        Everything typed at the gate that is not `/approve` resumes the graph
+        with approved=False, so the model can read it. That is right: a
+        question is a question, and answering it must not abandon the run. But
+        resuming CONSUMES the interrupt, and if the model answers in prose
+        without re-proposing, the turn ends with no decision open.
+
+        The old code wrote `status = HELD` at that point. It did not restore
+        the decision; it restored the appearance of one -- /list said "waiting
+        for approval" and /approve said "not waiting at the gate any more",
+        about the same run, on the same screen. Worse, it restored the last
+        proposal WRITTEN TO THE RECORD, which after a rejection is the command
+        the person rejected: ampliconseq-0804-2 was re-held pointing at an
+        output directory its owner had just said no to.
+
+        So this raises a real interrupt instead, for the proposal the record
+        actually holds, and refuses outright in the cases where restoring one
+        would be a lie.
+
+        NO MODEL CALL. update_state(as_node="generate") writes the channel and
+        evaluates that node's outgoing edge; routing_function sees `regate` and
+        queues the gate; invoke(None) runs it. `generate` is never re-entered
+        -- verified against the pinned LangGraph 0.3.18 rather than assumed,
+        because this is the one mechanism in the file whose semantics are not
+        obvious from its name.
+
+        Returns True when a decision is now open.
+        """
         proposal = (record or {}).get("proposal")
         if not proposal:
-            return
+            return False
+
+        # A REJECTED OR SUPERSEDED PROPOSAL IS NEVER RESURRECTED. This is the
+        # barrier that makes ampliconseq-0804-2 structurally impossible: its
+        # revision is on the rejected list the moment /reject records it, and
+        # no amount of re-gating brings it back.
+        revision = proposal.get("revision") or (record or {}).get("revision")
+        if revision and revision in ((record or {}).get("rejected") or ()):
+            return False
+        if revision and revision in ((record or {}).get("superseded") or ()):
+            return False
+
+        config = self._config(thread_id)
+
+        # HAS THE CONVERSATION MOVED PAST THIS PROPOSAL?
+        #
+        # The ampliconseq-0804-2 shape, and the one barrier that catches it.
+        # Feedback at the gate is not always a question: "put it in a new
+        # output directory" sends the model off to REGENERATE, and it may
+        # succeed at that and then end the turn without proposing. The record
+        # still holds the old proposal, it was never formally rejected, and
+        # restoring it would put a command back in front of somebody who has
+        # just finished asking for a different one.
+        #
+        # The history is consulted here for STALENESS ONLY -- never as the
+        # thing that executes. What runs is always the durable proposal on the
+        # record; this only asks whether that proposal is still the newest
+        # thing the conversation produced. When it is not, there is nothing
+        # honest to restore and the run lapses, saying so.
+        newest = self._newest_revision(config)
+        if newest and revision and newest != revision:
+            display.problem(
+                f"'{name}' was not put back at the gate.",
+                f"A newer command was generated after that proposal and never "
+                f"offered, so restoring the old one would show you something "
+                f"the conversation has moved past.  ·  say 'propose it' to "
+                f"gate the new one, or /modify {name}.")
+            return False
+
+        try:
+            self.app.update_state(
+                config,
+                {"pending_proposal": dict(proposal), "next_step": "regate"},
+                as_node="generate")
+            self.app.invoke(None, config)
+        except Exception as e:                  # noqa: BLE001
+            # A graph that cannot be re-parked is a run whose decision is
+            # genuinely gone. Say nothing here and let the caller mark it
+            # lapsed, which is the truthful outcome -- inventing a HELD status
+            # is the exact failure this method exists to end.
+            display.problem(
+                f"'{name}' could not be put back at the gate.",
+                f"{type(e).__name__}: {e}  ·  /modify {name} rebuilds it.")
+            return False
+
+        if self.gate_interrupt(config) is None:
+            return False
         self.registry.hold(name, thread_id, proposal,
-                           (record or {}).get("cwd") or os.getcwd())
+                           (record or {}).get("workdir") or os.getcwd())
         display.nothing(
             f"{name} is still waiting for a decision.",
             f"/approve {name}   ·   /modify {name} <change>   ·   /reject {name}")
+        return True
+
+    def _newest_revision(self, config):
+        """The revision of the newest generation in this thread, or None.
+
+        A STALENESS PROBE, and nothing else. It exists so regate() can tell
+        "the model answered a question" from "the model went and built
+        something different", which are the two ways a feedback turn can end
+        and which want opposite treatment.
+
+        Nothing executes from this. The proposal that runs is the one on the
+        record; this only answers whether that proposal is still the newest
+        command the conversation produced. Reading history for what to RUN is
+        the thing that made _make_runnable dangerous; reading it to notice that
+        a durable record has been overtaken is exactly what it is good for.
+
+        None when there is no generation to compare against, which is
+        no-opinion and lets the restore proceed.
+        """
+        try:
+            snap = self.app.get_state(config)
+        except Exception:                       # noqa: BLE001
+            return None
+        messages = list((snap.values or {}).get("messages") or [])
+        generated = gate.generation_command(messages)
+        if not generated:
+            return None
+        script = gate.flag_value(gate.invocation(generated) or generated, "-g")
+        probe = gate.build_proposal(messages,
+                                    f'propose_submission("{script}")'
+                                    if script else "")
+        return (probe or {}).get("revision")
+
+    def _lapse(self, name, why):
+        """Record that a run's decision is gone, and say what to do instead."""
+        self.registry.update(name, status=runs_store.LAPSED,
+                             reconciled_at=runs_store._now(),
+                             reconciled_because=why)
+        display.problem(
+            f"'{name}' is no longer at the gate.",
+            f"{why.capitalize()} — /modify {name} rebuilds it, or /reject to "
+            f"drop it. Nothing was submitted.")
 
     def _history(self, config):
         """Everything already said on this thread, or [] for a new one."""
@@ -1514,6 +2517,10 @@ class GenpipeA1(A1):
         if status["status"] == "paused":
             proposal = status["proposal"]
             name = self._run_name(thread_id, proposal, task, held)
+            # Read BEFORE the hold overwrites it. This is the only moment both
+            # versions of the proposal exist in the same place, and the gate's
+            # change marks are a comparison of the two -- see modify.compare.
+            previous = (self.registry.get(name) or {}).get("proposal")
             self.registry.hold(name, thread_id, proposal, os.getcwd())
             if task:
                 self.registry.update(name, task=task)
@@ -1534,9 +2541,25 @@ class GenpipeA1(A1):
             if risks:
                 self.registry.update(name, warnings=risks)
             status["warnings"] = risks
-            moved = list(note.get("changed") or ())
-            self.registry.update(name, changed=moved)
-            status["changed"] = moved
+            # WHAT ACTUALLY MOVED, not what was asked for.
+            #
+            # `previous` is read before registry.hold() overwrites it, because
+            # after that there is nothing left to compare against. The diff is
+            # over the proposals' SLOTS, which are a parse of the generated
+            # command -- so this reports what the run will do, which is the
+            # only question the gate is for.
+            #
+            # The old line took note["changed"] straight through: the rows
+            # somebody ASKED to change, written before the model ran and never
+            # checked. A change the model dropped came back green.
+            requested = note.get("changed") or ()
+            verdicts = modify.compare(previous, proposal, requested)
+            self.registry.update(name, changed=verdicts,
+                                 requested=dict(requested)
+                                 if isinstance(requested, dict) else
+                                 list(requested))
+            status["changed"] = verdicts
+            status["requested"] = requested
             # Always drawn. There was a `quiet` flag here for /modify's "hold
             # for later", which applied a change and suppressed this box -- and
             # left the run in a state indistinguishable from the one this
@@ -1544,7 +2567,8 @@ class GenpipeA1(A1):
             # the batch case it was aimed at wants a flow of its own, not a
             # menu row whose only effect is skipping a repaint.
             display.gate(proposal, name, blockers=blockers, warnings=risks,
-                         changed=moved,
+                         changed=verdicts,
+                         wanted=requested if isinstance(requested, dict) else None,
                          resources=self._resource_summary(name))
         return status
 
@@ -1601,6 +2625,248 @@ class GenpipeA1(A1):
         if os.environ.get("GENPIPE_FAKE"):
             return []          # the fake cluster has no allocation to bill
         return preflight.blockers()
+
+    # ------------------------------------------------------------------- #
+    #  Evidence, and the classification it supports.
+    #
+    #  The registry caches a status; this is what corrects it. Gathering lives
+    #  here because it needs the graph, the filesystem and sometimes Slurm;
+    #  DECIDING lives in runs.classify(), which is pure and stdlib-only, so
+    #  the precedence rules are testable without any of that.
+    # ------------------------------------------------------------------- #
+    def gate_interrupt(self, config):
+        """The GATE payload this thread is parked on, or None, or UNKNOWN.
+
+        Three answers, and the third is why this is not a boolean.
+
+          a proposal dict   a submission decision is genuinely open
+          None              the graph is not parked on a gate. It may be
+                            parked on an ASK, which is not a decision about a
+                            submission and must never be mistaken for one --
+                            resume() used to check only that SOME interrupt
+                            existed, which would have let /approve spend an
+                            approval into a question.
+          runs.UNKNOWN      the checkpoint could not be read at all
+
+        The last is the one that keeps a locked or missing database from
+        retiring every pending decision in the registry.
+        """
+        try:
+            snap = self.app.get_state(config)
+        except Exception:                       # noqa: BLE001
+            return runs_store.UNKNOWN
+        if not (snap.next and snap.tasks and snap.tasks[0].interrupts):
+            return None
+        value = snap.tasks[0].interrupts[0].value
+        if isinstance(value, dict) and value.get("kind") == "ask":
+            return None
+        return value if isinstance(value, dict) else None
+
+    def evidence_for(self, record):
+        """Everything durable that is known about one run, as plain data.
+
+        Assembled in the order the sources can be trusted to survive: the
+        filesystem first, because a job list outlives the conversation that
+        made it; then the checkpoint, which outlives the process; then the
+        graph's own pause. Slurm is not asked here -- it is the one source
+        that can be unreachable for reasons having nothing to do with the run,
+        and reconcile() already knows how to ask it when a verdict needs it.
+        """
+        evidence = {}
+
+        # 1. Did this command run? Filesystem only -- see runs.ran_already for
+        #    why the answer is True or UNKNOWN and never False.
+        ran = runs_store.ran_already(record)
+
+        # 2. The checkpoint may still hold what the submission printed, which
+        #    is what turns "it ran" into a gradeable outcome. This is the
+        #    evidence that resolves the 2026-07-29 case: the ids are in the
+        #    observation even though the turn that would have recorded them
+        #    died two nodes later.
+        observation = None
+        config = None
+        ids = ()
+        if record.get("thread_id"):
+            config = self._config(record["thread_id"])
+            observation = self._last_observation(config)
+            # THE WHOLE THREAD, not just the last observation. A conversation
+            # routinely carries on after a submission -- ampliconseq_demo
+            # submitted 18 jobs and then spent four more turns watching them
+            # with squeue -- so the newest observation is a status dump and the
+            # launch is eight messages back. Reading only the last one found
+            # nothing and filed a live run as a lapsed proposal.
+            ids = self._submitted_ids_in(config)
+        if ids:
+            ran = True
+
+        # SUBMITTING IS ALWAYS GRADED, evidence or none.
+        #
+        # It is the one status whose whole meaning is "we were in the middle of
+        # this when we last looked", and leaving it standing is what it exists
+        # to stop -- a record saying `submitting` about a session that ended
+        # days ago. reconcile() already knows how to return SUBMIT_UNKNOWN when
+        # it cannot establish anything, and an honest unknown is the point: the
+        # status must move even when the evidence does not resolve it.
+        #
+        # Every other status is graded only on positive evidence, so a held
+        # proposal is never dragged into a submission verdict by silence.
+        if ran is True or record.get("status") == runs_store.SUBMITTING:
+            baseline = record.get("job_list_baseline")
+
+            # RECOVERY, when the run was never instrumented. No baseline and
+            # no job list means this record predates begin_submission -- there
+            # is nothing to difference, and the only durable account of what
+            # happened is the ids the launch printed into the conversation.
+            #
+            # The script on disk is deliberately NOT consulted here, and that
+            # is the correction that matters. A generated script is written to
+            # a path a person reuses: `~/ampliconseq_cit_test/…_cmd.sh` was
+            # rewritten by three later runs, and the file sitting there now
+            # declares `TOTAL: 0 jobs`. Reconciling an August 4th submission
+            # against it reported "no jobs — everything was already up to
+            # date" about 18 jobs that genuinely ran. A stale artifact is not
+            # evidence about a historical run; the transcript is.
+            if (ids and not baseline and not record.get("job_list")
+                    and record.get("status") != runs_store.SUBMITTING):
+                evidence["outcome"] = runs_store.Outcome(
+                    runs_store.SUBMITTED, jobs_seen=len(ids), expected=None,
+                    detail=f"{len(ids)} jobs were submitted — recovered from "
+                           f"the conversation, which is the only surviving "
+                           f"account of this launch")
+                evidence["submitted"] = True
+                return evidence
+
+            script = (record.get("submitted_script")
+                      or self._approved_script(record))
+            path = ((baseline or {}).get("path")
+                    or runs_store.declared_job_list(script)
+                    or record.get("job_list"))
+            after = runs_store.job_list_state(path)
+            outcome = runs_store.reconcile(
+                script=script, observation=observation, baseline=baseline,
+                after=after, quiet=None)
+            # Only for a run that really was mid-flight, and only when the
+            # first pass could not settle it. Asking the scheduler whether it
+            # has been quiet since a given moment is what separates "the
+            # submission failed" from "the submission failed after putting
+            # work on the cluster", and it is the one question here that costs
+            # a round trip -- so it is not asked about the twenty-odd held
+            # proposals that never ran anything.
+            if (outcome.status != runs_store.SUBMITTED
+                    and record.get("status") == runs_store.SUBMITTING):
+                outcome = runs_store.reconcile(
+                    script=script, observation=observation, baseline=baseline,
+                    after=after,
+                    quiet=runs_store.scheduler_quiet_since(
+                        record.get("submitted_since")
+                        or _epoch(record.get("submitted_at"))))
+            # A run whose only evidence is "ids were printed" still deserves a
+            # graded outcome rather than a shrug: the count of ids IS the
+            # number submitted, and with the job list long gone reconcile has
+            # no other way to learn it.
+            #
+            # GRADED, not assumed. The ids are compared against the total the
+            # script declared, exactly as rows_added would have been, so a
+            # recovered outcome is held to the same standard as a live one. A
+            # count that matches is submitted; anything else is unknown and
+            # says both numbers, because "45 of 46" is a partial submission and
+            # is precisely the thing nobody should be told was clean.
+            if outcome.status != runs_store.SUBMITTED and ids and not outcome.jobs_seen:
+                expected = outcome.expected
+                matched = expected is not None and len(ids) == expected
+                outcome = runs_store.Outcome(
+                    runs_store.SUBMITTED if matched else runs_store.SUBMIT_UNKNOWN,
+                    jobs_seen=len(ids), expected=expected,
+                    job_list=outcome.job_list,
+                    detail=(
+                        f"{len(ids)} jobs were submitted — recovered from the "
+                        f"conversation's own record of the launch"
+                        if matched else
+                        f"{len(ids)} jobs were submitted, but the script "
+                        f"declared {expected if expected is not None else 'no'}"
+                        f" total — recovered from the conversation, and it "
+                        f"does not add up"))
+            evidence["outcome"] = outcome
+            evidence["submitted"] = True
+            return evidence
+
+        # 3. No submission. Is a decision actually open, and for what?
+        if config is None:
+            evidence["gate"] = False
+            return evidence
+        gate = self.gate_interrupt(config)
+        if gate is runs_store.UNKNOWN:
+            evidence["gate"] = runs_store.UNKNOWN
+            return evidence
+        evidence["gate"] = gate is not None
+        if gate is not None:
+            evidence["gate_revision"] = gate.get("revision")
+        return evidence
+
+    def standing_of(self, record):
+        """What this record's evidence supports. Never writes."""
+        try:
+            return runs_store.classify(record, self.evidence_for(record))
+        except Exception as e:                  # noqa: BLE001
+            # A record we cannot reason about keeps the status it has. This
+            # runs on every /list, and a malformed row must cost a row rather
+            # than the listing.
+            return runs_store.Standing(record.get("status"),
+                                       f"could not be reconciled ({e})")
+
+    def reconcile_registry(self, records=None, commit=True):
+        """Bring every record's status into line with its evidence.
+
+        The single reconciliation path. It replaces a version that visited only
+        `submitting` records, which is how a run that submitted 46 jobs sat in
+        /list offering approval for three weeks: it had never reached
+        `submitting`, so the reconciler never looked at it, and the one status
+        it was wearing was the one that claimed nothing had happened yet.
+
+        Asking every non-terminal record the same question -- what does the
+        evidence say? -- is what makes the CLASS detectable rather than the
+        instance. A future crash in a node nobody has written yet leaves a
+        record this pass can still resolve, because it does not need to know
+        which node failed.
+
+        `commit=False` reports without writing. That is not a debugging
+        convenience: it is how a migration gets read before it is run, and the
+        first thing to do with an unfamiliar registry.
+
+        Returns [(record, Standing)] for everything whose status MOVED.
+        """
+        records = (self.registry.live(prune=False) if records is None
+                   else list(records))
+        moved = []
+        for record in records:
+            if record.get("status") in runs_store.TERMINAL:
+                continue
+            standing = self.standing_of(record)
+            if not standing.status or standing.status == record.get("status"):
+                continue
+            moved.append((record, standing))
+            if not commit:
+                continue
+            fields = {"status": standing.status,
+                      "reconciled_at": runs_store._now(),
+                      "reconciled_from": record.get("status"),
+                      "reconciled_because": standing.why}
+            if standing.outcome is not None:
+                self.registry.record_outcome(record["name"], standing.outcome)
+            self.registry.update(record["name"], **fields)
+        return moved
+
+    def reconcile_stale(self):
+        """Called at startup. Reconciles the whole registry and says what moved.
+
+        The name is kept because it is what the app calls; what it does is no
+        longer limited to runs left mid-submission. See reconcile_registry.
+        """
+        moved = self.reconcile_registry()
+        if moved:
+            display.reconciled([(record["name"], standing.outcome)
+                                for record, standing in moved])
+        return [record["name"] for record, _ in moved]
 
     def _interrupt_value(self, config):
         """The payload of whatever the graph is currently parked on, or None.
@@ -1695,7 +2961,18 @@ class GenpipeA1(A1):
         return gate.generation_command(state.get("messages"))
 
     def _build_proposal(self, state, code):
-        return gate.build_proposal(state.get("messages"), code)
+        """The approval payload, with the install's own opinion attached.
+
+        Two authorities, joined here because here is the only place both are
+        reachable. gate.build_proposal is stdlib-only and runs in CI, so it
+        cannot shell out to ask GenPipes anything; runs.pipeline_usage does
+        exactly that and caches the answer. Keeping the parse pure and the
+        lookup out here is what lets the gate's invariants keep running on a
+        machine with no GenPipes on it.
+        """
+        proposal = gate.build_proposal(state.get("messages"), code)
+        return gate.with_usage(proposal, runs_store.pipeline_usage(
+            (proposal.get("slots") or {}).get("pipeline")))
 
     # --------------------------------------------------------------------- #
     #  Monitoring, in three sizes. check() is one aggregate number, jobs() is #
@@ -1709,19 +2986,19 @@ class GenpipeA1(A1):
         standing. Returns None when the script cannot be located, which
         reconcile() treats as "no declared total to check against" rather than
         as permission to assume success.
+
+        The resolution itself is runs.resolve_path, which expands `~` and
+        `$VARS` first. This function used to do the walk itself with a bare
+        os.path.exists, so `-g ~/run/cmd.sh` -- a path bash expands without
+        comment -- was looked for under a directory literally named `~`, never
+        found, and reported as a script that did not exist. See runs.expand.
         """
         proposal = (record or {}).get("proposal") or {}
-        script = proposal.get("script")
-        if not script:
-            return None
-        if os.path.isabs(script):
-            return script if os.path.exists(script) else None
-        for base in (record.get("workdir") or "", os.getcwd(),
-                     ((proposal.get("slots") or {}).get("output_dir") or "")):
-            candidate = os.path.join(base, script) if base else script
-            if os.path.exists(candidate):
-                return os.path.abspath(candidate)
-        return None
+        return runs_store.resolve_path(
+            proposal.get("script"),
+            (record or {}).get("workdir"),
+            os.getcwd(),
+            (proposal.get("slots") or {}).get("output_dir"))
 
     def _last_observation(self, config):
         """What the execute node last returned on this thread, or None.
@@ -1745,24 +3022,61 @@ class GenpipeA1(A1):
                 return content
         return None
 
-    def _reconcile_submission(self, name, since, script, baseline, config):
+    def _submitted_ids_in(self, config):
+        """Every distinct Slurm id this thread ever reported submitting.
+
+        The whole history, oldest to newest, deduplicated. A submission is not
+        always the last thing that happened on a thread -- the conversation
+        usually carries on watching the jobs it just made -- so the launch has
+        to be looked for rather than assumed to be at the end.
+
+        Deduplicated because a thread can legitimately mention the same id
+        twice (the launch, then a squeue dump quoting it back), and counting it
+        twice would turn 18 jobs into 36.
+
+        Returns a tuple, empty when nothing was found or the checkpoint could
+        not be read. Empty means "no evidence", never "nothing was submitted".
+        """
+        try:
+            snap = self.app.get_state(config)
+        except Exception:                       # noqa: BLE001
+            return ()
+        found = {}
+        for message in list((snap.values or {}).get("messages") or []):
+            content = str(getattr(message, "content", "") or "")
+            if "Submitted job with ID" not in content:
+                continue
+            for job_id in runs_store.submitted_ids(content):
+                found.setdefault(job_id, None)
+        return tuple(found)
+
+    def _reconcile_submission(self, name, since, script, baseline, config,
+                              observation=None):
         """Establish what the approved command actually did, and record it.
 
-        Runs in resume()'s `finally`, so it happens whether the turn ended
-        cleanly, raised, or was interrupted. Nothing here may raise: this is the
-        last chance to write down that a submission occurred, and a traceback
-        from the bookkeeping would lose exactly what the bookkeeping is for.
+        Runs in a `finally`, so it happens whether the turn ended cleanly,
+        raised, or was interrupted. Nothing here may raise: this is the last
+        chance to write down that a submission occurred, and a traceback from
+        the bookkeeping would lose exactly what the bookkeeping is for.
 
         No model is consulted. The four facts are the script's declared total,
         whether the runner reported a non-zero exit, how many job rows appeared
         that were not there before, and -- only when a failure needs grading --
         what Slurm says. See runs.reconcile for how they combine, and for why a
         clean exit alone is never enough.
+
+        `observation` is what the submission printed, when the caller ran it
+        itself and therefore has it in hand (_perform_submission does). Left
+        None, it is read back out of the checkpoint instead -- which is where it
+        lives when the graph did the running, and which is deliberately a READ
+        rather than something captured in flight, so it survives the exception
+        this whole path exists to survive.
         """
         try:
             record = self.registry.get(name) or {}
             proposal = record.get("proposal")
-            observation = self._last_observation(config)
+            if observation is None:
+                observation = self._last_observation(config)
 
             after = runs_store.job_list_state((baseline or {}).get("path"))
             # No declared list to watch -- an older script, or one whose header
@@ -1807,79 +3121,6 @@ class GenpipeA1(A1):
                 pass
             return None
 
-    def reconcile_stale(self):
-        """Resolve runs left mid-submission by a session that never came back.
-
-        Called at startup. A record only reaches `submitting` and stays there
-        if the process died between /approve and the reconciliation in
-        resume()'s `finally` -- a kill, a closed terminal, a rebooted login
-        node. Until this ran, such a record sat in /list forever saying
-        "submitting" about a session that ended days ago.
-
-        NOTHING IS RETRIED AND NOTHING IS SUBMITTED. This reads three things
-        that are already on disk -- the persisted baseline, the job list, and
-        the checkpoint's last observation -- and writes a status. It never
-        resumes a graph, never runs a command, and cannot reach the scheduler
-        except to ASK, which it does only when the answer decides whether a
-        retry may be offered.
-
-        The verdict is the same reconcile() every other path uses, so a run
-        resolved here and a run resolved in-flight are held to one standard:
-
-          rows added == the script's declared total   -> submitted
-          the observation survived and reported a
-          failure                                     -> submit_failed
-          anything else                               -> submit_unknown
-
-        Returns the names it settled, so the caller can say so.
-        """
-        settled = []
-        for record in self.registry.submitting():
-            name = record["name"]
-            try:
-                script = (record.get("submitted_script")
-                          or self._approved_script(record))
-                baseline = record.get("job_list_baseline")
-                path = ((baseline or {}).get("path")
-                        or runs_store.declared_job_list(script))
-                after = runs_store.job_list_state(path)
-
-                # The checkpoint outlives the process, so the observation may
-                # still be there -- if the turn got far enough to store one.
-                observation = None
-                if record.get("thread_id"):
-                    observation = self._last_observation(
-                        self._config(record["thread_id"]))
-
-                outcome = runs_store.reconcile(
-                    script=script, observation=observation,
-                    baseline=baseline, after=after, quiet=None)
-                if outcome.status != runs_store.SUBMITTED:
-                    outcome = runs_store.reconcile(
-                        script=script, observation=observation,
-                        baseline=baseline, after=after,
-                        quiet=runs_store.scheduler_quiet_since(
-                            record.get("submitted_since")
-                            or _epoch(record.get("submitted_at"))))
-                self.registry.record_outcome(name, outcome)
-                settled.append((name, outcome))
-            except Exception as e:                  # noqa: BLE001
-                # Startup must not fail because a record is malformed. An
-                # unresolvable one is left unknown rather than left claiming to
-                # be in flight.
-                try:
-                    self.registry.record_outcome(
-                        name,
-                        runs_store.Outcome(
-                            runs_store.SUBMIT_UNKNOWN,
-                            detail=f"could not be reconciled at startup ({e})"))
-                    settled.append((name, None))
-                except Exception:                   # noqa: BLE001
-                    pass
-        if settled:
-            display.reconciled(settled)
-        return [name for name, _ in settled]
-
     def _need_run(self, name, needs_jobs=True):
         """Resolve a name to a record, explaining the failure if it can't.
 
@@ -1908,7 +3149,30 @@ class GenpipeA1(A1):
             # fall back to the old both-answers wording only for records that
             # predate it.
             seen, expected = record.get("jobs_seen"), record.get("expected_jobs")
-            if record["status"] == runs_store.SUBMITTED and seen == 0:
+            if runs_store.jobs_are_unreachable(record):
+                # SAY WHAT IS KNOWN. This used to fall through to the guess
+                # below -- "either every step was already up to date, or
+                # GenPipes wrote its list outside the directories searched" --
+                # and offer both possibilities about a run whose answer had
+                # already been established: 46 jobs, recovered from the
+                # conversation's own record of the launch. Neither branch of
+                # the guess was true, and the one fact anybody had was left out
+                # of it.
+                #
+                # What genuinely cannot be done is named separately, because it
+                # is a different thing: without a manifest there are no job ids
+                # to ask Slurm about, so per-job state is gone even though the
+                # run's outcome is not.
+                display.problem(
+                    f"'{name}' submitted {seen} job{'s' if seen != 1 else ''}, "
+                    f"but no job list was recorded for it.",
+                    f"{record.get('outcome_detail') or ''}"
+                    f"{'  ·  ' if record.get('outcome_detail') else ''}"
+                    f"Without the manifest there are no job ids to ask the "
+                    f"scheduler about, so this run's jobs cannot be inspected."
+                    f"  ·  /track {name} <path/to/job_list> if you still have "
+                    f"it  ·  /history {name} for what is recorded")
+            elif record["status"] == runs_store.SUBMITTED and seen == 0:
                 display.problem(
                     f"'{name}' created no jobs — every step was already up to "
                     f"date.", "There is nothing on the scheduler to check.")

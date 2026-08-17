@@ -131,9 +131,15 @@ try:
     tracker.track("ghost", os.path.join(tracker.path, "does_not_exist.job_list"))
     expect("track() refuses a missing path", tracker.registry.load(), [])
 
-    # track() on a real file records a live, source="manual" entry.
+    # track() on a real JOB LIST records a live, source="manual" entry.
+    #
+    # The fixture used to be an empty file, which adoption accepted -- that
+    # was the defect: any file at all became a permanent run. It carries real
+    # rows now, which is both what the guard requires and what a job list
+    # actually is.
     job_list = os.path.join(tracker.path, "Pipeline.protocol.job_list.T1")
-    open(job_list, "w").close()
+    with open(job_list, "w") as f:
+        f.write("101\ttrimmomatic.sampleA\tjob_output/t.o\tCOMPLETED\n")
     tracker.track("manual-1", job_list)
     records = tracker.registry.load()
     expect("track() records one entry", len(records), 1)
