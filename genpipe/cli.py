@@ -22,6 +22,7 @@ from . import preflight
 from . import prep
 from . import readset
 from . import runs as runs_store
+from . import settings
 from . import slots
 from . import ui
 from .agent import GenpipeA1
@@ -34,7 +35,10 @@ from .agent import GenpipeA1
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 GRAMMAR_PATH = HERE / "genpipes.md"
-ENV_PATH = ROOT / ".env"
+# The settings file, via settings.py rather than recomputed here, so the module
+# that READS it and the code that WRITES it cannot end up pointing at two
+# different files -- and so GENPIPE_ENV_FILE moves both together.
+ENV_PATH = settings.path()
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_SOURCE = "Anthropic"
 
@@ -234,7 +238,11 @@ def _prompt_for_api_key():
 
 def _require_api_key():
     """Ensure some provider's API key is set, prompting for and saving one
-    (plus which provider/model it's for) if not.
+    (plus which provider/model it's for) if not. True if it had to ask.
+
+    The return value is what lets main() check a BRAND NEW key against the
+    provider without checking an already-working one on every launch -- see
+    _confirm_new_key.
 
     Without this, a missing key doesn't surface until the first real LLM call
     -- deep inside Biomni's tool-retriever call in run() -- as a ~25-frame
@@ -250,8 +258,9 @@ def _require_api_key():
     """
     for _, _, env_var, _ in KNOWN_PROVIDERS:
         if not _looks_like_placeholder(os.environ.get(env_var, "")):
-            return
+            return False
     _prompt_for_api_key()
+    return True
 
 
 def _prompt_for_name():
@@ -591,6 +600,46 @@ def _cmd_model(agent, args):
     _write_env_var("GENPIPE_LLM_MODEL", model)
     os.environ["GENPIPE_LLM_SOURCE"] = source
     os.environ["GENPIPE_LLM_MODEL"] = model
+
+
+def _confirm_new_key(agent):
+    """Ask the provider whether the key just pasted actually works.
+
+    THE ONE PLACE A KEY WAS NEVER CHECKED. /model probes before it switches and
+    /key probes before it applies -- both because a provider only rejects a bad
+    key when a request is actually made, and a client object constructed around
+    one is indistinguishable from a client constructed around a good one. The
+    first-launch path did neither: a typo, an expired key or a key pasted with
+    half of it missing was masked, saved to .env, and reported as `Saved`, and
+    the first sign of trouble was a provider error from inside the agent loop a
+    turn later -- where it reads as a problem with the message.
+
+    So the same probe runs here, once, and only after the prompt has actually
+    fired. It costs one very short completion on a first launch and nothing on
+    any launch after that.
+
+    A rejection is not fatal and does not loop. The session is left standing
+    with the two commands that can fix it named, because a person who has just
+    mistyped a key may want to paste a different one OR pick a different
+    provider, and guessing which is not this function's business.
+    """
+    source = os.environ.get("GENPIPE_LLM_SOURCE", DEFAULT_SOURCE)
+    model = os.environ.get("GENPIPE_LLM_MODEL", DEFAULT_MODEL)
+    state, detail = _probe_llm(agent.llm)
+    if state == _MODEL_OK:
+        return True
+    if state == _MODEL_UNVERIFIED:
+        # A rate limit or a DNS failure says nothing about the key. Saying so
+        # and carrying on is the honest answer; refusing to start would strand
+        # somebody behind a problem that is not theirs.
+        print(f"  {display.GREY}Could not reach {source} to check the key "
+              f"-- {detail}{display.RESET}\n")
+        return True
+    display.nothing(
+        f"{source} rejected that key — {detail}.",
+        "/key pastes another one · /model switches provider. "
+        "Nothing else is affected.")
+    return False
 
 
 def _cmd_key(agent, args):
@@ -2229,6 +2278,13 @@ def _cmd_where(agent, args):
          "every run this tool knows about; /history reads it"),
         ("checkpoints", os.path.join(agent.path, "genpipe_checkpoints.sqlite"),
          "the conversations, and the gates parked in them"),
+        # The file the app writes the key, the model and the name into, and
+        # now also reads back. It belongs on this screen for the same reason
+        # `launched from` does: when it is not where somebody assumes, nothing
+        # else on the screen explains why the session came up unconfigured.
+        ("settings", str(ENV_PATH),
+         f"key, model and name · colours are {display.THEME} "
+         f"(GENPIPE_THEME=light|dark)"),
         ("this copy", ROOT, ""),
     ])
 
@@ -2810,6 +2866,7 @@ def main(argv=None):
     fake_llm = "--fake-llm" in argv or bool(os.environ.get("GENPIPE_FAKE_LLM"))
     notes = []
     fakecluster = None
+    asked = False
     if fake_cluster or fake_llm:
         # Dev mode: a stubbed GenPipes and Slurm on PATH, and optionally a stand-in
         # for the model, so the whole interface -- gate, approve, check, jobs, why
@@ -2847,10 +2904,13 @@ def main(argv=None):
     else:
         # A scripted model needs no key, and asking for one would make dev mode
         # unusable on a machine that has never had a key configured.
-        _require_api_key()
+        asked = _require_api_key()
     agent = build_agent()
     if fake_llm:
         agent.llm = fakecluster.DevLLM()
+    elif asked:
+        # Only when a key was pasted a moment ago. See _confirm_new_key.
+        _confirm_new_key(agent)
     # The readiness line printed here, and does not any more: it existed
     # because the prompt used to follow a banner and nothing else, and looked
     # like a dead end. welcome() is the last thing before the prompt now, and

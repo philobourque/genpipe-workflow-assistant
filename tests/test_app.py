@@ -72,6 +72,12 @@ class App:
         # this it would stop at "what should I call you?" and every send() below
         # would be answering that question instead.
         env["GENPIPE_USER"] = "tester"
+        # The app reads its own .env now (settings.load, called from
+        # __main__ before cli is imported). Pointed at a file inside this
+        # test's own directory, which does not exist -- so the checkout's real
+        # .env cannot put a real API key back into an environment this suite
+        # deliberately stripped, and --fake-llm goes on proving it needs none.
+        env["GENPIPE_ENV_FILE"] = os.path.join(workdir, "settings-none.env")
 
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "genpipe", "--fake", "--fake-llm"],

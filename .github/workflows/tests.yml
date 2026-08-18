@@ -119,6 +119,12 @@ jobs:
         # fails here rather than on somebody's laptop three weeks later.
         run: python tests/test_theme.py
 
+      - name: The settings file, read by the app that writes it
+        # The regression for a .env the app wrote and never read. Also the
+        # allow-list: a plain text file loaded at startup with no supervision
+        # must not be able to set PATH or PYTHONPATH.
+        run: python tests/test_settings.py
+
       - name: The line editor's wrapping and caret arithmetic
         run: python tests/test_ui.py
 
@@ -145,7 +151,7 @@ jobs:
         # A stdlib-only module that quietly grows a heavy import would break CI
         # in a confusing way later; catching it as its own step names the cause.
         run: |
-          python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui, modify, prep, readset, theme; print('ok')"
+          python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui, modify, prep, readset, theme, settings; print('ok')"
           python -c "import genpipe, sys; assert 'biomni' not in sys.modules; print('no biomni')"
 
   agent:
@@ -211,3 +217,9 @@ jobs:
 
       - name: End to end, against a scripted model
         run: python tests/test_mock_pipeline.py
+
+      - name: Clone, launch, paste a key, switch model
+        # The path somebody walks exactly once, and therefore the one nobody
+        # who built this ever walks again. Needs cli.py, which needs biomni --
+        # no key, no network, no cluster: every provider call is a stub.
+        run: python tests/test_onboarding.py
