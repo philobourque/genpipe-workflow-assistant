@@ -1,17 +1,28 @@
 name: tests
 
-# The suites that can run anywhere and still say something true. They import
-# only the standard library -- every module in the genpipe package except
-# agent.py and cli.py was deliberately kept free of biomni for exactly this
-# reason, so CI needs no pinned agent stack, no API key, and no cluster.
+# TWO JOBS, split by what they have to install rather than by what they cover.
 #
-# What is NOT here, and why: test_lifecycle.py, test_app.py, test_agent_gate.py
-# and test_mock_pipeline.py drive the real LangGraph gate and a real terminal,
-# so they need biomni==0.0.8 and its pinned langgraph. Installing that on every
-# push to check a gate matcher would trade a two-second signal for a
-# several-minute one. Those four run on the cluster, in the venv, before a
-# release -- as do the scenarios in testcases/, which walk the product rather
-# than its parts. See the README.
+# `offline` is the fast one: every module in the genpipe package except agent.py
+# and cli.py was deliberately kept free of biomni, so these need no pinned agent
+# stack, no API key and no cluster, and they answer in seconds.
+#
+# `agent` installs biomni==0.0.8 and its pinned langgraph and runs the suites
+# that drive the real gate. It exists because the reasoning that kept them out
+# -- "installing the stack on every push to check a gate matcher trades a
+# two-second signal for a several-minute one" -- was a fair trade for a gate
+# MATCHER and stopped being one once the architectural protections moved into
+# that half. test_capability asserts that prose containing every trigger word
+# anybody could imagine produces no capability; test_surface dispatches every
+# public command and proves the held run never became a submission; the
+# lifecycle suites are the only automated proof that hold -> approve -> submit
+# still works. Those cannot be allowed to regress between releases just because
+# they are slower to run than the rest.
+#
+# The two jobs run in parallel and both must pass; the split is about install
+# cost, not about one mattering less than the other.
+#
+# What is still NOT in CI: test_app.py, which drives a real pty through pyte,
+# and the scenarios in testcases/. Both run on the cluster before a release.
 
 on:
   push:
@@ -103,9 +114,78 @@ jobs:
       - name: The line editor's wrapping and caret arithmetic
         run: python tests/test_ui.py
 
+      - name: The /modify panel, and a fork's own identity
+        # Carries the regressions for the fork defects: the panel is drawn
+        # under the name of the run being BUILT, an unchanged fork is still
+        # creatable, and no extra row is emitted twice.
+        run: python tests/test_panel.py
+
+      - name: What a run's status may claim
+        # Submission evidence beats everything. The suite for the run that
+        # submitted 46 jobs and said `held` for three weeks.
+        run: python tests/test_classify.py
+
+      - name: Reading a generated command back
+        run: python tests/test_mirror.py
+
+      - name: Step ranges, scoped to the protocol they belong to
+        # Seven dnaseq protocols whose step numbers all restart at 1. Also the
+        # scoping that stops "set walltime to 24 hours" being read as step 24.
+        run: python tests/test_steps.py
+
       - name: Everything imports without a cluster present
         # A stdlib-only module that quietly grows a heavy import would break CI
         # in a confusing way later; catching it as its own step names the cause.
         run: |
           python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui, modify, prep, readset; print('ok')"
           python -c "import genpipe, sys; assert 'biomni' not in sys.modules; print('no biomni')"
+
+  agent:
+    # The suites that need the real LangGraph gate. Slower, and the only
+    # automated cover for the capability boundary, the command surface and the
+    # submission lifecycle.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: The pinned agent stack
+        # requirements.txt exactly, because agent.py reaches into LangGraph's
+        # snapshot/interrupt internals and those are not a stable API across
+        # versions. Nothing here needs an API key: every suite below drives a
+        # scripted model.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Prose is never a capability call
+        # The architectural boundary, and the reason this job exists. Asserts
+        # that a sentence containing every trigger word anybody could imagine
+        # produces no capability at all, that the table is closed, and that
+        # each capability is bound to the same method its slash command calls.
+        run: python tests/test_capability.py
+
+      - name: One command table, and every command in it
+        # Dispatches every public command for real against the fake cluster,
+        # then checks the held run never became a submission. Also the
+        # source-level proof that the fork path uses the fork-aware ini seam.
+        run: python tests/test_surface.py
+
+      - name: The gate, inside the graph
+        run: python tests/test_agent_gate.py
+
+      - name: Hold, approve, submit, check
+        run: python tests/test_lifecycle.py
+
+      - name: Re-gating after a rework
+        run: python tests/test_regate.py
+
+      - name: Preparation carried across turns
+        run: python tests/test_run_prep.py
+
+      - name: End to end, against a scripted model
+        run: python tests/test_mock_pipeline.py

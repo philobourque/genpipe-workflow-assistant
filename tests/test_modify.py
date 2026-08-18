@@ -332,6 +332,122 @@ def main():
                 not override.removed(os.path.join(tmp, "never.override.ini")))
 
     # ------------------------------------------------------------------ #
+    # THE REGRESSION FOR "EDITING A FORK EDITED ITS PARENT".
+    #
+    # The rule the section above documents -- path_for reads the -c line to
+    # find the live file, so a rename does not orphan it -- is right for a run
+    # being EDITED and exactly wrong for one being COPIED. A fork quotes its
+    # parent's command verbatim, so stacked_override() finds the PARENT's ini
+    # on that -c line; tuning a step in the fork then wrote into the parent's
+    # file, and a run somebody had gone out of their way not to touch silently
+    # acquired a new walltime.
+    #
+    # The two runs a fork exists to keep separate were sharing one file again,
+    # which is the precise thing naming the file after the run is supposed to
+    # prevent. And it was silent: nothing failed, nothing was reported, and the
+    # parent's own /view then showed the new number as though it had always
+    # been there.
+    #
+    # What is asserted below is the parent's state ACROSS the child's edit, on
+    # all four axes it could have moved on -- its ini's path and bytes, its -c
+    # stack, its generated command and script, and its registry identity.
+    r.section("tuning a fork never touches the run it was forked from")
+
+    with tempfile.TemporaryDirectory() as forkdir:
+        parent_ini = os.path.join(forkdir, "pouletrun.override.ini")
+        override.write(parent_ini,
+                       {"gatk_sam_to_fastq": {"cluster_walltime": "35:00:00"}},
+                       run="pouletrun")
+
+        parent = {
+            "command": "bash pouletrun.sh",
+            "generated": (f"genpipes chipseq -t chipseq -s 1-5 "
+                          f"-c chipseq.base.ini rorqual.ini {parent_ini} "
+                          f"-g pouletrun.sh"),
+            "slots": {"pipeline": "chipseq", "protocol": "chipseq",
+                      "steps": "1-5", "design": None, "pairs": None,
+                      "readset": "readset.tsv",
+                      "inis": ["chipseq.base.ini", "rorqual.ini", parent_ini],
+                      "output_dir": None},
+        }
+
+        registry = runs.Registry(tempfile.mkdtemp())
+        registry.hold("pouletrun", "chat-1", parent, forkdir)
+
+        # Everything about the parent, recorded BEFORE the child is touched.
+        before = {
+            "ini_path": override.path_for("pouletrun", forkdir, parent),
+            "ini_bytes": open(parent_ini, "rb").read(),
+            "stack": list(modify.config_stack(parent)),
+            "generated": parent["generated"],
+            "script": parent["command"],
+            "record": dict(registry.get("pouletrun")),
+        }
+
+        # THE CHILD'S EDIT, through the same calls cli._fill_resources makes:
+        # path_for to decide where, read/merge to build it, write to land it.
+        # `fresh` is what the fork path passes and a rewrite does not.
+        child_ini = override.path_for("pouletrun-2", forkdir, parent, fresh=True)
+        r.equal("a fork's ini is named after the fork, not the parent",
+                os.path.basename(child_ini), "pouletrun-2.override.ini")
+        r.check("and it is a different file from the parent's",
+                os.path.abspath(child_ini) != os.path.abspath(parent_ini))
+
+        override.write(child_ini,
+                       override.merge(override.read(child_ini),
+                                      "gatk_sam_to_fastq",
+                                      {"cluster_walltime": "71:00:00"}),
+                       run="pouletrun-2")
+
+        # THE PARENT, AFTER. Four axes, none of which may have moved.
+        r.equal("the parent's ini is still the same file",
+                override.path_for("pouletrun", forkdir, parent),
+                before["ini_path"])
+        r.equal("...and its contents are byte-identical",
+                open(parent_ini, "rb").read(), before["ini_bytes"])
+        r.contains("...still holding the walltime it was written with",
+                   before["ini_bytes"].decode(), "35:00:00")
+        r.check("...and not the one the fork was tuned to",
+                "71:00:00" not in open(parent_ini).read())
+
+        r.equal("the parent's -c stack is unchanged",
+                list(modify.config_stack(parent)), before["stack"])
+        r.check("...and does not carry the fork's ini",
+                child_ini not in modify.config_stack(parent))
+
+        r.equal("the parent's generated command is unchanged",
+                parent["generated"], before["generated"])
+        r.equal("...and the script it runs is unchanged",
+                parent["command"], before["script"])
+
+        after = registry.get("pouletrun")
+        r.equal("the parent's registry record is unchanged", dict(after),
+                before["record"])
+        r.equal("...still held", after["status"], runs.HELD)
+        r.equal("...still on its own conversation", after["thread_id"], "chat-1")
+        r.equal("...and still the only record there is", len(registry.load()), 1)
+
+        # The fork's own file really was written -- without this every
+        # assertion above would pass on a child edit that never happened.
+        r.contains("the fork's ini holds the fork's tuning",
+                   open(child_ini).read(), "71:00:00")
+
+        # THE NEGATIVE CONTROL, which is what makes this a regression test
+        # rather than a description. Without `fresh`, path_for resolves to the
+        # parent's file -- correct for a rewrite, and the exact defect when the
+        # caller is a fork. If this ever stops being true, the assertions above
+        # have stopped being able to fail.
+        r.equal("without fresh, path_for still resolves to the parent's file",
+                os.path.abspath(override.path_for("pouletrun-2", forkdir, parent)),
+                os.path.abspath(parent_ini))
+
+        # And the model is told to displace the inherited ini rather than sit
+        # beside it, so the parent's file cannot go on tuning the fork either.
+        deltas = modify._deltas(parent, {"resources": child_ini})
+        r.check("the fork is told to replace the ini it inherited",
+                any(f"replace {parent_ini}" in d for d in deltas), deltas)
+
+    # ------------------------------------------------------------------ #
     # The rule stays -- the name is typed as a CLI argument, built into
     # `{name}.override.ini`, and embedded in a fork's thread id, so a space or a
     # slash breaks a real thing. What changed is that a refusal now hands back

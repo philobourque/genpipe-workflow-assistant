@@ -146,6 +146,42 @@ def main():
             None)
 
     # ------------------------------------------------------------------ #
+    r.section("the fork path really reaches the seam that protects the parent")
+    # test_modify proves the MECHANISM: override.path_for(fresh=True) names a
+    # file after the fork, and the parent's ini, -c stack, command and record
+    # all survive the child's edit untouched. That proof is worth nothing if
+    # the fork path does not call it that way, and the defect was precisely a
+    # caller passing the wrong thing to a correct function.
+    #
+    # Asserted by source, like test_capability's "one implementation, two
+    # doors", because there is no way to drive a panel through a redirected
+    # stdout and the binding is the thing at risk rather than the behaviour.
+    import inspect
+
+    guided = inspect.getsource(cli._modify_guided)
+    r.contains("the panel resolves its ini with a fork-aware path",
+               guided, "fresh=bool(fork_as)")
+    r.contains("and hands the same flag to the resources flow",
+               guided, "fresh=bool(fork_as)")
+    r.contains("which is told which identity it is writing for",
+               guided, "editing=editing")
+    r.check("the panel is drawn under the edited identity, not the source",
+            "modify.rows_for(proposal, editing" in guided, "rows_for")
+
+    fill = inspect.getsource(cli._fill_resources)
+    r.contains("_fill_resources passes fresh straight through to path_for",
+               fill, "override.path_for(editing, directory, proposal, fresh=fresh)")
+    r.check("and writes under the edited identity",
+            "run=editing" in fill, "run=editing")
+    r.check("while still reading the SOURCE's diagnosis",
+            "self.registry.get(name)" in fill or "agent.registry.get(name)" in fill,
+            "registry.get(name)")
+
+    from genpipe import override
+    r.check("path_for takes the flag at all",
+            "fresh" in inspect.signature(override.path_for).parameters)
+
+    # ------------------------------------------------------------------ #
     r.section("/list and /sort present runs in the same order")
     # The reported defect: the same collection rearranged itself between the
     # two screens, so a row read as fourth in /list was seventeenth in the
