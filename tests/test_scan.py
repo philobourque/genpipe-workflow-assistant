@@ -149,6 +149,97 @@ def main():
                     registry.unique_name(entry["name"]), entry["name"] + "-2")
 
         # -------------------------------------------------------------- #
+        # Finding a run again is three different situations, and /scan used to
+        # answer all three with "already known as <name>". See
+        # runs.rediscovery() for what each of them costs.
+        r.section("rediscovering a run that is already on record")
+
+        found = {"name": "proj-0805", "pipeline": "dnaseq",
+                 "protocol": "somatic_fastpass", "workdir": "/w/proj",
+                 "job_list": "/w/proj/job_output/DnaSeq.somatic.job_list.T1",
+                 "attempts": ["/w/proj/job_output/DnaSeq.somatic.job_list.T1"],
+                 "at": "2026-08-05"}
+
+        def registry_of(*records):
+            store = runs.Registry(tempfile.mkdtemp())
+            store.save([runs._normalise(dict(x)) for x in records])
+            return store
+
+        def tracked(**over):
+            base = {"name": "mine", "status": "submitted", "source": "scan",
+                    "job_list": found["job_list"], "workdir": "/w/proj"}
+            base.update(over)
+            return base
+
+        for label, records, want in (
+                ("nothing on record is adopted", [], runs.ADOPT),
+                ("a hidden run comes back", [tracked(hidden=True)], runs.RESTORE),
+                ("a gone run comes back", [tracked(status="gone")], runs.RESTORE),
+                ("gone and hidden comes back",
+                 [tracked(status="gone", hidden=True)], runs.RESTORE),
+                ("a current run is left alone", [tracked()], runs.KNOWN),
+                ("the same job list under another name is not duplicated",
+                 [tracked(name="totally-different", workdir="/elsewhere")],
+                 runs.KNOWN),
+                # A held proposal has never launched, so a job_output beside it
+                # belongs to some other run. This is the reported defect: /scan
+                # refused a real finished run because a held proposal shared
+                # its directory.
+                ("a held proposal does not own the directory it names",
+                 [{"name": "hi-0724", "status": "held", "source": "agent",
+                   "job_list": None, "workdir": "/w/proj",
+                   "held_at": "2026-07-24T22:42:58"}], runs.ADOPT),
+                # And the converse: a run built here really does own the
+                # submission it made, so a newer job list beside it is not
+                # allowed to re-point that record.
+                ("an agent run is never re-pointed at somebody else's job list",
+                 [tracked(source="agent",
+                          job_list="/w/proj/job_output/DnaSeq.somatic.job_list.T0")],
+                 runs.KNOWN),
+                ("an adopted run takes a newer attempt in its own directory",
+                 [tracked(job_list="/w/proj/job_output/DnaSeq.somatic.job_list.T0")],
+                 runs.RESTORE)):
+            r.equal(label, runs.rediscovery(registry_of(*records), found).action,
+                    want)
+
+        r.section("a restore returns the identity, it does not mint one")
+        store = registry_of(tracked(status="gone", hidden=True, source="agent",
+                                    thread_id="chat-1",
+                                    proposal={"generated": "genpipes dnaseq -c a -r b"},
+                                    notes=[{"text": "OOM in picard"}]))
+        back = store.rediscover("mine", found)
+        r.equal("it is in /list again", back["status"], "submitted")
+        r.check("not gone", not back["gone"])
+        r.check("not hidden", not back["hidden"])
+        r.equal("pointing at the file that was found", back["job_list"],
+                found["job_list"])
+        r.equal("still built here", back["source"], "agent")
+        r.equal("still on its conversation", back["thread_id"], "chat-1")
+        r.truthy("still holding its command", back["proposal"])
+        r.truthy("still holding what was found out about it", back["notes"])
+        r.equal("and there is still exactly one of it", len(store.load()), 1)
+
+        r.section("a held run is never converted by being found on disk")
+        store = registry_of({"name": "held-one", "status": "held",
+                             "source": "agent", "job_list": None,
+                             "workdir": "/w/proj", "thread_id": "chat-9",
+                             "held_at": "2026-07-24T22:42:58"})
+        verdict = runs.rediscovery(store, found)
+        r.equal("it is not the run that was found", verdict.action, runs.ADOPT)
+        r.equal("and its record is untouched",
+                store.get("held-one")["status"], "held")
+
+        r.section("an invalid job list is still refused by track()")
+        with tempfile.TemporaryDirectory() as junk:
+            path = os.path.join(junk, "notes.txt")
+            with open(path, "w") as fh:
+                fh.write("this is not a job list\n")
+            store = runs.Registry(tempfile.mkdtemp())
+            record, why = store.track("typo-1", path)
+            r.equal("nothing was written", record, None)
+            r.contains("and it says why", why, "job list")
+
+        # -------------------------------------------------------------- #
         r.section("an empty directory is an answer, not an error")
 
         with tempfile.TemporaryDirectory() as empty:

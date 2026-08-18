@@ -85,6 +85,24 @@ jobs:
         # same knowledge written twice and nothing else stops them drifting.
         run: python tests/test_intake.py
 
+      - name: The freedoms — model's and user's
+        # The two halves of the architecture, asserted as invariants because
+        # both can be broken by a change that makes some individual screen
+        # nicer and nothing else would go red. Prose selects no pipeline, no
+        # protocol, no capability and no submission; and an option GenPipes
+        # calls optional does not become mandatory here.
+        run: python tests/test_freedom.py
+
+      - name: GenPipes' own parsers, against the table that describes them
+        # Compares slots.py to genpipe/genpipes_facts.json, which is generated
+        # from a real install by tools/genpipes_facts.py. The table is still
+        # what the product reads -- it has to work on a machine with no
+        # GenPipes -- but it can no longer drift from the software silently.
+        run: python tests/test_requirements.py
+
+      - name: The line editor's wrapping and caret arithmetic
+        run: python tests/test_ui.py
+
       - name: Everything imports without a cluster present
         # A stdlib-only module that quietly grows a heavy import would break CI
         # in a confusing way later; catching it as its own step names the cause.

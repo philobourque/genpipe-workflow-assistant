@@ -19,6 +19,7 @@ import sys
 
 from harness import Report
 
+from genpipe import ui
 from genpipe.slots import Option
 from genpipe.ui import Field, _Line, option_lines
 
@@ -254,6 +255,71 @@ def main():
         rows, cursor=0, field=Field("fork", "pouletrun-2"), details=False))
     r.contains("a field survives descriptions being hidden",
                with_field[1], "pouletrun-2")
+
+    # ------------------------------------------------------------------ #
+    r.section("the composer wraps a paragraph instead of scrolling it away")
+    # The reported defect: typing a long request scrolled the box sideways and
+    # the beginning of the sentence left the screen, so there was no way to
+    # read back what was about to be asked. Widening the box would only have
+    # moved the column at which that happens, so the text wraps instead.
+    #
+    # Everything here is asserted against wrap_segments/caret_at rather than
+    # against a terminal, because they are where the arithmetic lives -- the
+    # pty can only show that the result looks right, not that the caret lands
+    # on the correct character.
+    text = ("I want to change something about this run but I am not sure "
+            "what exactly it is that I would like to do")
+    segs = ui.wrap_segments(text, 30)
+    rows = [text[a:b] for a, b, _ in segs]
+
+    r.check("every row fits the width", all(len(x) <= 30 for x in rows), rows)
+    r.check("more than one row for a paragraph", len(rows) > 1)
+    r.check("the beginning is still on screen", rows[0].startswith("I want"))
+    # Nothing may be lost or duplicated by wrapping. Rejoining on the breaks
+    # has to give back exactly what was typed.
+    r.equal("no character is dropped or repeated", " ".join(rows), text)
+    r.check("no row starts or ends on a space",
+            not any(x.startswith(" ") or x.endswith(" ") for x in rows), rows)
+
+    r.section("the caret lands on the character it is actually on")
+    # Every index, not a sample: an off-by-one on a single wrap boundary is
+    # exactly the kind of bug that survives spot checks and is then reported
+    # as "the cursor is sometimes wrong".
+    bad = []
+    for i in range(len(text) + 1):
+        row, col = ui.caret_at(segs, i)
+        start, end, _ = segs[row]
+        if not (0 <= col <= end - start):
+            bad.append((i, row, col))
+    r.check("every caret position is inside its row", not bad, bad[:4])
+    r.equal("the caret starts at the top left", ui.caret_at(segs, 0), (0, 0))
+    last_start, last_end, _ = segs[-1]
+    r.equal("and ends after the last character typed",
+            ui.caret_at(segs, len(text)),
+            (len(segs) - 1, last_end - last_start))
+
+    r.section("the degenerate cases have a row for the caret to sit on")
+    r.equal("an empty line still has one row", ui.wrap_segments("", 30),
+            [(0, 0, 0)])
+    r.equal("and the caret is on it", ui.caret_at(ui.wrap_segments("", 30), 0),
+            (0, 0))
+    runon = "x" * 70
+    r.equal("a word longer than the box is hard-broken rather than dropped",
+            "".join(runon[a:b] for a, b, _ in ui.wrap_segments(runon, 30)),
+            runon)
+    r.check("a one-column box does not loop forever",
+            len(ui.wrap_segments("abc", 1)) == 3)
+    r.check("nor does a zero-width one",
+            len(ui.wrap_segments("abc", 0)) == 3)
+
+    r.section("re-wrapping on resize is a recomputation, not a stored layout")
+    narrow = ui.wrap_segments(text, 20)
+    wide = ui.wrap_segments(text, 60)
+    r.check("a narrower window takes more rows", len(narrow) > len(wide))
+    r.equal("and neither loses anything",
+            " ".join(text[a:b] for a, b, _ in narrow), text)
+    r.equal("nor does the wide one",
+            " ".join(text[a:b] for a, b, _ in wide), text)
 
     return r.finish()
 

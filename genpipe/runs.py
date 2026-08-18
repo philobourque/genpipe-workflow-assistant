@@ -270,12 +270,20 @@ class Registry:
         return found
 
     def all(self, prune=True):
-        """Every record, newest first. This is /history."""
+        """Every record, newest first. This is /history.
+
+        Keyed on _listing_key -- submitted_at OR held_at -- and that `or` is a
+        bug fix rather than a tidy-up. Sorting on submitted_at alone gave the
+        same empty string to every record that was never submitted, so held,
+        lapsed and abandoned runs all compared equal and fell out in the
+        registry's raw append order, in one undifferentiated block below every
+        submitted run. /history claimed to be newest first and was newest first
+        only for the runs that had launched.
+        """
         records = self.load()
         if prune and self._prune(records):
             self.save(records)
-        return sorted(records, key=lambda r: r.get("submitted_at") or "",
-                      reverse=True)
+        return sorted(records, key=_listing_key, reverse=True)
 
     def live(self, prune=True):
         """Runs still worth acting on: submitted and not purged, plus anything
@@ -561,6 +569,42 @@ class Registry:
             source="scan")
         return self.update(name, attempts=found.get("attempts") or [found["job_list"]],
                            discovered_at=_now())
+
+    def rediscover(self, name, found):
+        """Re-point an existing record at artifacts /scan found again.
+
+        The restore half of rediscovery(). It writes exactly four things --
+        where the run is, which job list is newest, the attempts under it, and
+        the fact that it is neither gone nor hidden any more -- and touches
+        nothing else.
+
+        WHAT IT DELIBERATELY DOES NOT WRITE, because a restore that quietly
+        rewrote identity would be worse than the refusal it replaces:
+
+          source        a run built here stays built here. Finding its files
+                        on disk is not evidence it was launched elsewhere, and
+                        relabelling it would lose the conversation behind it.
+          proposal      the command it is remains the command it is.
+          thread_id     ditto, and it is what /approve would resume through.
+          decisions     the record of what a person authorised is not ours to
+                        edit from a directory listing.
+
+        Nothing on disk is read beyond the paths /scan already collected, and
+        nothing on disk is written at all.
+        """
+        record = self.get(name)
+        if record is None:
+            return None
+        attempts = list(dict.fromkeys(
+            (found.get("attempts") or []) + (record.get("attempts") or [])))
+        return self.update(name,
+                           status=SUBMITTED,
+                           gone=False,
+                           hidden=False,
+                           job_list=found["job_list"],
+                           workdir=found.get("workdir") or record.get("workdir"),
+                           attempts=attempts or [found["job_list"]],
+                           rediscovered_at=_now())
 
     def abandon(self, name, reason=None):
         """Retire a held run. Nothing submitted, nothing regenerated.
@@ -1874,13 +1918,106 @@ def already_known(registry, found):
     same run adopted twice under two names would put two rows in /list that
     cannot be told apart, and a /scan that silently re-added everything it found
     would make the command unusable the second time you ran it.
+
+    A RECORD WITH NO JOB LIST IS NOT A MATCH, whatever directory it names, and
+    that exception is a bug fix rather than a refinement. A held proposal has
+    never launched -- that is what held means -- so a job_output directory
+    beside it was written by some other run, quite possibly one this tool has
+    never seen. Matching on workdir alone made the held proposal `hi-0724`
+    "own" every run that had ever executed in its directory, and /scan refused
+    to adopt a real, finished, launched run with the words "already known as
+    hi-0724". They were never the same run. A workdir identifies a run only
+    once that run has actually produced something.
     """
     for record in registry.load():
-        if record.get("job_list") and record["job_list"] == found["job_list"]:
+        if not record.get("job_list"):
+            continue
+        if record["job_list"] == found["job_list"]:
             return record
         if record.get("workdir") and os.path.abspath(record["workdir"]) == found["workdir"]:
             return record
     return None
+
+
+# What /scan should do about a run it found on disk. Three outcomes, and the
+# distinction between them is the whole of the fix.
+ADOPT = "adopt"        # nothing on record matches; mint an identity
+RESTORE = "restore"    # an identity exists and had lost its artifacts or its
+                       # place in /list. Re-point it; do not mint a second one.
+KNOWN = "known"        # already on record, already current. Nothing to do.
+
+
+class Rediscovery:
+    """What a discovered run means for the registry: an action and why.
+
+    `record` is the existing identity when there is one, so the caller can name
+    it rather than saying "already known" and leaving somebody to guess which
+    of forty rows that was.
+    """
+
+    __slots__ = ("action", "record", "reason")
+
+    def __init__(self, action, record=None, reason=""):
+        self.action = action
+        self.record = record
+        self.reason = reason
+
+    @property
+    def name(self):
+        return (self.record or {}).get("name")
+
+    def __repr__(self):
+        return f"<Rediscovery {self.action} {self.name!r}>"
+
+
+def rediscovery(registry, found):
+    """What to do about `found`: adopt it, restore an identity, or nothing.
+
+    WHY RESTORING RATHER THAN REFUSING. "already known as hi-0724" was the
+    whole of what /scan could say, and it was the wrong answer to three
+    different questions. A run hidden by /sort is on record and not in /list,
+    so finding it again should put it back. A run marked `gone` because its
+    job list had been cleaned off the cluster is on record and pointing at a
+    file that had disappeared -- and here is that file, so the record can be
+    made true again. Only the third case, a run already on record and already
+    current, is genuinely nothing to do.
+
+    None of the three may mint a second identity for one job list, and the
+    restore path never touches disk, never resubmits, and never rewrites what
+    the run IS -- not its source, not its proposal, not the conversation it
+    came from. It re-points a record at artifacts that are demonstrably there.
+
+    An agent-built run whose directory has since produced a DIFFERENT job list
+    is deliberately left alone. Re-pointing it would break the link between a
+    run and the submission it actually made, which is the one thing its record
+    is for; the newer job list is somebody else's run and can be adopted on its
+    own.
+    """
+    record = already_known(registry, found)
+    if record is None:
+        return Rediscovery(ADOPT)
+
+    same_file = record.get("job_list") == found["job_list"]
+    hidden = bool(record.get("hidden"))
+    lost = record.get("status") == GONE or bool(record.get("gone"))
+
+    if same_file:
+        if hidden and lost:
+            return Rediscovery(RESTORE, record,
+                               "its job list is back, and it was hidden from "
+                               "/list")
+        if lost:
+            return Rediscovery(RESTORE, record, "its job list is back")
+        if hidden:
+            return Rediscovery(RESTORE, record, "it was hidden from /list")
+        return Rediscovery(KNOWN, record, "already tracked, and up to date")
+
+    # Same directory, a different job list: another attempt at the same run.
+    if (record.get("source") or "agent") == "agent":
+        return Rediscovery(KNOWN, record,
+                           "a run built here owns this directory — the newer "
+                           "job list here is not the submission it made")
+    return Rediscovery(RESTORE, record, "a newer job list in the same directory")
 
 
 def _run(cmd, env=None, cwd=None):
@@ -2473,6 +2610,55 @@ ATTENTION_BUCKET = "attention"
 FINISHED_BUCKET = "finished"
 UNAVAILABLE_BUCKET = "unavailable"
 
+# THE ORDER RUNS ARE PRESENTED IN. One list, because a collection that
+# rearranges itself between two screens is a collection nobody can learn.
+#
+# /list and /sort used to disagree completely: /list grouped by state and
+# sorted each group by age, /sort showed the registry's raw append order. So
+# the row somebody had just read as fourth from the top in /list was
+# seventeenth in the panel where they went to hide it, and the only way to find
+# it was to read every line. /sort is /list with selectors on it; it has to
+# look like /list.
+#
+# Needing attention is deliberately not first. What is FIRST is what is waiting
+# on a decision from the person reading -- a held proposal is the only row here
+# that stops until somebody acts -- and a broken run, however urgent, has
+# already happened.
+SECTION_ORDER = (HELD_BUCKET, ACTIVE_BUCKET, ATTENTION_BUCKET,
+                 LAPSED_BUCKET, FINISHED_BUCKET, UNAVAILABLE_BUCKET)
+
+
+def _listing_key(record):
+    """When a run entered its current state, for ordering inside a bucket.
+
+    submitted_at where there is one, held_at otherwise: the moment the row
+    started being what it now is. Empty sorts first, which puts records too old
+    to carry either timestamp at the top of their group rather than scattering
+    them.
+    """
+    return str(record.get("submitted_at") or record.get("held_at") or "")
+
+
+def listing_order(rows):
+    """[(bucket, record, status)] in the one order both screens present.
+
+    `rows` is resolve_all()'s shape -- [(record, RunStatus or None), ...].
+
+    Deliberately here rather than in display.py, even though /list is the
+    screen it was written for. It is a policy about the registry, not about
+    rendering, and putting it beside the bucket rule it depends on is what lets
+    a caller with no terminal -- /sort's option builder, a test -- ask for the
+    same order without importing the renderer.
+    """
+    grouped = {bucket: [] for bucket in SECTION_ORDER}
+    for record, status in rows:
+        grouped[list_bucket(record, status)].append((record, status))
+    for entries in grouped.values():
+        entries.sort(key=lambda rs: _listing_key(rs[0]))
+    return [(bucket, record, status)
+            for bucket in SECTION_ORDER
+            for record, status in grouped[bucket]]
+
 
 def list_bucket(record, status):
     """held / active / attention / finished / unavailable for one /list row.
@@ -2794,3 +2980,90 @@ def suggest_name(task, when=None):
     keep = [w for w in words if w not in _STOPWORDS and not w.isdigit()]
     slug = "-".join(keep[:3]).replace("_", "-")[:32].strip("-")
     return f"{slug or 'run'}-{when:%m%d}"
+
+
+# ===========================================================================
+#  Focus: the run the person is visibly working on.
+#
+#  WHAT MAKES THIS FACTUAL RATHER THAN A GUESS, because a "what did they mean"
+#  feature is exactly the kind this project deletes on sight.
+#
+#  Focus is only ever set from a run name somebody TYPED as the argument of a
+#  slash command. `/view foo` is not evidence that foo was mentioned; it is
+#  the user having named foo, unambiguously, in a position where nothing else
+#  can go. That is the same class of fact as "this file is on disk" -- it is
+#  read off the command line, not off prose.
+#
+#  Nothing here reads a sentence. "should I use foo or bar?" sets no focus,
+#  because it is not a command and never reaches this code. That is not a
+#  filter applied to prose; it is that prose has no argument position.
+#
+#  And focus only ever REORDERS a list somebody is already being offered. It
+#  never adds a candidate, never selects one, and never survives the run
+#  leaving the set -- /approve after approving foo does not offer foo again,
+#  because foo is no longer held and the ranking below only moves rows that
+#  the caller had already decided to show.
+# ===========================================================================
+
+class Focus:
+    """The last run named explicitly on a command line, if it still exists.
+
+    One mutable field, deliberately. A stack of recent runs sounds better and
+    is worse: the second-most-recent thing you looked at is not a thing anyone
+    reasons about, and a ranking with two answers in it stops being
+    predictable, which is the only property this feature has to have.
+    """
+
+    __slots__ = ("name",)
+
+    def __init__(self, name=None):
+        self.name = name or None
+
+    def note(self, command, args, known=None):
+        """Record `args[0]` as the focus, if this command takes a run name.
+
+        `known` is a callable that returns the record for a name, or None. It
+        is consulted so that a typo does not become the focus -- a name that
+        is not in the registry is not a run somebody is working on, it is a
+        mistake, and ranking by it would push a real row down the list for
+        nothing.
+
+        Returns the focus after the update, so callers can chain.
+        """
+        if command in NAMES_A_RUN and args:
+            candidate = str(args[0]).strip()
+            if candidate and (known is None or known(candidate)):
+                self.name = candidate
+        return self.name
+
+    def clear(self):
+        self.name = None
+
+    def rank(self, rows):
+        """`rows` -- [(name, note), ...] -- with the focused run moved first.
+
+        Order-preserving otherwise, and a no-op when the focused run is not in
+        `rows`. Both matter: the caller decided which runs are legal for this
+        command, and this must not second-guess it in either direction.
+        """
+        if not self.name:
+            return list(rows)
+        first = [r for r in rows if r and r[0] == self.name]
+        return first + [r for r in rows if not (r and r[0] == self.name)] \
+            if first else list(rows)
+
+    def __repr__(self):
+        return f"<Focus {self.name!r}>"
+
+
+# Commands whose FIRST argument is the name of an existing run. Kept beside
+# Focus rather than in cli.py so that "which commands name a run" is one fact
+# the completion menu and the focus rule share, and so it can be asserted in
+# CI without importing the agent stack.
+#
+# /track is absent on purpose: its first argument names a run that does NOT
+# exist yet, which is the opposite of what focus means.
+NAMES_A_RUN = frozenset({
+    "approve", "reject", "modify", "fork", "view",
+    "check", "jobs", "diagnose", "cancel", "monitor", "hold",
+})

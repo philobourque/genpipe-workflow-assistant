@@ -292,6 +292,71 @@ class _Line:
         return None
 
 
+def wrap_segments(text, room):
+    """`text` cut into visual rows of at most `room` columns each.
+
+    Returns [(start, end, next_start), ...] over the ORIGINAL string:
+
+        start       index of the first character drawn on this row
+        end         index one past the last character drawn on this row
+        next_start  index the following row begins at
+
+    `next_start` is not always `end`, and that gap is the whole reason this
+    returns indices instead of strings. Wrapping at a word boundary swallows
+    the space it broke on -- drawing it would put a stray column of whitespace
+    at the end of a row, and keeping it in the next row would indent every
+    wrapped line by one. The caret still has to be placeable on that space,
+    because somebody can put it there, so the mapping from string index to
+    (row, column) has to know the space exists and is not drawn.
+    ...
+    WHY WORD-AWARE AND NOT JUST EVERY `room` CHARACTERS. The whole point of
+    the change is to be able to read back a paragraph before sending it, and a
+    paragraph broken mid-word is measurably harder to re-read than one broken
+    between them. A word longer than `room` is still hard-broken -- there is
+    nowhere else to put it.
+
+    Always returns at least one segment, so an empty line still has a row for
+    the caret to sit on.
+    """
+    room = max(1, int(room))
+    if not text:
+        return [(0, 0, 0)]
+    out = []
+    at = 0
+    n = len(text)
+    while at < n:
+        limit = at + room
+        if limit >= n:
+            out.append((at, n, n))
+            break
+        # The last space that is not the first character of the row. Breaking
+        # at column 0 would make no progress and loop forever.
+        cut = text.rfind(" ", at + 1, limit + 1)
+        if cut > at:
+            out.append((at, cut, cut + 1))
+            at = cut + 1
+        else:
+            out.append((at, limit, limit))
+            at = limit
+    return out or [(0, 0, 0)]
+
+
+def caret_at(segments, cur):
+    """(row, column) for string index `cur`, given wrap_segments()' output.
+
+    The caret belongs to the FIRST row whose end it does not pass, which is
+    what puts it just after the last character of a row rather than at column
+    0 of the next one. Typing there moves it on by itself, which is how every
+    editor behaves and is the only rule that keeps end-of-text and
+    end-of-a-wrapped-row from needing separate cases.
+    """
+    for row, (start, end, _) in enumerate(segments):
+        if cur <= end:
+            return row, cur - start
+    start, end, _ = segments[-1]
+    return len(segments) - 1, end - start
+
+
 class _Editor:
     def __init__(self, commands, history, initial="", arguments=None):
         self.commands = commands
@@ -306,13 +371,18 @@ class _Editor:
         # everything from matches() to _input_line() reads them.
         self.line = _Line(initial)
         self.sel = 0          # highlighted row in the completion menu
-        self.scroll = 0       # first visible character, for long lines
+        # Which row of the wrapped text the caret is on. Kept because finish()
+        # has to erase from the TOP of the block and the caret is left at the
+        # bottom of it; there is nothing on screen to recover it from.
+        self.caret_row = 0
         self.hist_at = len(history)
         self.stash = ""       # line being typed, parked while browsing history
         self.cols = 0         # window width the box below was cut to
         self.span = 0
         self.rule = ""
         self.room = 1
+        self.tall = 1         # most rows the typed text may occupy at once
+        self.rows = 0         # window height the cap above was computed from
         self._measure()
 
     def _measure(self):
@@ -326,14 +396,24 @@ class _Editor:
         the prompt marched down the screen a row per keystroke.
         """
         cols = display.terminal_cols()
-        if cols == self.cols:
+        rows = display.terminal_rows()
+        if cols == self.cols and rows == self.rows:
             return
+        self.rows = rows
         self.cols = cols
         self.span = span_for(cols)
         self.rule = " " + display.GREY + display.DIM + "─" * self.span + display.RESET
         # "  ❯ " occupies four columns; leave one at the far end so a full line
         # never touches the rule's last character.
         self.room = max(1, self.span - 5)
+        # How many rows the typed text may take before it starts scrolling
+        # within itself. The rest of the window belongs to the rule, the
+        # completion menu (MAX_MENU rows plus its "+n more" line) and a couple
+        # of rows of breathing space -- if the whole block ever grew taller
+        # than the window, the walk-up in draw() would be walking to rows that
+        # had already scrolled off, which is the marching-prompt failure this
+        # module has been bitten by before.
+        self.tall = max(1, display.terminal_rows() - MAX_MENU - 4)
 
     @property
     def text(self):
@@ -395,13 +475,53 @@ class _Editor:
 
     # -- drawing ------------------------------------------------------------
 
-    def _input_line(self):
-        if self.cur - self.scroll > self.room:
-            self.scroll = self.cur - self.room
-        if self.cur < self.scroll:
-            self.scroll = self.cur
-        seen = self.text[self.scroll:self.scroll + self.room]
-        return f"  {display.BOLD}{display.GREEN}{_MARK}{display.RESET} {seen}"
+    def _input_rows(self):
+        """The typed text as visible rows, plus the caret's (row, column).
+
+        WHAT THIS REPLACES, and why the replacement is a different shape.
+
+        It used to be one row and a horizontal scroll offset: once the text was
+        longer than the box, the window slid right and the beginning of the
+        sentence left the screen. That is fine for a shell, where a line is a
+        command you are composing token by token, and wrong here, where a line
+        is a paragraph you are about to ask somebody to act on. The reported
+        symptom was exactly that -- typing a long request and no longer being
+        able to read the start of it before pressing Enter.
+
+        Widening the box would not have fixed it; it would have moved the
+        column at which the same thing happens. So the text wraps instead, and
+        every row of it stays on screen.
+
+        THE CARET IS RETURNED WITH THE ROWS rather than recomputed by the
+        caller, because the two have to be derived from the same segmentation.
+        Wrapping in one place and locating the caret in another is how a caret
+        ends up one column out on rows after a word break.
+
+        The continuation rows are indented to sit under the text rather than
+        under the mark, so the paragraph reads as a block with one prompt in
+        front of it.
+        """
+        segments = wrap_segments(self.text, self.room)
+        row, col = caret_at(segments, self.cur)
+
+        # A block taller than the window cannot be repainted by walking the
+        # cursor back up its own height -- the rows to walk back to have
+        # scrolled away -- which is the marching-prompt bug this module has
+        # already been bitten by once, arriving from the other axis. So the
+        # rows scroll vertically instead, keeping the caret in view. In
+        # practice a request is a paragraph and this never engages; when it
+        # does, it degrades to a moving window rather than to a broken editor.
+        top = 0
+        if len(segments) > self.tall:
+            top = min(max(0, row - self.tall + 1), len(segments) - self.tall)
+        shown = segments[top:top + self.tall]
+
+        lines = []
+        for i, (start, end, _) in enumerate(shown):
+            lead = (f"  {display.BOLD}{display.GREEN}{_MARK}{display.RESET} "
+                    if top + i == 0 else "    ")
+            lines.append(lead + self.text[start:end])
+        return lines, max(0, row - top), col
 
     def _menu_lines(self):
         m = self.matches()
@@ -471,13 +591,29 @@ class _Editor:
     def draw(self):
         self._measure()
         # Clamped to the window BEFORE anything is counted. The menu rows and
-        # the input line are already cut to self.span, but the hint lines are
+        # the input rows are already cut to self.span, but the hint lines are
         # fixed strings and the "no command starts with X" line interpolates
         # whatever has been typed, so neither is bounded by the box on its own.
         # One line over the edge is all it takes to desynchronise the walk-up.
+        typed, caret_row, caret_col = self._input_rows()
         lines = [display.fit(line, self.cols - 1)
-                 for line in (self._input_line(), self.rule, *self._menu_lines())]
-        parts = ["\r\033[J", lines[0]]
+                 for line in (*typed, self.rule, *self._menu_lines())]
+        # BACK TO THE TOP OF THE BLOCK BEFORE ERASING ANYTHING. This module's
+        # one invariant used to be "the cursor is at column 0 of the input line
+        # on entry to draw", which held for free while the input was a single
+        # row and the caret could only ever be on it. It stopped holding the
+        # moment the text wrapped: draw() now LEAVES the cursor on whichever
+        # wrapped row is being edited, so on the next keystroke \033[J erased
+        # from the middle of the block downwards and the rows above it stayed,
+        # and the prompt marched a row down the screen per character typed.
+        #
+        # So the invariant is restored explicitly rather than assumed: walk up
+        # by however far down the block the caret was left, and only then
+        # erase.
+        parts = []
+        if self.caret_row:
+            parts.append(f"\033[{self.caret_row}A")
+        parts += ["\r\033[J", lines[0]]
         for line in lines[1:]:
             parts.append("\r\n" + line)
         # Rows advanced, not lines written: each "\r\n" moves down one, and a
@@ -487,10 +623,18 @@ class _Editor:
         # the marching prompt this replaced.
         up = (display.row_count(lines[0], self.cols) - 1
               + sum(display.row_count(line, self.cols) for line in lines[1:]))
+        # Back to the top of the block, then down to the caret's own row. The
+        # caret is no longer always on the first line -- that is the whole
+        # point of the change -- so the walk is up-then-down rather than up.
+        # Its ROW is remembered for finish(), which has to erase from the top
+        # of the block and cannot find it from where the caret was left.
+        self.caret_row = caret_row
         if up:
             parts.append(f"\033[{up}A")
+        if caret_row:
+            parts.append(f"\033[{caret_row}B")
         parts.append("\r")
-        col = 4 + (self.cur - self.scroll)
+        col = 4 + caret_col
         if col:
             parts.append(f"\033[{col}C")
         sys.stdout.write("".join(parts))
@@ -509,7 +653,16 @@ class _Editor:
         The box is the editor, and an editor is furniture -- it exists while you
         are typing and has no business in the record afterwards. The line itself
         is drawn once, by display.echo, as `❯ what you said`.
+
+        The walk up to the top of the block is what makes this correct for a
+        paragraph. \033[J erases from the cursor DOWN, and the cursor is left
+        wherever the caret was -- which used to be the first row of the box and
+        is now whichever row of the wrapped text is being edited. Erasing from
+        there would leave every row above the caret on screen.
         """
+        if getattr(self, "caret_row", 0):
+            sys.stdout.write(f"\033[{self.caret_row}A")
+        self.caret_row = 0
         sys.stdout.write("\r\033[J")
         sys.stdout.flush()
 
@@ -544,7 +697,6 @@ class _Editor:
 
     def set(self, text):
         self.line.set(text)
-        self.scroll = 0
         self._changed()
 
     def insert(self, ch):
@@ -931,7 +1083,8 @@ def _text(value):
 
 def choose(question, options, note="", free_text=True, free_label="Something else",
            multi=False, draw=None, cursor=0, field=None,
-           on_enter=None, on_escape=None, on_text=None, typing=None):
+           on_enter=None, on_escape=None, on_text=None, typing=None,
+           hotkeys=None):
     """A numbered choice panel. Returns the chosen value, or None if cancelled.
 
     `options` are slots.Option-shaped: anything with .value, .label and
@@ -1014,6 +1167,24 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                           /modify actually uses. Only while the open row has no
                           choices of its own -- when it does, `1-9 to pick` is
                           the advertised behaviour and stays.
+
+        hotkeys   a dict (or a callable returning one) from a single key to
+                  the value of the row that key stands for. A hotkey is Enter
+                  on that row, routed through on_enter exactly as a digit is,
+                  so the two keys advertised for one action cannot come to mean
+                  different things.
+
+                  It exists because /modify's panel has advertised `d applies
+                  to this run` in its own footer since it was written and
+                  nothing was ever bound to `d` -- the key did nothing, and the
+                  only way to apply a change set was to find the row and press
+                  Enter. A footer naming a key that does not work is worse than
+                  no footer.
+
+                  Suppressed while `typing` is true, for the same reason the
+                  digits are: `d` is a character somebody may be entering into
+                  a free-text row, and a panel that acted on it mid-word would
+                  be unusable for exactly the rows that need typing.
 
     Both are called between repaints, so a hook may change whatever `options`
     reads and the next paint will show it.
@@ -1117,6 +1288,15 @@ def choose(question, options, note="", free_text=True, free_label="Something els
         lines = [display.fit(line, cols - 1) for line in block()]
         for line in lines:
             sys.stdout.write(f"\r{line}\033[K\r\n")
+        # Erase whatever a TALLER previous frame left below this one. \033[K
+        # above clears each line it rewrites and nothing past the last of them,
+        # so a panel that shrinks -- a row folding shut, the "apply N changes"
+        # row vanishing when a config toggle returns the stack to where it
+        # started -- left its old tail on screen. The walk-up stayed correct
+        # (`painted` is recomputed), so the leftovers were never overwritten
+        # either: they just sat there, which is why "describe it instead" and
+        # the key hints appeared twice in a fork panel.
+        sys.stdout.write("\033[J")
         painted = sum(display.row_count(line, cols) for line in lines)
         sys.stdout.flush()
 
@@ -1216,6 +1396,19 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                                 continue
                         chosen = rows[cursor]
                         break
+            elif (hotkeys is not None and not _text(typing)
+                    and (_text(hotkeys) or {}).get(key) is not None):
+                # Enter on the row this key stands for, through the same hook,
+                # so the key and the row cannot drift apart.
+                value = (_text(hotkeys) or {})[key]
+                if on_enter is not None:
+                    verdict = on_enter(value)
+                    if verdict is not False and verdict is not None:
+                        refresh(verdict if isinstance(verdict, int)
+                                and not isinstance(verdict, bool) else None)
+                        paint()
+                        continue
+                break
             elif on_text is not None and (
                     key in ("\x7f", "\x08") or
                     (len(key) == 1 and key.isprintable())):

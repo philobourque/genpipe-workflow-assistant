@@ -46,9 +46,16 @@ PROPOSAL = {
 OFFERED = ["name", "protocol", "steps", "readset", "config", "output"]
 
 
-def build(open_row=None, choices=(), typed="", changes=None):
-    m = mirror.read(PROPOSAL["generated"], name="run1").ensure(OFFERED)
-    return modify.panel_entries(m, OFFERED, open_row, choices, typed, changes)
+def build(open_row=None, choices=(), typed="", changes=None, forking=False,
+          name="run1"):
+    m = mirror.read(PROPOSAL["generated"], name=name).ensure(OFFERED)
+    return modify.panel_entries(m, OFFERED, open_row, choices, typed, changes,
+                                forking=forking)
+
+
+def extra_labels(entries):
+    """{row: label} for the panel's EXTRA rows (apply/create, describe)."""
+    return {e.row: e.label for e in entries if e.kind == modify.EXTRA}
 
 
 def kinds(entries, kind):
@@ -197,6 +204,51 @@ def main():
     r.equal("and no answer screen was added anywhere",
             len(kinds(entries, modify.CHOICE)) + len(kinds(entries, modify.TYPED)),
             0)
+
+    # ------------------------------------------------------------------ #
+    r.section("a fork with nothing changed is still something you can create")
+    # The reported defect, and it was two defects wearing one symptom. The
+    # panel offered no way out but escape when nothing had been changed --
+    # correct for a rewrite, which would have nothing to do, and wrong for a
+    # copy, whose new name IS the change. "Run this again under a second name"
+    # is an ordinary request and could not be expressed at all.
+    r.check("rewriting an unchanged run offers nothing to apply",
+            modify.DONE not in extra_labels(build(changes={})))
+    forked = extra_labels(build(changes={}, forking=True))
+    r.check("forking an unchanged run offers to create it",
+            modify.DONE in forked, forked)
+    r.contains("worded as what it makes, not as what it applies",
+               forked.get(modify.DONE, ""), "create")
+    r.contains("and it is still not a submission",
+               next(e.description for e in build(changes={}, forking=True)
+                    if e.row == modify.DONE), "nothing is submitted")
+
+    r.check("with a change, a fork applies it like anything else",
+            "apply" in extra_labels(build(changes={"protocol": "germline_sv"},
+                                    forking=True)).get(modify.DONE, ""))
+
+    r.section("the panel is drawn under the name of the run being built")
+    # /fork asks what the variant is called before opening anything, and the
+    # panel then showed the ORIGINAL's name in its `name` row -- so the screen
+    # somebody was editing was labelled as the run they were not editing.
+    rows = dict(modify.rows_for(PROPOSAL, "run1-2"))
+    r.equal("the name row carries the identity being built",
+            rows.get("name"), "run1-2")
+    named = [e for e in build(forking=True, name="run1-2")
+             if e.kind == modify.ROW and e.row == "name"]
+    r.check("and so does the panel line", named and "run1-2" in
+            (named[0].line.value or ""), named[0].line.value if named else None)
+
+    r.section("the extras are emitted once, not once per state")
+    # Duplicated footer rows were reported in a fork panel. The renderer's
+    # stale-row bug is fixed in ui.paint; this is the other half -- the list
+    # itself must never contain two of anything.
+    for label, entries in (("closed", build(changes={"protocol": "x"})),
+                           ("open", build(open_row="protocol",
+                                          changes={"protocol": "x"})),
+                           ("forking", build(changes={}, forking=True))):
+        got = [e.row for e in entries if e.kind == modify.EXTRA]
+        r.equal(f"{label}: no extra appears twice", len(got), len(set(got)))
 
     return r.finish()
 

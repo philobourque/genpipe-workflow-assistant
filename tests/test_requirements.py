@@ -29,12 +29,13 @@ What the source says, verified 2026-08-17 against mugqic/genpipes/6.1.1:
 
 Run:  python tests/test_requirements.py
 """
+import json
 import os
 import sys
 
 from harness import Report
 
-from genpipe import modify, slots, usage
+from genpipe import modify, prep, slots, usage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(HERE, "fixtures", "help")
@@ -48,8 +49,96 @@ def helptext(pipeline):
         return f.read()
 
 
+MANIFEST = os.path.join(os.path.dirname(HERE), "genpipe", "genpipes_facts.json")
+
+
+def manifest():
+    """The generated record of what this GenPipes' parsers say, or None.
+
+    Produced by tools/genpipes_facts.py against a real install and committed,
+    so the check below runs in CI on a machine with no GenPipes on it. See that
+    file for why a generated manifest beats a hand-kept table even though the
+    hand-kept table is the one the product reads.
+    """
+    try:
+        with open(MANIFEST) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
 def main():
     r = Report("requirements: correct, and shared without drift")
+
+    # ------------------------------------------------------------------ #
+    # THE FOUR CATEGORIES, KEPT APART. This section is the one that stops
+    # slots.py drifting from the software it describes, and it is also where
+    # the difference between a GenPipes requirement and an agent policy is
+    # asserted rather than merely written down somewhere.
+    r.section("slots.py still agrees with the installed GenPipes' own parsers")
+
+    facts = manifest()
+    if facts is None:
+        r.check("the generated manifest is present", False,
+                f"missing {MANIFEST} — run tools/genpipes_facts.py")
+    else:
+        pipelines = facts["pipelines"]
+        r.equal("every pipeline on the install is in slots.PIPELINES",
+                sorted(pipelines), sorted(slots.PIPELINES))
+
+        for name in sorted(pipelines):
+            entry = pipelines[name]
+
+            # (A) PARSER-REQUIRED. Objective, and the same two flags on every
+            # pipeline: GenPipes will not parse a command without them.
+            r.equal(f"{name}: argparse requires -c and -r",
+                    entry["parser_required"],
+                    ["-c/--config", "-r/--readsets"])
+
+            # (B) PROTOCOLS. The choice list and the literal default=, read off
+            # the install rather than decided here.
+            proto = entry["protocol"]
+            ours = [p.name for p in slots.protocols(name)]
+            if proto is None:
+                r.equal(f"{name}: takes no -t, and slots holds none", ours, [])
+                r.check(f"{name}: and has no default to have",
+                        name not in slots.DEFAULTS)
+            else:
+                r.equal(f"{name}: -t choices match the install",
+                        sorted(ours), sorted(proto["choices"]))
+                # (C) A VALID DEFAULT IS NOT A GAP. This is the assertion that
+                # keeps a documented GenPipes default from being turned into a
+                # question the user is made to answer.
+                r.equal(f"{name}: -t default matches the install",
+                        slots.DEFAULTS.get(name), proto["default"])
+                r.check(f"{name}: an unstated protocol is therefore not a gap",
+                        "protocol" not in
+                        [g.slot for g in slots.gaps(pipeline=name,
+                                                    readset="r.txt",
+                                                    design="d.tsv",
+                                                    pairs="p.csv")])
+
+            # (C again) OMITTING -s IS LEGAL. GenPipes gives it no default,
+            # which means "every step in the protocol". Nothing in this repo
+            # may quietly promote that into a required slot.
+            steps = entry["optional_defaults"].get("steps") or {}
+            r.equal(f"{name}: -s has no GenPipes default", steps.get("default"),
+                    None)
+            r.check(f"{name}: so steps is never reported as missing",
+                    "steps" not in [g.slot for g in
+                                    slots.gaps(pipeline=name, readset="r.txt",
+                                               design="d.tsv", pairs="p.csv")])
+
+        # (D) AGENT POLICY IS NOT A GENPIPES REQUIREMENT. The rows this tool
+        # fills in without asking are recorded as ASSUMED, not as required, and
+        # the distinction is asserted so that renaming one into the other has
+        # to be deliberate.
+        r.equal("the rows this tool assumes are steps, config and output",
+                sorted(prep.ASSUMED), ["config", "output", "steps"])
+        for row in prep.ASSUMED:
+            r.check(f"{row!r} is an assumption, never a reported gap",
+                    row not in [g.slot for g in
+                                slots.gaps(pipeline="dnaseq", readset="r.txt")])
 
     # ------------------------------------------------------------------ #
     r.section("the protocol lists match this GenPipes")

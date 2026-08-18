@@ -172,6 +172,7 @@ def candidates(directory=None, limit=8):
     caller decides what counts as "established"; this function never guesses.
     """
     buckets = {"readset": [], "design": [], "pairs": [], "config": []}
+    inis = []
     if directory is None:
         return buckets
     try:
@@ -189,8 +190,7 @@ def candidates(directory=None, limit=8):
         # that every `.ini` mentioned in a sentence is a slot value would have
         # it filling `-c` from a message that merely explained the layering.
         if name.lower().endswith(".ini"):
-            if len(buckets["config"]) < limit:
-                buckets["config"].append(path)
+            inis.append(path)
             continue
         if not name.lower().endswith(_FILE_SUFFIXES):
             continue
@@ -199,7 +199,53 @@ def candidates(directory=None, limit=8):
             if any(h in stem for h in hints) and len(buckets[role]) < limit:
                 buckets[role].append(path)
                 break
+    buckets["config"] = rank_inis(inis, limit)
     return buckets
+
+
+# GenPipes writes the full resolved configuration of every run it generates
+# beside that run, as <Pipeline>.<protocol>.<timestamp>.config.trace.ini. It is
+# a RECORD of a past run, not an input to a new one -- stacking one on -c means
+# asking for another run's entire resolved config, which is almost never what
+# anybody means and is never what anybody means by accident.
+_TRACE_INI = re.compile(r"\.config\.trace\.ini$", re.I)
+
+# Ours: written by /modify's resources flow, named after the run it tunes.
+_OVERRIDE_INI = re.compile(r"\.override\.ini$", re.I)
+
+
+def _ini_tier(path):
+    """How likely this ini is to be something somebody wants on -c. Lower first.
+
+    A FILENAME FACT, not a judgement about the science. Both patterns below are
+    naming conventions -- one GenPipes', one ours -- so this is the same kind of
+    knowledge as "this file is on disk", and it decides ORDER only. Nothing is
+    hidden, nothing is chosen, and the free-text row still takes any path at
+    all: an ini this ranks last is one keystroke from being used.
+    """
+    name = os.path.basename(path)
+    if _TRACE_INI.search(name):
+        return 2          # a record of a past run
+    if _OVERRIDE_INI.search(name):
+        return 1          # a private override, probably another run's
+    return 0              # a hand-written ini, which is what this list is for
+
+
+def rank_inis(paths, limit=8):
+    """Candidate `-c` inis, most plausible first, capped.
+
+    WHY A CAP WITH NO ORDER WAS THE BUG. This used to take the first `limit`
+    inis in alphabetical order, and in a real working directory that is six
+    `DnaSeq.*.config.trace.ini` files -- artifacts GenPipes wrote about runs
+    that already happened -- pushing the one hand-written override off the
+    end of the list entirely. The numbered options were all the useless ones
+    and the useful one was unreachable except by typing its path.
+
+    Ties keep the order they arrived in, which is the alphabetical listing, so
+    the result is stable from one call to the next.
+    """
+    ordered = sorted(paths, key=_ini_tier)
+    return ordered[:limit]
 
 
 def spoken(text):

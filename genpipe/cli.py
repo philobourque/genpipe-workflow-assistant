@@ -596,8 +596,26 @@ def _cmd_model(agent, args):
 def _cmd_key(agent, args):
     """/key -- rotate or add a key. Reuses the exact first-launch prompt,
     then applies it immediately instead of waiting for a relaunch.
+
+    THE CANCEL IS CAUGHT HERE, and that is the whole reason this is not a
+    two-line function. _prompt_for_api_key() ends a cancelled prompt with
+    SystemExit, from two places -- the key read and the provider chooser --
+    and at startup that is exactly right: there is no key, nothing can be done
+    without one, and carrying on would only reach the same failure further
+    away.
+
+    Reached from /key it is a different act. There is a working session
+    behind this prompt, quite possibly with a proposal parked at the gate, and
+    pressing Ctrl+C at a question is not a request to throw that away. It used
+    to end the process and take the conversation with it.
     """
-    _prompt_for_api_key()
+    try:
+        _prompt_for_api_key()
+    except SystemExit:
+        display.nothing("No key changed.",
+                        "The session, and anything held at the gate, are "
+                        "untouched.")
+        return
     source = os.environ.get("GENPIPE_LLM_SOURCE", DEFAULT_SOURCE)
     model = os.environ.get("GENPIPE_LLM_MODEL", DEFAULT_MODEL)
     _apply_llm(agent, source, model)
@@ -892,7 +910,7 @@ def _cmd_fork(agent, args):
     except (EOFError, KeyboardInterrupt):
         return
     verdict = modify.check("name", str(wanted or ""), proposal,
-                           registry=agent.registry)
+                           registry=agent.registry, forking=True)
     if not verdict:
         display.problem(verdict.message, f"'{name}' is unchanged.")
         return
@@ -1011,7 +1029,8 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
 
     def entries():
         return modify.panel_entries(m, offered, state["open"], choices(),
-                                    state["typed"], changes)
+                                    state["typed"], changes,
+                                    forking=bool(fork_as))
 
     def options():
         return [slots.Option(e.value, e.label, e.description)
@@ -1050,7 +1069,8 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
             required.pop(row, None)
             return True
         verdict = modify.check(row, picked, proposal, registry=agent.registry,
-                               name=name, pending=changes)
+                               name=name, pending=changes,
+                               forking=bool(fork_as))
         if not verdict:
             # A tier-1 refusal leaves the row open with what was typed still
             # there. Closing it would throw away the narrowing and make the
@@ -1143,11 +1163,28 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
     # row. Scoped to rows with no choices, so `1-9 to pick` still works where
     # it is advertised -- see keys() above, which draws exactly this
     # distinction one line at a time.
+    def hotkeys():
+        """`d` for the row the footer says it is for, when that row exists.
+
+        Computed per keystroke rather than fixed, because the row it stands for
+        is not always on the panel: with nothing changed and nothing being
+        forked there is no DONE entry, and a key that silently does nothing is
+        the defect this replaces rather than a smaller version of it. It is
+        also withheld while a row is open, where `d` is a character somebody is
+        typing into a value.
+        """
+        if state["open"]:
+            return {}
+        if not any(e.kind == modify.EXTRA and e.row == modify.DONE
+                   for e in entries()):
+            return {}
+        return {"d": (modify.EXTRA, modify.DONE)}
+
     picked = ui.choose(question, options, free_text=False, draw=draw,
                        cursor=modify.cursor_of(entries(), "name"),
                        on_enter=on_enter, on_escape=on_escape, on_text=on_text,
                        typing=lambda: bool(state["open"]) and not choices(),
-                       note=keys)
+                       hotkeys=hotkeys, note=keys)
     if state["out"]:
         return state["out"], state["row"]
     return ("cancel", None) if picked is None else ("done", None)
@@ -1185,10 +1222,27 @@ def _modify_guided(agent, name, record, fork_as=None):
                  makes it different is a question nobody can answer yet.
 
     Falsy means rewrite this run in place, which only a held run allows.
+
+    WHOSE NAME THE SCREEN CARRIES. Everything below is drawn under `editing`,
+    not under `name`. They differ for exactly one caller -- /fork, which has
+    already asked what the variant is called -- and the difference was a
+    reported bug: the panel said `name  test-now` while what was being built
+    was `test-now-2`, so the screen somebody was editing was labelled as the
+    run they were NOT editing. The source run's name survives in the header
+    display.forking_from() printed above, which is where "this came from
+    test-now" belongs.
+
+    `name` is still the SOURCE, and stays the source everywhere a fact about
+    the original is wanted: the registry lookup, the parent's override ini,
+    the thread the variant is named after.
     """
     proposal = record.get("proposal") or {}
     directory = record.get("workdir") or os.getcwd()
     candidates = intake.candidates(directory)
+    # The identity being edited. /fork settled it before opening anything;
+    # /modify-on-a-submitted-run has not asked yet, so the original stands in
+    # and the `name` row is where the answer arrives.
+    editing = fork_as if isinstance(fork_as, str) else name
 
     # Checked once, outside the loop below: mirror.read()'s emptiness depends
     # only on the recorded command, which does not change from one pass of
@@ -1224,11 +1278,12 @@ def _modify_guided(agent, name, record, fork_as=None):
         # already tuned rewrites it without changing the command -- which is
         # exactly the case a summary read once would show stale.
         tuned = override.summary(
-            override.read(override.path_for(name, directory, proposal)))
-        rows = modify.rows_for(proposal, name, resources=tuned)
-        m = (mirror.read(proposal.get("generated"), name=name, resources=tuned,
+            override.read(override.path_for(editing, directory, proposal,
+                                            fresh=bool(fork_as))))
+        rows = modify.rows_for(proposal, editing, resources=tuned)
+        m = (mirror.read(proposal.get("generated"), name=editing, resources=tuned,
                          missing=proposal.get("missing"))
-             or mirror.from_slots(proposal, name=name, resources=tuned)).ensure(
+             or mirror.from_slots(proposal, name=editing, resources=tuned)).ensure(
                  [row for row, _ in rows])
         # Cursor order follows the mirror, not ROWS, so ↓ moves down the screen.
         # They agree today; they would not the moment a command carried a flag
@@ -1237,7 +1292,7 @@ def _modify_guided(agent, name, record, fork_as=None):
         offered = [line.row for line in m.lines
                    if line.row in {row for row, _ in rows}]
 
-        outcome, row = _run_panel(agent, name, proposal, m, offered,
+        outcome, row = _run_panel(agent, editing, proposal, m, offered,
                                   candidates, changes, required,
                                   fork_as=fork_as)
         if outcome == "cancel":
@@ -1260,18 +1315,31 @@ def _modify_guided(agent, name, record, fork_as=None):
             # screen writes an override ini and hands back the path, which goes
             # into `changes` like any other answer, and the loop comes straight
             # back to the panel with that row now green.
-            path = _fill_resources(agent, name, proposal, directory)
+            path = _fill_resources(agent, name, proposal, directory,
+                                   editing=editing, fresh=bool(fork_as))
             if path is None:
                 return
             if path:
                 changes[row] = path
             continue
 
-        if not changes:
-            if fork_as:
-                display.nothing("Nothing changed.", f"'{name}' is unchanged.")
-            else:
-                display.nothing("Nothing changed.", f"'{name}' is still held.")
+        # An empty change set means two different things, and only one of them
+        # is a no-op.
+        #
+        # REWRITING a run with nothing changed is genuinely nothing: the
+        # command is already what it would be regenerated as, and paying a
+        # model call to reproduce it can only introduce drift.
+        #
+        # FORKING with nothing changed is a real request, and refusing it was
+        # a reported bug. "Run this again under a second name" is an ordinary
+        # thing to want -- a rerun after a cluster problem, a second identity
+        # for a command somebody is about to tune elsewhere -- and the new
+        # name IS the change. Nothing else has to justify the copy.
+        # modify.fork_sentence() has always handled the empty set ("Generate
+        # this GenPipes run again, exactly as written"); the refusal was in
+        # this caller, not in the instruction it would have sent.
+        if not changes and not fork_as:
+            display.nothing("Nothing changed.", f"'{name}' is still held.")
             return
 
         # A row an earlier answer made mandatory and nobody filled in. This is
@@ -1303,7 +1371,14 @@ def _modify_guided(agent, name, record, fork_as=None):
         # the panel opened -- and silently wrong here, where the name has not
         # been asked yet: somebody typing one into the row is naming the thing
         # they are making, and dropping it would then ask them for it again.
-        wanted = fork_as if isinstance(fork_as, str) else changes.get("name")
+        # The panel's own `name` row wins when it was touched. /fork settled a
+        # name before opening, and somebody who then opens that row and types a
+        # different one has changed their mind about what they are making --
+        # taking the earlier answer would silently discard the later one.
+        # Either way _fork_run pops it from `changes`, so it names the copy and
+        # never renames the original.
+        wanted = (changes.get("name")
+                  or (fork_as if isinstance(fork_as, str) else None))
         _fork_run(agent, name, record, proposal, changes, wanted=wanted)
         return
     _apply_changes(agent, name, proposal, changes)
@@ -1324,8 +1399,20 @@ def _modify_guided(agent, name, record, fork_as=None):
 # See _cmd_fork.
 
 
-def _fill_resources(agent, name, proposal, directory):
+def _fill_resources(agent, name, proposal, directory, editing=None, fresh=False):
     """Tune one or more steps' cluster resources into this run's override ini.
+
+    TWO NAMES, because a fork reads from one run and writes to another.
+    `name` is the SOURCE -- the registry record whose /diagnose may already
+    have computed an override worth offering -- and `editing` is the run the
+    file is written for, which is the fork when there is one. `fresh` goes to
+    override.path_for and stops it reusing the ini it finds on the parent's
+    inherited -c line.
+
+    Getting this wrong was a real defect and a silent one: tuning a step in a
+    fork wrote into the PARENT's override ini, so a run somebody had gone out
+    of their way not to touch quietly acquired a new walltime, and the two runs
+    the fork exists to keep separate shared one file again.
 
     Returns the ini's path, "" if nothing was written, or None if the person
     backed out. The path is what the caller turns into a change, because from
@@ -1346,7 +1433,8 @@ def _fill_resources(agent, name, proposal, directory):
     prompts are shapes, not recommendations.
     """
     values = (proposal or {}).get("slots") or {}
-    path = override.path_for(name, directory, proposal)
+    editing = editing or name
+    path = override.path_for(editing, directory, proposal, fresh=fresh)
     sections = override.read(path)
 
     # An override /diagnose already worked out from the logs. Offered, never
@@ -1370,7 +1458,7 @@ def _fill_resources(agent, name, proposal, directory):
     proposed = (agent.registry.get(name) or {}).get("proposed_override") or {}
     proposed = {s: k for s, k in proposed.items() if s not in sections}
     if proposed:
-        display.overrides(name, override.describe(proposed), path)
+        display.overrides(editing, override.describe(proposed), path)
         take = ui.choose(
             "What should this run use?",
             [slots.Option("take", "what /diagnose worked out",
@@ -1390,8 +1478,8 @@ def _fill_resources(agent, name, proposal, directory):
             # Accepted as-is. Asking "which step should be tuned?" after
             # somebody has just said "use exactly those" is asking them to
             # re-answer a question they came here having already answered.
-            display.overrides(name, override.describe(sections), path)
-            return override.write(path, sections, run=name)
+            display.overrides(editing, override.describe(sections), path)
+            return override.write(path, sections, run=editing)
 
     protocol = (values.get("protocol")
                 or slots.DEFAULTS.get(values.get("pipeline") or ""))
@@ -1427,7 +1515,7 @@ def _fill_resources(agent, name, proposal, directory):
         if again != "yes":
             break
 
-    display.overrides(name, override.describe(sections), path)
+    display.overrides(editing, override.describe(sections), path)
     # Whether a file actually went is asked BEFORE writing, because write()
     # returns '' both for "deleted it" and for "there was never one" -- and this
     # used to announce a removal on the strength of that empty string alone.
@@ -1543,7 +1631,7 @@ def _fork_run(agent, name, record, proposal, changes, wanted=None):
         except (EOFError, KeyboardInterrupt):
             return
     verdict = modify.check("name", str(wanted or ""), proposal,
-                           registry=agent.registry)
+                           registry=agent.registry, forking=True)
     if not verdict:
         display.problem(verdict.message, f"'{name}' is unchanged.")
         return
@@ -1840,7 +1928,17 @@ def _cmd_sort(agent, args):
             display.problem(f"No run named '{name}'.")
         return
 
-    options = [slots.Option(r["name"], r["name"], _run_note(r)) for r in records]
+    # The same rows /list just drew, in the same order, with checkboxes on
+    # them. This used to iterate `records` in the registry's raw append order,
+    # so the row somebody had read as fourth in /list turned up seventeenth
+    # here and the only way to find it was to read every line. resolve_all()
+    # is the same batched scheduler call /list makes, and it is what lets
+    # listing_order() put a live run where /list puts it.
+    with ui.Activity("reading the scheduler"):
+        rows = runs_store.resolve_all(records)
+    options = [slots.Option(record["name"], record["name"],
+                            _run_note(record, status))
+               for _, record, status in runs_store.listing_order(rows)]
     options.append(slots.Option("__track__", "add a run instead",
                                 "/track or /scan adopts one that already exists"))
     # "as many as you like" is the part the key hint at the foot of the panel
@@ -2088,7 +2186,14 @@ def _cmd_list(agent, args):
 
 
 def _cmd_history(agent, args):
-    agent.history()
+    """/history [name] -- the archive, or one record in full.
+
+    The bare form is a table with one row per run and no scheduler call in it:
+    /history is an archive, not a dashboard. Naming a run opens what /diagnose
+    once found out about it, which is the part worth keeping and the part that
+    made the summary unreadable when it was printed under every row.
+    """
+    agent.history(" ".join(args) if args else None)
 
 
 def _cmd_track(agent, args):
@@ -2109,12 +2214,22 @@ def _cmd_where(agent, args):
     here = preflight.cluster()
     display.where([
         ("cluster", f"{here}  ({preflight.cluster_ini()})" if here
-                    else "not a recognised Alliance login node"),
-        ("launched from", os.getcwd()),
-        ("agent workdir", agent.path),
-        ("run registry", agent.registry.path),
-        ("checkpoints", os.path.join(agent.path, "genpipe_checkpoints.sqlite")),
-        ("this copy", ROOT),
+                    else "not a recognised Alliance login node",
+         "picks the cluster ini a generated command stacks on -c"),
+        # The one row with teeth, and now the one row that says so. A run's
+        # job list is looked for under here, so launching the app from an
+        # unexpected directory is the difference between a submission being
+        # recorded and vanishing -- which is a failure that looks exactly like
+        # success until somebody types /check.
+        ("launched from", os.getcwd(),
+         "where a submission's job_output is looked for — a run launched "
+         "from elsewhere has to be adopted with /track"),
+        ("agent workdir", agent.path, ""),
+        ("run registry", agent.registry.path,
+         "every run this tool knows about; /history reads it"),
+        ("checkpoints", os.path.join(agent.path, "genpipe_checkpoints.sqlite"),
+         "the conversations, and the gates parked in them"),
+        ("this copy", ROOT, ""),
     ])
 
 
@@ -2152,52 +2267,79 @@ def _cmd_help(agent, args):
 # breaking out of it, and swapping the conversation thread -- rather than on the
 # agent. They are listed anyway so they show up in the menu and in /help like
 # everything else.
+#
+# THE LAST COLUMN IS WHETHER THE COMMAND IS PART OF THE PRODUCT. A False row
+# still parses, still dispatches and still has its tests; it is simply not
+# taught. That distinction is worth having as a flag rather than as a deletion
+# for two different reasons, and both are on this table:
+#
+#   /telemetry  developer instrumentation. It is genuinely useful when a
+#               generation feels slow, and it is not a thing a person running
+#               a pipeline should be reading about in /help.
+#   /readset    not mature enough to teach. Building a readset from filenames
+#               is a real need and a real subsystem, and half of one offered in
+#               /help reads as a promise. Hidden rather than removed, because
+#               removing it is a bigger change than the situation calls for and
+#               `/readset schema` -- which prints the format and touches
+#               nothing -- is the part that already works.
+#
+# Hiding rather than deleting also keeps the honest property: nothing anybody
+# has typed before stops working. What changes is what the product claims.
 COMMAND_SPECS = [
-    ("new",      "",                   "start a fresh conversation",              "talking",  None),
-    ("verbose",  "[off]",              "show or fold away the agent's working",   "talking",  _cmd_verbose),
-    ("approve",  "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve),
-    ("modify",   "<name> [change]",    "change a run; submitted ones fork",       "deciding", _cmd_modify),
-    ("fork",     "<name> [change]",    "build a second run from an existing one", "deciding", _cmd_fork),
-    ("reject",   "<name> [why...]",    "abandon a held run; nothing submitted",   "deciding", _cmd_reject),
-    ("view",     "<name>",             "the command a run is, and what it takes", "watching", _cmd_view),
-    ("list",     "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list),
+    ("new",      "",                   "start a fresh conversation",              "talking",  None,          True),
+    ("verbose",  "[off]",              "show or fold away the agent's working",   "talking",  _cmd_verbose,  True),
+    ("approve",  "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve,  True),
+    ("modify",   "<name>",             "change a run before it is launched",      "deciding", _cmd_modify,   True),
+    ("fork",     "<name>",             "build a second run from an existing one", "deciding", _cmd_fork,     True),
+    ("reject",   "<name>",             "abandon a held run; nothing submitted",   "deciding", _cmd_reject,   True),
+    ("view",     "<name>",             "the command a run is, and what it takes", "watching", _cmd_view,     True),
+    ("list",     "",                   "runs awaiting approval, and live ones",   "watching", _cmd_list,     True),
     # These four answer four different questions about one run, and they are
     # worded to read as a set: what is its overall state, what are its jobs,
     # why did it break, and tell me when it changes. Each keeps its own verb
     # and its own implementation -- see the note on _cmd_jobs for why "jobs"
     # is not a detail level of "check".
-    ("check",    "<name>|all",         "show the run's overall status",           "watching", _cmd_check),
-    ("monitor",  "<name> [seconds]",   "watch a run until its state changes",     "watching", _cmd_monitor),
-    ("jobs",     "<name> [failed]",    "show every job and its state",            "watching", _cmd_jobs),
-    ("history",  "",                   "every run recorded, live or gone",        "watching", _cmd_history),
+    ("check",    "<name>|all",         "show the run's overall status",           "watching", _cmd_check,    True),
+    ("monitor",  "<name>",             "watch a run until its state changes",     "watching", _cmd_monitor,  True),
+    ("jobs",     "<name> [failed]",    "show every job and its state",            "watching", _cmd_jobs,     True),
+    ("history",  "[name]",             "the archive of every run recorded",       "watching", _cmd_history,  True),
     # One verb, not two. /why and /diagnose were the same function under two
     # names, and the only thing the pair achieved was making people wonder which
     # to reach for -- the two answers differed by model variance, never by
     # design. /check already gives the quick why, in its root cause block, for
     # free and with no model call. This is the one that reads the logs.
-    ("diagnose", "<name> [question]",  "investigate why a run failed",            "fixing",   _cmd_diagnose),
-    ("hold",     "<name> [release]",   "stop a run's queued jobs being scheduled", "fixing",  _cmd_hold),
-    ("cancel",   "<name>",             "scancel a run's remaining jobs",          "fixing",   _cmd_cancel),
-    ("sort",     "[names...|show]",    "tick rows to hide from /list; show undoes", "fixing", _cmd_sort),
-    ("scan",     "[path]",             "find GenPipes runs already on disk",      "fixing",   _cmd_scan),
-    ("track",    "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track),
-    ("readset",  "[dir|schema]",       "build a readset file from filenames",     "setup",    _cmd_readset),
-    ("where",    "",                   "which directories this is using",         "setup",    _cmd_where),
-    ("telemetry", "",                  "generate/execute/checkpoint timings",     "setup",    _cmd_telemetry),
-    ("user",     "[name]",             "show or change what it calls you",        "setup",    _cmd_user),
-    ("model",    "[provider [model]]", "show or switch the model behind this",    "setup",    _cmd_model),
-    ("key",      "",                   "add or rotate an API key",                "setup",    _cmd_key),
-    ("help",     "",                   "this list",                               "setup",    _cmd_help),
-    ("exit",     "",                   "leave",                                   "setup",   None),
+    ("diagnose", "<name>",             "investigate why a run failed",            "fixing",   _cmd_diagnose, True),
+    ("hold",     "<name> [release]",   "stop a run's queued jobs being scheduled", "fixing",  _cmd_hold,     True),
+    ("cancel",   "<name>",             "scancel a run's remaining jobs",          "fixing",   _cmd_cancel,   True),
+    ("sort",     "[show]",             "tick rows to hide from /list; show undoes", "fixing", _cmd_sort,     True),
+    ("scan",     "[path]",             "find GenPipes runs already on disk",      "fixing",   _cmd_scan,     True),
+    ("track",    "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track,    True),
+    ("readset",  "[dir|schema]",       "build a readset file from filenames",     "setup",    _cmd_readset,  False),
+    ("where",    "",                   "the cluster, and where runs are written", "setup",    _cmd_where,    True),
+    ("telemetry", "",                  "generate/execute/checkpoint timings",     "setup",    _cmd_telemetry, False),
+    ("user",     "[name]",             "show or change what it calls you",        "setup",    _cmd_user,     True),
+    ("model",    "[provider [model]]", "show or switch the model behind this",    "setup",    _cmd_model,    True),
+    ("key",      "",                   "add or rotate an API key",                "setup",    _cmd_key,      True),
+    ("help",     "",                   "this list",                               "setup",    _cmd_help,     True),
+    ("exit",     "",                   "leave",                                   "setup",    None,          True),
 ]
 
-COMMANDS = {name: fn for name, _, _, _, fn in COMMAND_SPECS if fn}
+# Every command that dispatches, public or not. A hidden command still works
+# when it is typed -- it is only untaught.
+COMMANDS = {name: fn for name, _, _, _, fn, _ in COMMAND_SPECS if fn}
 
 
 def _specs_now():
-    """COMMAND_SPECS with the state-dependent rows filled in for right now.
+    """The PUBLIC commands, with the state-dependent rows filled in for now.
 
-    Just /verbose so far. Its row was written as a fixed "[off]", which is a
+    Two jobs, and the first one is the command surface. A row flagged
+    non-public is dropped here, which is the single point that decides what
+    /help teaches and what the completion menu offers -- COMMANDS above is
+    built from the raw table, so a hidden command still dispatches when it is
+    typed. See the note on COMMAND_SPECS for why /telemetry and /readset are
+    hidden rather than deleted.
+
+    The second job is /verbose. Its row was written as a fixed "[off]", which is a
     label for one of the two states it can be in and is therefore wrong half
     the time -- it read as "off" while the working was already being shown. A
     toggle has to say which way it will flip and where it currently stands, so
@@ -2209,7 +2351,9 @@ def _specs_now():
     somebody to work out which one they need before pressing a key.
     """
     out = []
-    for name, args, desc, group, fn in COMMAND_SPECS:
+    for name, args, desc, group, fn, public in COMMAND_SPECS:
+        if not public:
+            continue
         if name == "verbose":
             args = ""
             desc = ("fold the agent's working away  ·  now: showing"
@@ -2262,13 +2406,21 @@ def _panel(gap):
                      note=gap.note, free_text=gap.free_text)
 
 
-def _dispatch_line(agent, line):
+def _dispatch_line(agent, line, focus=None):
     """Run a slash command. One implementation, shared by every caller that
-    needs to dispatch a typed command."""
+    needs to dispatch a typed command.
+
+    `focus` is the session's runs.Focus, updated here because this is the one
+    place a typed command and its arguments are both in hand. It is recorded
+    BEFORE the handler runs and from the argument alone -- see runs.Focus for
+    why an argument is a fact and a sentence is not.
+    """
     parts = line[1:].split()
     if not parts:
         return
     cmd, args = _resolve(parts[0].lower()), parts[1:]
+    if focus is not None:
+        focus.note(cmd, args, known=agent.registry.get)
     handler = COMMANDS.get(cmd)
     if handler is None:
         print(f"  {display.RED}No such command: {line.split()[0]}{display.RESET}"
@@ -2432,7 +2584,7 @@ def _provider_names():
     return out
 
 
-def _run_names(agent, command):
+def _run_names(agent, command, focus=None):
     """Values to complete the first argument of `command` with, or None.
 
     None means "this command's argument is neither a run name nor anything
@@ -2441,6 +2593,13 @@ def _run_names(agent, command):
     from _provider_names(). An empty list means it IS a run name and there are
     none, which the prompt says out loud rather than silently offering
     nothing.
+
+    `focus` is the run the person last named on a command line, and it is
+    applied LAST -- after this function has decided which runs are legal for
+    this command -- so it can only reorder that set, never widen it. That is
+    what makes `/view foo` then `/approve ` offer foo first while `/approve `
+    after foo has been approved does not offer it at all: foo stops being held,
+    so it is not in the list for focus to move.
     """
     # Before the try: this reads the environment, not the registry, and a
     # broken registry has no bearing on whether the provider list is right.
@@ -2457,7 +2616,7 @@ def _run_names(agent, command):
             records = ([r for r in live if r["status"] == runs_store.HELD]
                        + list(reversed([r for r in live
                                         if r["status"] != runs_store.HELD])))
-            return [(r["name"], _run_note(r)) for r in records]
+            return _ranked([(r["name"], _run_note(r)) for r in records], focus)
         elif command in _WATCH:
             records = [r for r in agent.registry.live()
                        if r["status"] != runs_store.HELD]
@@ -2468,14 +2627,29 @@ def _run_names(agent, command):
     # Newest first, because the registry is append-only and therefore oldest
     # first, and the run you mean is almost always the one you just made. It is
     # also the row Enter takes when you have not moved the selection.
-    return [(r["name"], _run_note(r)) for r in reversed(records)]
+    return _ranked([(r["name"], _run_note(r)) for r in reversed(records)], focus)
 
 
-def _run_note(record):
-    """One phrase saying what this run is, for the completion menu."""
-    slots = (record.get("proposal") or {}).get("slots") or {}
-    what = " ".join(str(slots[k]) for k in ("pipeline", "protocol")
-                    if slots.get(k)) or (record.get("proposal") or {}).get("command", "")
+def _ranked(rows, focus):
+    """`rows` with the focused run first, when it is one of them."""
+    return focus.rank(rows) if focus is not None else rows
+
+
+def _run_note(record, status=None):
+    """One phrase saying what this run is, for a completion menu or /sort.
+
+    `status` is a resolved RunStatus when the caller has already paid for the
+    scheduler round-trip. Given one, the state comes from runs.list_tag -- the
+    same words /list puts in its STATUS column -- so a row reads identically on
+    both screens. Without one it falls back to the last cached verdict, which
+    is what the completion menu has to live with: it redraws on every keystroke
+    and cannot query Slurm to do it.
+    """
+    values = (record.get("proposal") or {}).get("slots") or {}
+    what = " ".join(str(values[k]) for k in ("pipeline", "protocol")
+                    if values.get(k)) or (record.get("proposal") or {}).get("command", "")
+    if status is not None or record.get("job_list"):
+        return f"{what}  {runs_store.list_tag(record, status)}".strip()
     check = record.get("last_check") or {}
     return f"{what}  {check.get('verdict', '')}".strip()
 
@@ -2537,7 +2711,12 @@ def _repl(agent):
 
     The prompt is created once and kept, so history survives across turns.
     """
-    prompt = ui.Prompt(menu, arguments=lambda cmd: _run_names(agent, cmd))
+    # The run somebody last named on a command line. See runs.Focus: it is set
+    # from an argument, never from prose, and it only reorders a menu the
+    # completion code had already decided to show.
+    focus = runs_store.Focus()
+    prompt = ui.Prompt(menu,
+                       arguments=lambda cmd: _run_names(agent, cmd, focus))
     thread = _conversation_id()
     context = None              # the last directory brief sent on this thread
     preparation = prep.Preparation()
@@ -2586,7 +2765,7 @@ def _repl(agent):
             # returns to the prompt rather than ending the session; that is
             # _dispatch_line's doing, and without it Ctrl+C would mean two
             # different things depending on when it was pressed.
-            _dispatch_line(agent, line)
+            _dispatch_line(agent, line, focus)
             continue
 
         try:

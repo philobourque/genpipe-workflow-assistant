@@ -1576,12 +1576,31 @@ something you can do, do it rather than telling them what to type.
         protocol = request.get("protocol")
         task = getattr(self, "user_task", "") or ""
 
-        # A model that asks about a protocol without saying whose is common
-        # enough to be worth recovering from, and the pipeline is nearly always
-        # sitting in what the user just said.
-        if slot in ("protocol", "design", "pairs") and not pipeline:
-            pipeline = intake.find_pipeline(task)
-
+        # A PIPELINE IS NEVER RECOVERED FROM THE USER'S WORDS HERE, and the
+        # three lines that used to do it are the reason this comment is long.
+        #
+        # They read: if the model asked about a protocol, a design or a pairs
+        # file without saying which pipeline it meant, scrape one out of what
+        # the user last said (intake.find_pipeline). The intention was
+        # recovery. The effect was the mention-is-selection defect that prep.py
+        # was rewritten to delete, still live one module over -- measured on
+        # the sentences that provoked that rewrite:
+        #
+        #     "should I use rnaseq or chipseq?"  ->  chipseq
+        #     "I do NOT want chipseq"            ->  chipseq
+        #
+        # A comparison resolved to one of the things being compared and a
+        # refusal resolved to the thing refused, and the panel then offered
+        # that pipeline's protocols as though the question had been settled.
+        # Matching a word proves it was typed, never that it was chosen.
+        #
+        # Nothing is needed in its place, which is the part worth knowing:
+        # slots.gap_for() already handles an unnamed pipeline correctly and
+        # says why in its own docstring -- asked for a protocol with no
+        # pipeline, it returns the PIPELINE gap, because that is the real gap
+        # and answering it first is what the ordering exists to enforce. So
+        # removing the guess does not lose the recovery; it replaces a guessed
+        # answer with the question that was actually outstanding.
         named = intake.find_directories(task)
         found = intake.candidates(named[0] if named else None)
         return slot_table.gap_for(
@@ -1715,13 +1734,30 @@ something you can do, do it rather than telling them what to type.
                 self.registry.remember_reasons(record["name"], status.reasons)
         display.run_list(rows)
 
-    def history(self):
-        """List every recorded run, live and gone, newest first. Unlike
-        submissions(), nothing is hidden -- this is how you find a run again
-        after its job_list file has been cleaned up from Rorqual."""
+    def history(self, name=None):
+        """The archive of run records, newest first, or one record in full.
+
+        Unlike submissions(), nothing is hidden and nothing is asked of the
+        scheduler -- this is how you find a run again after its job_list file
+        has been cleaned up from Rorqual, and it stays an archive rather than
+        becoming a second, slower /list.
+
+        `name` opens one record: its provenance and whatever /diagnose found
+        out about it. Those findings used to be printed under every row of the
+        summary, which is what made the summary unreadable; they are still
+        recorded, and this is where they are read.
+        """
         records = self.registry.all()
         if not records:
             display.nothing("No runs recorded yet.")
+            return
+        if name:
+            record = self.registry.get(name)
+            if record is None:
+                display.problem(f"No run named '{name}'.",
+                                "/history on its own lists every record.")
+                return
+            display.history_detail(record)
             return
         display.history(records)
 
@@ -1950,22 +1986,34 @@ something you can do, do it rather than telling them what to type.
             return found
 
         wanted = {str(c) for c in chosen}
-        added, skipped = [], []
+        added, restored, skipped = [], [], []
         for entry in found:
             if entry["name"] not in wanted and entry["job_list"] not in wanted:
                 continue
-            duplicate = runs_store.already_known(self.registry, entry)
-            if duplicate:
+            # THREE OUTCOMES, NOT TWO. This used to be adopt-or-refuse, and
+            # the refusal was a dead end: "already known as hi-0724" for a run
+            # that was hidden, or gone, or not in fact the same run at all.
+            # runs.rediscovery() decides which of the three this is; nothing
+            # here re-derives it, so /scan and any other caller cannot disagree
+            # about what finding a run again means.
+            verdict = runs_store.rediscovery(self.registry, entry)
+            if verdict.action == runs_store.KNOWN:
                 skipped.append((entry["name"],
-                                f"already known as {duplicate['name']}"))
+                                f"{verdict.reason} — on record as "
+                                f"{verdict.name}"))
+                continue
+            if verdict.action == runs_store.RESTORE:
+                self.registry.rediscover(verdict.name, entry)
+                restored.append((verdict.name, verdict.reason))
                 continue
             name = self.registry.unique_name(entry["name"])
             if name != entry["name"]:
                 skipped.append((entry["name"], f"name taken — added as {name}"))
             self.registry.adopt(name, entry)
             added.append(name)
-        display.scan_results(root, found, added=added, skipped=skipped)
-        return added
+        display.scan_results(root, found, added=added, skipped=skipped,
+                             restored=restored)
+        return added + [n for n, _ in restored]
 
     def step_help(self, pipeline, protocol=None):
         """`genpipes <pipeline> [-t <protocol>] --help`, as text.

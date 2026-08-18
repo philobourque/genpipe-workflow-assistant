@@ -72,17 +72,101 @@ from . import runs
 # ---------------------------------------------------------------------------
 # ANSI escape codes. \033[<n>m sets an attribute; \033[0m clears everything.
 # ---------------------------------------------------------------------------
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RED = "\033[31m"
-AMBER = "\033[33m"
-GREEN = "\033[32m"
-CYAN = "\033[36m"
-GREY = "\033[90m"
-WHITE = "\033[37m"
-REVERSE = "\033[7m"
-UNDER = "\033[4m"
+# ---------------------------------------------------------------------------
+# HOW THIS PALETTE SURVIVES A TERMINAL IT KNOWS NOTHING ABOUT.
+#
+# The reported problem was real and was two problems: light blue is hard to
+# read on a dark background, and light grey is hard to read on a white one.
+# Both came from picking colours that only contrast with ONE background.
+#
+# The fix is not to detect the theme. There is no reliable way to -- the
+# control sequence that asks (OSC 11) is unanswered by tmux, by screen, by
+# most CI terminals and by anything reading a pipe, so a detector is a thing
+# that is confidently wrong on the machines people actually use, and it fails
+# by making text invisible.
+#
+# So the rules are these, and they are about which colours are CHOSEN rather
+# than about which terminal is running:
+#
+#   1. COLOUR IS NEVER THE ONLY CARRIER. Every state has a glyph (see _MARKS)
+#      and a word ("waiting for approval", "failed"). Strip every escape
+#      sequence and the screen still says the same things. That is what makes
+#      the rest of this a readability question rather than a correctness one.
+#
+#   2. NOTHING IS PAINTED IN A COLOUR THAT ONLY WORKS ON ONE BACKGROUND.
+#      Bright blue and cyan are illegible on white; plain blue is illegible on
+#      black; ANSI 37 "white" is light grey, which vanishes on a white
+#      terminal. Red and green have adequate contrast against both, so the
+#      palette is built from those, from the terminal's own DEFAULT foreground
+#      -- which contrasts with the background by definition, whatever it is --
+#      and from bold, which is a weight rather than a colour.
+#
+#   3. MUTED MEANS 90, NOT 2. \033[2m (dim) is rendered as a large opacity drop
+#      by some terminals and ignored entirely by others, so it is both the
+#      least readable thing here and the least predictable. It stays for
+#      genuine background furniture; 90 (bright black) is the muted colour,
+#      because it is a real mid-grey and therefore the one shade that is
+#      legible against black and white alike.
+#
+#   4. NO_COLOR IS HONOURED. See _colour_wanted().
+# ---------------------------------------------------------------------------
+
+
+def _colour_wanted():
+    """Should anything be coloured at all?
+
+    NO_COLOR is the informal standard (no-color.org): any value, even empty,
+    means do not emit colour. TERM=dumb is the older one. Both are honoured
+    because the alternative is escape sequences landing in a log file, and a
+    person who has set either has already said what they want.
+
+    Deliberately NOT conditioned on isatty(). Output is piped constantly here
+    -- `| tee`, `| less -R`, the test harness -- and stripping colour from a
+    pipe would take it away from `less -R`, which handles it perfectly well.
+    fit() and cells() already discount escape sequences when measuring, so a
+    redirected screen keeps its layout either way.
+    """
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    return os.environ.get("TERM", "") != "dumb"
+
+
+_COLOUR = _colour_wanted()
+
+
+def _sgr(code):
+    return code if _COLOUR else ""
+
+
+RESET = _sgr("\033[0m")
+BOLD = _sgr("\033[1m")
+DIM = _sgr("\033[2m")
+RED = _sgr("\033[31m")
+# Bold yellow rather than plain. Plain 33 on a white background is the weakest
+# thing on that screen, and this is the colour of the one state that is waiting
+# for somebody to act -- the row that must not be the hardest to see. Bold is
+# rendered as a heavier or brighter yellow by every terminal that renders bold
+# at all, and by none as a lighter one.
+AMBER = _sgr("\033[1;33m")
+GREEN = _sgr("\033[32m")
+# Kept, and no longer used for any STATE. See _MARKS: cyan was the colour of a
+# live run, and cyan on a white terminal is the reported "light blue is hard to
+# read" defect. Anything still reaching for it should ask whether it wants the
+# default foreground instead.
+CYAN = _sgr("\033[36m")
+GREY = _sgr("\033[90m")
+# NOT \033[37m, which is ANSI "white" -- a LIGHT GREY that disappears against a
+# white background, and the other half of the reported defect. This is the
+# emphasis this name was always reaching for: the terminal's own foreground
+# colour, made heavier. It contrasts with the background whatever the
+# background is, because that is what a default foreground means.
+#
+# The name is left alone deliberately. Sixty call sites say WHITE where they
+# mean "the emphasised one", and renaming them would be a large diff over
+# working code to relabel a decision that is stated here.
+WHITE = BOLD
+REVERSE = _sgr("\033[7m")
+UNDER = _sgr("\033[4m")
 
 WIDTH = 74
 
@@ -175,6 +259,26 @@ def row_count(text, cols):
     if cols <= 0:
         return 1
     return max(1, -(-cells(text) // cols))
+
+
+def terminal_rows():
+    """The real height of the window, in rows.
+
+    Same reasoning as terminal_cols() below, and needed for the same class of
+    bug from the other axis: a block taller than the window cannot be repainted
+    by walking the cursor up its own height, because the rows it wants to walk
+    back to have already scrolled off. Anything that repaints in place has to
+    know when to stop growing.
+    """
+    for stream in (sys.__stdout__, sys.__stderr__, sys.__stdin__):
+        try:
+            return os.get_terminal_size(stream.fileno()).lines
+        except (AttributeError, ValueError, OSError):
+            continue
+    try:
+        return max(1, int(os.environ.get("LINES", "24")))
+    except ValueError:
+        return 24
 
 
 def terminal_cols():
@@ -530,6 +634,17 @@ def help_text(commands):
           f"it reaches the gate;{RESET}")
     print(f"  {DIM}that name is how you approve it, and how you check on it days "
           f"later.{RESET}")
+    print()
+    # WHAT THE HELP TEACHES AND WHAT THE PARSER ACCEPTS ARE NOT THE SAME SET,
+    # and this line is where the difference is admitted rather than advertised
+    # in every row. The signatures above used to read `/modify <name> [change]`,
+    # `/reject <name> [why...]`, `/diagnose <name> [question]` -- three
+    # different notations for one idea, spending the widest column on the
+    # option nobody needs to start with. The flexibility is real and is not
+    # being removed; it is just not the first thing somebody has to parse.
+    print(f"  {DIM}Most of these take a sentence after the name too — "
+          f"{RESET}{GREY}/modify run-1 use steps 1-5{RESET}"
+          f"{DIM}, {RESET}{GREY}/diagnose run-1 why did it stall{RESET}{DIM}.{RESET}")
     print()
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +1258,11 @@ def _draw(event):
 
     elif k == "answer":
         # One quiet line. The panel above it is the event; this is the receipt.
-        print(f"{CYAN}{DIM}\u258f {_answer_line(event['text'])}{RESET}\n")
+        # The bar is furniture and is muted; the text is the agent's answer and
+        # is left in the terminal's own foreground. This used to be cyan AND
+        # dim together, which is the least legible combination available and
+        # was applied to a line somebody is meant to read.
+        print(f"{GREY}\u258f{RESET} {_answer_line(event['text'])}\n")
 
     elif k == "solution":
         # The reply itself. Plain text, no rule, no label -- this is the agent
@@ -2945,7 +3064,11 @@ _MARKS = {
     # simply not a decision any more, and colouring it like one that is would
     # put it back in the queue this whole change exists to clear.
     LAPSED_BUCKET: (_UNKNOWN_MARK, GREY),
-    ACTIVE_BUCKET: (_LIVE_MARK, CYAN),
+    # Bold green, not cyan. Cyan is unreadable on a light terminal, and a run
+    # that is running is not a fourth kind of thing -- it is healthy, like a
+    # finished one, and doing something, unlike a finished one. Green says the
+    # first; the weight and the glyph (\u25b6 against \u2713) say the second.
+    ACTIVE_BUCKET: (_LIVE_MARK, BOLD + GREEN),
     ATTENTION_BUCKET: (_BROKE_MARK, RED),
     FINISHED_BUCKET: (_DONE_MARK, GREEN),
     UNAVAILABLE_BUCKET: (_UNKNOWN_MARK, GREY),
@@ -3188,8 +3311,12 @@ def _row_status(bucket, record, status):
 # sort order rather than a set of headings: a run's state is on its own row,
 # where the name is, and you never have to look up the screen to find out
 # which section you are reading.
-_SECTION_ORDER = [HELD_BUCKET, ACTIVE_BUCKET, ATTENTION_BUCKET,
-                  LAPSED_BUCKET, FINISHED_BUCKET, UNAVAILABLE_BUCKET]
+#
+# The order itself moved to runs.SECTION_ORDER, because /sort has to present
+# the same collection the same way and importing the renderer to find out how
+# would have been the wrong dependency. This alias is kept so the reasoning
+# above stays next to the screen it was written about.
+_SECTION_ORDER = list(runs.SECTION_ORDER)
 
 
 def _finished_line(status):
@@ -3264,16 +3391,10 @@ def run_list(rows):
     /view, which is what those commands are for; it was the widest thing on
     screen and the least often read.
     """
-    buckets = {b: [] for b in _SECTION_ORDER}
-    for record, status in rows:
-        buckets[list_bucket(record, status)].append((record, status))
-    for entries in buckets.values():
-        entries.sort(key=lambda rs: rs[0].get("submitted_at")
-                                    or rs[0].get("held_at") or "")
-
-    ordered = [(bucket, record, status)
-               for bucket in _SECTION_ORDER
-               for record, status in buckets[bucket]]
+    # runs.listing_order, not a second sort written here. /sort renders the
+    # same collection with checkboxes on it and has to present it in the same
+    # order -- see the note on runs.SECTION_ORDER for what disagreeing cost.
+    ordered = runs.listing_order(rows)
 
     # Columns sized from the data, then from the window. A name column wide
     # enough for the longest name is worth having and is not worth wrapping the
@@ -3358,23 +3479,171 @@ def run_list(rows):
     print()
 
 
-def history(records):
-    """/history -- every recorded run, live and gone, newest first.
+# What a registry status means as a HISTORICAL record, which is not what it
+# means as a current state.
+#
+# `submitted` used to render as "live", and that was the reported defect: a run
+# submitted three weeks ago whose jobs finished, failed or were cleaned up long
+# since was described as running right now, on a screen that asks the scheduler
+# nothing. The status field records that an approval was spent. It cannot know
+# what happened next, and the words here are chosen so they cannot be read as
+# though it did.
+#
+# THREE THINGS, KEPT APART, because collapsing them is what produced the lie:
+#
+#   registry lifecycle       this table. What the record says about itself.
+#   live scheduler evidence  NOT ON THIS SCREEN. /list and /check ask Slurm;
+#                            /history deliberately does not, so it stays fast
+#                            and stays honest about being an archive.
+#   last known outcome       _last_seen() below, printed as a separate, dated,
+#                            explicitly stale clause.
+_ARCHIVE_TAG = {
+    "held": ("awaiting approval", AMBER),
+    "lapsed": ("proposal expired", GREY),
+    "submitted": ("submitted", ""),
+    "gone": ("artifacts gone", GREY),
+    "abandoned": ("abandoned", GREY),
+}
 
-    A gone entry is shown, marked as such, so a run can still be found after its
-    job_list file has been cleaned up from Rorqual. Notes left by /diagnose are shown
-    too: months later, "OOM in picard_mark_duplicates" is the only part of this
-    record anyone still wants."""
+# How a run got into the registry, said as a verb rather than as a noun.
+# "agent" and "manual" were the stored values and neither reads as anything on
+# its own -- a column of the word "agent" tells you nothing about what agent
+# did. These say what happened to produce the record.
+_ORIGIN = {
+    "agent": "built here",
+    "manual": "tracked",
+    "scan": "found on disk",
+}
+
+
+def _last_seen(record):
+    """The last scheduler outcome recorded for this run, or "".
+
+    Explicitly dated and explicitly past tense. This is a cached snapshot from
+    whenever somebody last ran /check or /list -- it is the strongest thing
+    /history can say about what became of a run, and it is still not current
+    truth, so it never appears without the day it was taken.
+    """
+    check = record.get("last_check") or {}
+    verdict = str(check.get("verdict") or "").strip()
+    if not verdict:
+        return ""
+    at = str(check.get("at") or "")[:10]
+    return f"{verdict} when last checked{f' {at}' if at else ''}"
+
+
+def history(records, limit=None):
+    """/history -- the archive of run records, newest first.
+
+    WHAT THIS SCREEN IS FOR, because it was answering a different question than
+    the one it was being asked. /history is an ARCHIVE: it exists so a run can
+    still be found months later, after its job_list has been cleaned off the
+    cluster and after everyone has forgotten what it was called. It is not a
+    dashboard and it is not a diagnosis report.
+
+    So three things left, and each was doing real harm rather than merely
+    taking up room:
+
+      "live"        a registry status rendered as a claim about right now. See
+                    _ARCHIVE_TAG. A run that failed on the 5th of August was
+                    described as live for a fortnight.
+      the notes     two lines of /diagnose prose under every entry, usually
+                    "The log does not name a cause on its own." Sixty runs of
+                    that is a screen nobody reads, and the notes are still on
+                    the record and still shown by /diagnose, which is the
+                    command that is about them.
+      the gutter    a \u258c down the left of entries of wildly differing height,
+                    which is what a gutter is worst at.
+
+    What replaced them is one row per run, aligned, so the archive can be read
+    down a column -- which is the only way anybody has ever used it.
+    """
+    rows = list(records)
+    shown = rows[:limit] if limit else rows
+    cols = terminal_cols() if _tty() else 100
+
+    names = [str(r.get("name") or "?") for r in shown] or [""]
+    whats = [_what(r) for r in shown] or [""]
+    w_when = 10
+    w_origin = max(len(v) for v in _ORIGIN.values())
+    fixed = 2 + w_when + 2 + 2 + 2 + w_origin + 2
+    # 18 reserves the longest lifecycle word ("awaiting approval") and nothing
+    # for the "when last checked" clause after it. That clause is the least
+    # important thing on the row and the only one that may be cut: the name is
+    # what this screen exists to help somebody find again.
+    budget = max(24, cols - 1 - fixed - 18)
+    w_name = min(max(len(n) for n in names), max(12, budget * 2 // 3))
+    w_what = min(max(len(w) for w in whats), max(10, budget - w_name))
+
     print()
-    for r in records:
-        when = (r.get("submitted_at") or r.get("held_at") or "").replace("T", " ")
-        print(f"  {DIM}\u258c{RESET} {BOLD}{r['name']}{RESET}  {DIM}\u00b7{RESET}  {_tag(r)}"
-              f"  {DIM}\u00b7{RESET}  {DIM}{r.get('source', 'agent')}{RESET}"
-              f"  {DIM}\u00b7{RESET}  {DIM}{when}{RESET}")
-        if r.get("job_list"):
-            print(f"  {DIM}\u258c   {os.path.basename(r['job_list'])}{RESET}")
-        for note in (r.get("notes") or [])[-2:]:
-            print(f"  {DIM}\u258c{RESET}   {GREY}\u00b7 {note.get('text', '')}{RESET}")
+    head = (f"{'RECORDED':<{w_when}}  {'NAME':<{w_name}}  {'PIPELINE':<{w_what}}"
+            f"  {'ORIGIN':<{w_origin}}  RECORD")
+    print(f"  {DIM}{fit(head, cols - 3)}{RESET}")
+    for r in shown:
+        # The day, not the second. A timestamp to the second implies this
+        # screen is about sequencing events; it is about finding a run again,
+        # and the day is how anybody remembers which one they mean.
+        when = str(r.get("submitted_at") or r.get("held_at") or "")[:10]
+        word, colour = _ARCHIVE_TAG.get(r.get("status"), ("?", GREY))
+        origin = _ORIGIN.get(r.get("source"), str(r.get("source") or "?"))
+        tail = _last_seen(r)
+        line = (f"  {DIM}{when:<{w_when}}{RESET}"
+                f"  {BOLD}{pad(str(r.get('name') or '?'), w_name)}{RESET}"
+                f"  {GREY}{pad(_what(r), w_what)}{RESET}"
+                f"  {DIM}{origin:<{w_origin}}{RESET}"
+                f"  {colour}{word}{RESET}"
+                + (f"{DIM}  \u00b7  {tail}{RESET}" if tail else ""))
+        print(fit(line, cols - 1))
+
+    print()
+    if limit and len(rows) > limit:
+        print(f"  {DIM}{len(rows) - limit} older record(s) not shown{RESET}")
+    # Where the detail went, named on the screen it was taken off.
+    print(f"  {DIM}/view <name> for the command  \u00b7  /jobs <name> for its jobs"
+          f"  \u00b7  /diagnose <name> for what went wrong{RESET}")
+    print()
+
+
+def history_detail(record):
+    """One archived run, in full: what it was, and what was found out about it.
+
+    THIS IS WHERE THE NOTES WENT. /history used to print every run's last two
+    /diagnose findings underneath it, which on a real registry is sixty lines
+    of "The log does not name a cause on its own." for the two that say
+    something. Deleting them outright would have been the wrong trade -- months
+    later, "OOM in picard_mark_duplicates" really is the only part of a record
+    anybody still wants, and /diagnose cannot recover it once the logs are off
+    the cluster.
+
+    So the finding is archived rather than broadcast: it stays on the record,
+    and this is the screen that shows it, reached by naming the run.
+    """
+    name = str(record.get("name") or "?")
+    word, colour = _ARCHIVE_TAG.get(record.get("status"), ("?", GREY))
+    origin = _ORIGIN.get(record.get("source"), str(record.get("source") or "?"))
+    when = str(record.get("submitted_at") or record.get("held_at") or "").replace("T", " ")
+
+    print()
+    print(f"  {DIM}\u258c{RESET} {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  {colour}{word}{RESET}")
+    print(f"  {DIM}\u258c{RESET}")
+    for label, value in (("pipeline", _what(record)),
+                         ("recorded", when),
+                         ("origin", origin),
+                         ("last seen", _last_seen(record)),
+                         ("workdir", _tilde(record.get("workdir") or "")),
+                         ("job list", os.path.basename(record.get("job_list") or ""))):
+        if value:
+            print(f"  {DIM}\u258c{RESET}   {GREY}{label:<10}{RESET}{value}")
+
+    notes = record.get("notes") or []
+    if notes:
+        print(f"  {DIM}\u258c{RESET}")
+        print(f"  {DIM}\u258c{RESET}   {GREY}what was found{RESET}")
+        for note in notes:
+            at = str(note.get("at") or "")[:10]
+            for i, line in enumerate(textwrap.wrap(str(note.get("text") or ""), 66)):
+                lead = f"{at:<10}" if i == 0 else " " * 10
+                print(f"  {DIM}\u258c{RESET}     {DIM}{lead}{RESET}{line}")
     print(f"  {DIM}\u258c{RESET}")
     print()
 
@@ -3654,11 +3923,24 @@ def where(paths):
     a submission gets registered at all: the job list is looked for under the
     directory the app was launched from, and nothing else in the interface shows
     you what that is.
+
+    WHAT THIS SCREEN IS FOR was the thing it never said. It printed six paths
+    and left the reader to work out which of them mattered and why -- so the
+    one row with teeth read exactly like the five that are merely informative.
+    A heading now says what the list is, and a row may carry its own note.
+
+    `paths` rows are (label, value) or (label, value, note).
     """
+    rows = [(r[0], r[1], r[2] if len(r) > 2 else "") for r in paths]
     print()
-    width = max(len(k) for k, _ in paths) + 2
-    for label, value in paths:
+    print(f"  {DIM}\u258c{RESET} {BOLD}Where this session reads and writes{RESET}")
+    print(f"  {DIM}\u258c{RESET}")
+    width = max(len(k) for k, _, _ in rows) + 2
+    for label, value, note in rows:
         print(f"  {DIM}\u258c{RESET} {DIM}{label:<{width}}{RESET}{_tilde(str(value))}")
+        if note:
+            print(f"  {DIM}\u258c{RESET} {' ' * width}{GREY}{note}{RESET}")
+    print(f"  {DIM}\u258c{RESET}")
     print()
 
 
@@ -3938,12 +4220,19 @@ def reading_as(name, text):
     print()
 
 
-def scan_results(root, found, added=(), skipped=()):
-    """What /scan discovered and what was adopted from it.
+def scan_results(root, found, added=(), skipped=(), restored=()):
+    """What /scan discovered, and what happened to each of them.
 
     The directory is echoed because /scan takes a path and a person who typed
     the wrong one will otherwise read "no runs found" as a fact about GenPipes
     rather than about their typo.
+
+    `restored` is reported separately from `added`, and the separation is the
+    point rather than a nicety. Adding creates an identity; restoring returns
+    one that already existed to /list, with its name, its history and its
+    notes intact. Reporting a restore as an addition would suggest a second
+    row had appeared for a run that already had one -- which is the exact
+    confusion the rediscovery rules exist to prevent.
     """
     if not found:
         print()
@@ -3964,6 +4253,12 @@ def scan_results(root, found, added=(), skipped=()):
     else:
         print(f"  {DIM}▌{RESET} {DIM}Nothing added{RESET}"
               f"  {DIM}·  {len(found)} run(s) found under {_tilde(root)}{RESET}")
+    if restored:
+        print(f"  {GREEN}▌{RESET} {BOLD}{len(restored)} run"
+              f"{'s' if len(restored) != 1 else ''} back in /list{RESET}"
+              f"  {DIM}·  the same record, not a new one{RESET}")
+        for name, why in restored:
+            print(f"  {DIM}▌{RESET}   {BOLD}{name}{RESET}  {DIM}— {why}{RESET}")
     for name, why in skipped or ():
         print(f"  {DIM}▌{RESET}   {DIM}{name} — {why}{RESET}")
     print(f"  {DIM}▌{RESET}")

@@ -85,8 +85,17 @@ _CPU = re.compile(r"^\s*(?:\d+|%\([A-Za-z_]\w*\)s)\s*$")
 _SECTION = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 
-def path_for(name, directory, proposal=None):
+def path_for(name, directory, proposal=None, fresh=False):
     """Where this run's override ini lives.
+
+    `fresh` is what a FORK passes, and it exists because the rule below --
+    "the command is where the file is" -- is right for a run being edited and
+    exactly wrong for one being copied. A fork quotes its parent's command
+    verbatim, so `stacked_override` finds the PARENT's ini on that -c line;
+    tuning a step in the fork would then write into the parent's file and
+    silently re-tune a run that was supposed to be left alone. The original is
+    never mutated, so a fork always names a file after itself and lets
+    modify._deltas replace the inherited one on the -c stack.
 
     Named after the run and kept beside it rather than in a shared location, so
     that two runs tuned differently cannot quietly share one file -- and so that
@@ -107,7 +116,7 @@ def path_for(name, directory, proposal=None):
     regeneration for a rename, which is the one change that costs nothing. So
     the file stays where it was written, and this reads where that was.
     """
-    already = modify.stacked_override(proposal)
+    already = "" if fresh else modify.stacked_override(proposal)
     if already:
         return (already if os.path.isabs(already)
                 else os.path.join(directory or ".", os.path.basename(already)))

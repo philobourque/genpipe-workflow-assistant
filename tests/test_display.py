@@ -69,6 +69,14 @@ def job(job_id, name, state, elapsed="00:14:22", maxrss=None):
 
 
 def main():
+    # EVERY ASSERTION ABOUT COLOUR IN THIS SUITE IS GUARDED BY THIS, and the
+    # reason is the thing the guard is checking. With NO_COLOR set the palette
+    # is a set of empty strings, so `display.RED not in output` is trivially
+    # false and `output.count(display.AMBER)` is the length of the whole
+    # string -- these checks do not fail honestly when colour is off, they fail
+    # meaninglessly. What should be asserted in that mode is that the screen
+    # still SAYS everything it said before, which is the section at the end.
+    colour = bool(display._COLOUR)
     r = Report("every renderer")
 
     # ---------------------------------------------------------------- #
@@ -225,7 +233,10 @@ def main():
         counts={}, total=15, resolved=0, unknown=15, finished=False,
         verdict="scheduler unreachable", doomed=0, source="unavailable")
 
-    rows = [(held, None), (running_record, running_status),
+    # Kept under a second name so the no-colour section at the end of this
+    # suite can re-render exactly this listing. `rows` is rebound several
+    # times below.
+    rows = listing_rows = [(held, None), (running_record, running_status),
             (mixed_record, mixed_status), (dead_record, dead_status),
             (finished_record, finished_status), (up_to_date, None),
             (stopped_record, stopped_status),
@@ -387,36 +398,46 @@ def main():
     # The glyph and the status phrase, and nothing in between. A row with its
     # name, its counts and its status all lit up has four highlights competing,
     # which is the same as having none.
-    for name, colour in (("waiting", display.AMBER),
-                         ("running-one", display.CYAN),
-                         ("half-broken", display.RED),
-                         ("all-done", display.GREEN)):
+    # Read from _MARKS rather than retyped. What this section is about is that
+    # a state's colour appears exactly TWICE on its row -- on the glyph and on
+    # the status phrase -- and hardcoding which colour that is turned a palette
+    # change into a failure of an assertion that was not about the palette.
+    for name, shade in (
+            ("waiting", display._MARKS[runs.HELD_BUCKET][1]),
+            ("running-one", display._MARKS[runs.ACTIVE_BUCKET][1]),
+            ("half-broken", display._MARKS[runs.ATTENTION_BUCKET][1]),
+            ("all-done", display._MARKS[runs.FINISHED_BUCKET][1])):
+        if not colour:
+            continue
         r.equal(f"{name}'s state colour is spent exactly twice",
-                painted_row(name).count(colour), 2)
+                painted_row(name).count(shade), 2)
 
-    r.check("held is amber, not the red of something that went wrong",
-            display.RED not in painted_row("waiting"))
-    r.check("and a failure is red rather than the amber of a decision",
-            display.AMBER not in painted_row("half-broken"))
+    if colour:
+        r.check("held is amber, not the red of something that went wrong",
+                display.RED not in painted_row("waiting"))
+        r.check("and a failure is red rather than the amber of a decision",
+                display.AMBER not in painted_row("half-broken"))
 
     # The reason travels with the word it explains. Splitting them would put
     # "failed" in red and the one fact telling you what to do about it in
     # whatever colour was left over.
     broke = painted_row("half-broken")
-    r.check("a failure's reason carries the same colour as the word 'failed'",
-            broke.index(display.RED) < broke.index("failed")
-            and display.RESET not in broke[broke.index("failed"):
-                                           broke.index("still running")])
+    if colour:
+        r.check("a failure's reason carries the same colour as the word 'failed'",
+                broke.index(display.RED) < broke.index("failed")
+                and display.RESET not in broke[broke.index("failed"):
+                                               broke.index("still running")])
 
     # Everything between the two ends is weight, not hue: bold name, grey
     # pipeline, plain counts.
     r.check("the name is bold rather than coloured",
             display.BOLD in painted_row("waiting"))
-    r.check("and a stopped run is dim, not tagged with a colour of its own",
-            display.DIM in painted_row("i-stopped-it")
-            and not any(c in painted_row("i-stopped-it")
-                        for c in (display.RED, display.AMBER,
-                                  display.GREEN, display.CYAN)))
+    if colour:
+        r.check("and a stopped run is dim, not tagged with a colour of its own",
+                display.DIM in painted_row("i-stopped-it")
+                and not any(c in painted_row("i-stopped-it")
+                            for c in (display.RED, display.AMBER,
+                                      display.GREEN, display.CYAN)))
 
     # The table has to fit the window, or the prompt box below it drifts -- see
     # display.fit and the three redraws that share it.
@@ -441,17 +462,49 @@ def main():
     r.contains("and cover diagnosis too", out, "/diagnose")
 
     # ---------------------------------------------------------------- #
-    r.section("/history keeps gone runs and their findings")
-    out = drawn(display.history, [
-        {"name": "old-one", "status": "gone", "source": "agent",
-         "submitted_at": "2026-06-01T10:00:00", "held_at": None,
-         "job_list": "/s/job_output/X.job_list.T0",
-         "notes": [{"at": "2026-06-01T11:00:00",
-                    "text": "OOM in picard_mark_duplicates: raise java heap"}]},
-    ])
+    # THIS SECTION CHANGED WITH THE BEHAVIOUR IT DESCRIBES, deliberately.
+    #
+    # It used to assert that a run's /diagnose finding is printed underneath
+    # its /history row, and that assertion was holding a defect in place. On a
+    # real registry it produced two lines of prose under sixty runs, almost all
+    # of them "The log does not name a cause on its own." -- and the summary
+    # became unreadable, which is the one thing an archive may not be.
+    #
+    # The finding itself was never the problem and is not lost: what changed is
+    # which screen it is on. So the pair of checks below is stricter than the
+    # single one it replaces -- the summary must NOT carry the prose, and
+    # /history <name> MUST still be able to produce it.
+    archived = {"name": "old-one", "status": "gone", "source": "agent",
+                "submitted_at": "2026-06-01T10:00:00", "held_at": None,
+                "job_list": "/s/job_output/X.job_list.T0",
+                "notes": [{"at": "2026-06-01T11:00:00",
+                           "text": "OOM in picard_mark_duplicates: raise java heap"}]}
+
+    r.section("/history summarises; it does not dump diagnoses")
+    out = drawn(display.history, [dict(archived)])
     r.contains("names the run", out, "old-one")
-    r.contains("marked gone", out, "gone")
+    r.contains("marked as an archived record", out, "artifacts gone")
+    r.contains("says how it got here", out, "built here")
+    r.check("the diagnosis prose stays off the summary",
+            "picard_mark_duplicates" not in out)
+    r.check("and a stale status is never called live", "live" not in out)
+    r.contains("it points at where the detail is", out, "/diagnose <name>")
+
+    r.section("/history <name> is where the finding survives")
+    out = drawn(display.history_detail, dict(archived))
+    r.contains("names the run", out, "old-one")
     r.contains("and the finding survives with it", out, "picard_mark_duplicates")
+    r.contains("with the job list it belongs to", out, "X.job_list.T0")
+
+    r.section("a submitted record is not reported as running")
+    out = drawn(display.history, [
+        {"name": "sub-one", "status": "submitted", "source": "agent",
+         "submitted_at": "2026-06-01T10:00:00",
+         "last_check": {"at": "2026-06-02T10:00:00", "verdict": "failed"}},
+    ])
+    r.contains("the lifecycle fact is stated", out, "submitted")
+    r.check("the word 'live' appears nowhere", "live" not in out)
+    r.contains("the cached outcome is dated and past tense", out, "when last checked")
 
     # ---------------------------------------------------------------- #
     r.section("/check draws the run's progress")
@@ -620,8 +673,9 @@ def main():
     with redirect_stdout(painted_banner):
         display.banner("Anthropic", "claude-sonnet-5")
     raw = painted_banner.getvalue()
-    r.check("no red anywhere on a healthy banner", display.RED not in raw)
-    r.check("and no amber either", display.AMBER not in raw)
+    if colour:
+        r.check("no red anywhere on a healthy banner", display.RED not in raw)
+        r.check("and no amber either", display.AMBER not in raw)
     _os.environ.pop("COLUMNS", None)
 
     r.section("dev mode is stated loudly, and only when it applies")
@@ -1269,9 +1323,10 @@ def main():
         return buf.getvalue()
 
     healthy = painted(display.gate, proposal, "patient-42")
-    r.check("a complete run with no blockers draws no red at all",
-            display.RED not in healthy,
-            healthy[:400])
+    if colour:
+        r.check("a complete run with no blockers draws no red at all",
+                display.RED not in healthy,
+                healthy[:400])
     r.contains("the header is not an error colour", healthy, display.REVERSE)
     r.contains("but the irreversible verb is amber", healthy, display.AMBER)
 
@@ -1288,13 +1343,48 @@ def main():
     from genpipe import mirror as _mirror
     m = _mirror.from_slots(proposal, name="patient-42")
     rows = "\n".join(display.mirror_lines(m, pending=["protocol"]))
-    r.check("a row about to change is not red", display.RED not in rows, rows)
+    if colour:
+        r.check("a row about to change is not red", display.RED not in rows, rows)
     r.contains("it is underlined instead", rows, display.UNDER)
     r.contains("and carries its own glyph", rows, "◆")
 
     moved = "\n".join(display.mirror_lines(m, changed=["protocol"]))
     r.contains("a row that has changed stays green", moved, display.GREEN)
-    r.check("and is still not red", display.RED not in moved, moved)
+    if colour:
+        r.check("and is still not red", display.RED not in moved, moved)
+
+    # ------------------------------------------------------------------ #
+    r.section("every state is legible with the colour taken away")
+    # The palette's first rule (see display.py's note above RESET): colour
+    # REINFORCES information, it never carries it. So the test is not that the
+    # colours are well chosen -- that is a judgement no assertion can make --
+    # but that removing them costs nothing. What is checked here is the
+    # ANSI-STRIPPED screen, which is what a light terminal that renders one of
+    # these shades badly, a grayscale screenshot, `| tee log.txt` and NO_COLOR
+    # all reduce to.
+    stripped = drawn(display.run_list, listing_rows)
+    for name, glyph, word in (("waiting", "\u25c7", "waiting for approval"),
+                              ("running-one", "\u25b6", "running"),
+                              ("half-broken", "\u2717", "failed"),
+                              ("all-done", "\u2713", "completed"),
+                              ("i-stopped-it", "\u2298", "stopped")):
+        row = next((l for l in stripped.splitlines() if name in l), "")
+        r.check(f"{name} keeps its glyph", glyph in row, row)
+        r.check(f"{name} keeps its word", word in row, row)
+
+    r.section("the palette avoids the shades that only work on one background")
+    # ANSI 37 is a light grey that disappears on a white terminal, and 36
+    # (cyan) is unreadable on it too. Both were in use and both were reported.
+    # Asserted as a property of the palette rather than as a search of every
+    # screen, so a new screen cannot reintroduce them by copying an old one.
+    if colour:
+        r.check("nothing is painted ANSI 37 'white'", display.WHITE != "\033[37m")
+        r.check("...it is the terminal's own foreground, emphasised",
+                display.WHITE == display.BOLD)
+        for bucket in runs.SECTION_ORDER:
+            shade = display._MARKS[bucket][1]
+            r.check(f"{bucket}'s mark is not cyan", "36m" not in shade)
+            r.check(f"{bucket}'s mark is not blue", "34m" not in shade)
 
     return r.finish()
 

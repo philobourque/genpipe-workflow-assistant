@@ -44,6 +44,11 @@ import os
 import re
 
 from . import gate
+# For the -c row's ranking only: intake owns what an ini FILE is (it is the
+# module that reads the directory), and the panel must describe the candidates
+# the same way the scan ordered them. intake imports slots and nothing else
+# from this package, so the dependency runs one way.
+from . import intake
 from . import slots
 
 # Rows the gate will offer to change, in the order they are offered. `name`
@@ -362,15 +367,32 @@ def options_for(row, proposal, candidates=None, pending=None):
                     out.append(slots.Option(
                         ini, f"  {ini}",
                         f"feature ini {protocol} wants — enter adds it"))
+        # Ordered by intake.rank_inis before it got here: hand-written inis
+        # first, then private overrides, then GenPipes' own config traces. The
+        # description says WHICH of those each one is, because the ordering is
+        # invisible once the rows are on screen and "found here" was the same
+        # sentence for a config somebody wrote and a record of a run that
+        # already happened. Nothing is hidden and nothing is chosen -- a trace
+        # ini is still one Enter away for anybody who means it.
         for ini in candidates.get("config") or ():
             if os.path.basename(ini) not in on:
                 on.add(os.path.basename(ini))
                 out.append(slots.Option(ini, f"  {ini}",
-                                        "found here — enter adds it"))
+                                        _ini_blurb(ini)))
         return out
     # name, steps and output are free text. A step range is a range, not a list,
     # and a path is a path -- inventing options for either would be inventing.
     return []
+
+
+def _ini_blurb(path):
+    """What kind of ini this is, for the config row's description column."""
+    tier = intake._ini_tier(path)
+    if tier == 2:
+        return "a past run's resolved config, written by GenPipes — rarely an input"
+    if tier == 1:
+        return "another run's private override — enter adds it"
+    return "found here — enter adds it"
 
 
 def question_for(row, proposal, pending=None):
@@ -479,7 +501,7 @@ def valid_steps(text):
 
 
 def check(row, value, proposal, directory=".", registry=None, name=None,
-          pending=None):
+          pending=None, forking=False):
     """Validate one field's new value. Tiers 1 and 2 only.
 
     Returns a Verdict. A failing tier-1 verdict carries the legal options, so
@@ -570,6 +592,23 @@ def check(row, value, proposal, directory=".", registry=None, name=None,
                            [slots.Option(fixed, fixed, "the same name, legal")]
                            if fixed and fixed != value else ())
         if registry is not None:
+            taken = registry.get(value)
+            if forking:
+                # A FORK IS NOT A RENAME, and conflating the two is what made
+                # the reported message wrong. The guard below protects the tie
+                # between a submitted run's name and its job list -- a real
+                # constraint on renaming that record, and no constraint at all
+                # on what a copy of it is called. Naming a variant of a
+                # finished run is the ordinary case, so refusing it with "it
+                # has already been submitted" answered a question nobody asked.
+                #
+                # What IS worth saying is that the name is spoken for, said
+                # while the choice is still open rather than resolved silently
+                # by unique_name() afterwards.
+                if taken:
+                    return Verdict(True, note=f"'{value}' is taken — the new "
+                                              f"run will be numbered after it")
+                return Verdict(True)
             record = registry.get(name) if name else None
             if record and record.get("status") != "held":
                 return Verdict(False, f"'{name}' has already been submitted — "
@@ -1311,7 +1350,7 @@ def matching(choices, typed):
 
 
 def panel_entries(m, offered, open_row=None, choices=(), typed="",
-                  changes=None, extras=True):
+                  changes=None, extras=True, forking=False):
     """The whole panel as one ordered list of Entry.
 
         m         the Mirror -- the command being changed
@@ -1320,6 +1359,15 @@ def panel_entries(m, offered, open_row=None, choices=(), typed="",
         choices   that row's options, as slots.Option
         typed     what has been typed to narrow them
         changes   row -> new value, for rows already answered
+        forking   this panel builds a SECOND run rather than rewriting this one
+
+    `forking` decides only one thing, and it is the difference between a copy
+    being possible and not. DONE appears when there is something to do, and
+    with nothing changed those are different questions: rewriting a run to be
+    exactly what it already is has nothing to do, whereas copying it under a
+    new name has the copy to do. Without this the fork panel offered no way
+    out but escape, so a rerun of an unchanged command -- an ordinary request
+    -- could not be expressed at all.
 
     A mirror line whose row is not offered is still drawn -- `-g cmd.sh` is
     worth seeing and cannot be changed -- it simply gets no `pick`, so the
@@ -1356,7 +1404,14 @@ def panel_entries(m, offered, open_row=None, choices=(), typed="",
                 out.append(Entry(TYPED, line.row, (TYPED, line.row)))
 
     if extras:
-        if changes:
+        if forking and not changes:
+            # The new name is the change. Worded as what it makes rather than
+            # as what it applies, because there is nothing to apply.
+            out.append(Entry(EXTRA, DONE, (EXTRA, DONE),
+                             label="create it unchanged",
+                             description="the same command under a new name · "
+                                         "nothing is submitted"))
+        elif changes:
             count = len(changes)
             # "apply", not "review". It used to lead to a review screen and
             # then an apply menu, and the label was honest about that -- but

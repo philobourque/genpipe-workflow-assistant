@@ -1,0 +1,324 @@
+{
+  "generated_from": "the installed GenPipes' own argparse definitions",
+  "genpipes_version": "6.1.1",
+  "pipelines": {
+    "ampliconseq": {
+      "class": "AmpliconSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": null
+    },
+    "chipseq": {
+      "class": "ChipSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": {
+        "choices": [
+          "chipseq",
+          "atacseq"
+        ],
+        "default": "chipseq",
+        "flags": "-t/--type"
+      }
+    },
+    "covseq": {
+      "class": "CoVSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": null
+    },
+    "dnaseq": {
+      "class": "DnaSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": {
+        "choices": [
+          "germline_snv",
+          "germline_sv",
+          "germline_high_cov",
+          "somatic_tumor_only",
+          "somatic_fastpass",
+          "somatic_ensemble",
+          "somatic_sv"
+        ],
+        "default": "germline_snv",
+        "flags": "-t/--type"
+      }
+    },
+    "longread_dnaseq": {
+      "class": "LongReadDnaSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": {
+        "choices": [
+          "nanopore",
+          "nanopore_paired_somatic",
+          "revio"
+        ],
+        "default": "nanopore",
+        "flags": "-t/--type"
+      }
+    },
+    "methylseq": {
+      "class": "MethylSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": {
+        "choices": [
+          "bismark",
+          "gembs",
+          "hybrid",
+          "dragen"
+        ],
+        "default": "bismark",
+        "flags": "-t/--type"
+      }
+    },
+    "nanopore_covseq": {
+      "class": "NanoporeCoVSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": {
+        "choices": [
+          "default",
+          "basecalling"
+        ],
+        "default": "default",
+        "flags": "-t/--type"
+      }
+    },
+    "rnaseq": {
+      "class": "RnaSeq",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": {
+        "choices": [
+          "stringtie",
+          "variants",
+          "cancer"
+        ],
+        "default": "stringtie",
+        "flags": "-t/--type"
+      }
+    },
+    "rnaseq_denovo_assembly": {
+      "class": "RnaSeqDeNovoAssembly",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": {
+        "choices": [
+          "trinity",
+          "seq2fun"
+        ],
+        "default": "trinity",
+        "flags": "-t/--type"
+      }
+    },
+    "rnaseq_light": {
+      "class": "RnaSeqLight",
+      "optional_defaults": {
+        "design_file": {
+          "default": null,
+          "flags": "-d/--design"
+        },
+        "job_scheduler": {
+          "default": "slurm",
+          "flags": "-j/--job-scheduler"
+        },
+        "output_dir": {
+          "default": "<cwd>",
+          "flags": "-o/--output-dir"
+        },
+        "steps": {
+          "default": null,
+          "flags": "-s/--steps"
+        }
+      },
+      "parser_required": [
+        "-c/--config",
+        "-r/--readsets"
+      ],
+      "protocol": null
+    }
+  }
+}
