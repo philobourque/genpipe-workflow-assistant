@@ -8,8 +8,53 @@ biomni==0.0.8
 langgraph==0.3.18
 langgraph-checkpoint-sqlite==2.0.11
 langchain-core==0.3.86
-langchain-anthropic==1.4.7
+# 0.3.x, NOT 1.x, and the difference is the whole 0.3/1.0 langchain split.
+#
+# This said 1.4.7 from the initial commit and had never once been installed:
+# the cluster venv was built incrementally and resolved its own 0.3.22, and CI
+# did not install the agent stack until the job that runs the gate suites was
+# added. The first clean `pip install -r requirements.txt` in the project's
+# history failed, and it could only ever have failed:
+#
+#     langgraph 0.3.18        depends on langchain-core <0.4,>=0.1
+#     langchain-anthropic 1.4.7 depends on langchain-core <2.0.0,>=1.4.7
+#
+# There is no langchain-core satisfying both, so the file was internally
+# impossible rather than merely stale -- pip answers ResolutionImpossible on
+# any Python and any platform.
+#
+# Fixed by correcting THIS line rather than by moving langchain-core, because
+# langchain-core 0.3.86 is not an independent choice: langgraph 0.3.18 requires
+# the 0.3 line, and langgraph's pin is the one that must not move (see above).
+# 0.3.22 is what the cluster venv has, what every suite has been passing
+# against, and it accepts langchain-core >=0.3.78,<1.0.0.
+langchain-anthropic==0.3.22
 python-dotenv==1.2.2
+
+# BIOMNI 0.0.8'S UNDECLARED IMPORTS. Its metadata declares only pydantic,
+# langchain and python-dotenv, and its modules import three more at module
+# scope -- so `pip install biomni==0.0.8` installs a biomni that cannot be
+# imported. That is an upstream packaging bug, and until it is fixed upstream
+# the only place it can be fixed is here.
+#
+#     pandas, tqdm       biomni/utils.py, which agent.py imports for
+#                        pretty_print
+#     langchain-openai   biomni/model/retriever.py, imported by
+#                        biomni/agent/a1.py -- so `from biomni.agent import A1`
+#                        needs it even though this project is Anthropic-only
+#                        and never constructs an OpenAI client
+#
+# It never showed on the cluster because that venv was built incrementally and
+# had all three from other work. A clean install has none of them.
+#
+# langchain-openai is pinned to the 0.3 line for the same reason
+# langchain-anthropic is: its 1.x releases require langchain-core >=1.0, which
+# langgraph 0.3.18 forbids. 0.3.35 accepts langchain-core >=0.3.78,<1.0.0.
+# pandas and tqdm are pinned only so CI resolves the same set twice; nothing
+# here depends on their versions.
+langchain-openai==0.3.35
+pandas==2.3.3
+tqdm==4.67.1
 
 # Optional web UI (web/). Skip these two if you only use the CLI
 # (start_agent.sh), which is everything except the browser front end.
