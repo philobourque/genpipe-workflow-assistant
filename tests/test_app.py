@@ -33,7 +33,7 @@ import tempfile
 import termios
 import time
 
-from harness import Report
+from harness import Report, submission_environment
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROWS, COLS = 44, 100
@@ -228,6 +228,10 @@ def _answer_slot_panels(app, since, timeout=45):
 
 
 def main():
+    # The app is launched in a pty and driven as far as /approve, so the
+    # child inherits this process's environment and needs an allocation in
+    # it. See harness.submission_environment.
+    submission_environment()
     r = Report("the whole app, through a terminal")
     workdir = tempfile.mkdtemp(prefix="genpipe_app_")
     # The intake step asks about anything a request leaves out, so these exist

@@ -38,6 +38,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from harness import submission_environment
 from langchain_core.messages import AIMessage
 from genpipe.cli import build_agent
 from genpipe import runs as runs_store
@@ -115,6 +116,8 @@ def expect(label, got, want):
 
 
 def main():
+    # Drives a full generate-approve-submit cycle against the fake cluster.
+    submission_environment()
     workdir = tempfile.mkdtemp(prefix="genpipe_mock_")
     prev_cwd = os.getcwd()
     try:

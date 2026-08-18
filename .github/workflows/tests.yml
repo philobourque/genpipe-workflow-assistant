@@ -146,31 +146,19 @@ jobs:
     # submission lifecycle.
     runs-on: ubuntu-latest
 
-    env:
-      # THE SUITES BELOW SUBMIT, AND A SUBMISSION NEEDS AN ALLOCATION.
-      #
-      # preflight.check_rap_id returns a BLOCKING finding when RAP_ID is unset,
-      # so the gate refuses to submit and test_lifecycle, test_regate and
-      # test_mock_pipeline all fail at the moment of approval -- which is the
-      # product working exactly as designed. Slurm rejects a job submitted with
-      # an empty -A, and refusing to spend an approval on one is the invariant
-      # test_preflight exists to protect. It must not be relaxed to make this
-      # job green.
-      #
-      # It went unnoticed until this job ran because RAP_ID is exported by
-      # every Alliance login shell: the cluster venv inherited a real one, so
-      # every local run of these suites had an allocation without anybody
-      # choosing to give it one.
-      #
-      # This value is a shape, not an allocation. Nothing here reaches a real
-      # scheduler -- the suites run against fakecluster.py -- and the only
-      # thing read from it is that it matches the rrg-/def-/ctb-/rpp- form.
-      RAP_ID: rrg-ci-notreal
-      # JOB_MAIL is deliberately NOT set. It only ever warns, never blocks, so
-      # leaving it out keeps that distinction exercised rather than papered
-      # over -- and getting the two severities the right way round is the thing
-      # test_preflight is about.
-
+    # NO ENVIRONMENT IS INJECTED HERE, and that is deliberate.
+    #
+    # This job briefly set RAP_ID, because the suites that approve and submit
+    # fail without one -- preflight blocks a submission with no allocation, and
+    # Slurm really does reject a job carrying an empty -A. Setting it here made
+    # the job green and left the actual defect in place: those suites needed an
+    # allocation, never said so, and had been silently inheriting one from the
+    # Alliance login shell. Anybody running them on a laptop still failed.
+    #
+    # So they ask for it themselves now -- harness.submission_environment(),
+    # called by name from the four suites that submit -- and this job runs them
+    # in whatever environment a runner happens to have, which is the point of
+    # running them on a runner at all.
     steps:
       - uses: actions/checkout@v4
 

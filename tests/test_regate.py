@@ -29,7 +29,8 @@ import shutil
 import sys
 import tempfile
 
-from harness import Report, ScriptedLLM, execute_block, solution
+from harness import (Report, ScriptedLLM, execute_block, solution,
+                     submission_environment)
 
 from genpipe import cli
 from genpipe import display
@@ -63,6 +64,8 @@ def fixture(work, script):
 
 
 def main():
+    # Approves and resubmits after a rework; needs a submission environment.
+    submission_environment()
     r = Report("regate: the decision survives a conversation")
     work = tempfile.mkdtemp(prefix="regate-")
     envdir = tempfile.mkdtemp(prefix="regate-env-")

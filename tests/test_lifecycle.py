@@ -30,7 +30,8 @@ import shutil
 import sys
 import tempfile
 
-from harness import Report, ScriptedLLM, execute_block, solution
+from harness import (Report, ScriptedLLM, execute_block, solution,
+                     submission_environment)
 
 from genpipe import display
 from genpipe import fakecluster
@@ -82,6 +83,10 @@ def fresh_agent(work, llm_script, on_reject=None):
 
 
 def main():
+    # This suite approves and submits, so it needs an environment a
+    # submission may legally happen in. See harness.submission_environment:
+    # it used to inherit one from the login shell without asking.
+    submission_environment()
     r = Report("a run's whole life, offline")
     work = tempfile.mkdtemp(prefix="genpipe_life_")
     # Biomni's A1.__init__ re-roots self.path at <workdir>/biomni_data, and the

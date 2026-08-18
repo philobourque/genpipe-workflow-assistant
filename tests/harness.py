@@ -11,6 +11,63 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+# A RAP_ID that is a shape rather than an allocation. It has to match
+# preflight._RAP_PATTERN -- rrg-/def-/ctb-/rpp- -- and it must be obviously not
+# real, because the one thing worse than a suite that cannot submit is a suite
+# that looks like it is billing somebody.
+FAKE_RAP_ID = "rrg-harness-notreal"
+
+
+def submission_environment():
+    """Make this process's environment one a submission may legally happen in.
+
+    CALLED BY NAME, from the four suites that actually approve and submit, and
+    by nothing else. That is the whole design of it.
+
+    WHY IT EXISTS. preflight.check_rap_id blocks a submission when RAP_ID is
+    unset, because Slurm rejects a job carrying an empty -A and spending an
+    approval on one is worse than refusing it. That is correct, and it is not
+    what these suites are about: they drive hold -> approve -> submit -> check
+    against the fake cluster, and a valid submission environment is part of
+    their scenario rather than a thing they are testing.
+
+    They never said so. RAP_ID is exported by every Alliance login shell, so on
+    the cluster they inherited a real allocation without anybody choosing to
+    give them one, and they passed. Anywhere else -- a laptop, a container, a
+    CI runner -- they failed at the moment of approval, with a run that stayed
+    held and no obvious reason why. The dependency was real and invisible;
+    this makes it explicit and local.
+
+    WHAT IT DELIBERATELY IS NOT:
+
+      not global      it is a function a suite calls, not something that
+                      happens on importing this module. A suite that does not
+                      submit does not get an allocation, so nothing is
+                      quietly granted an environment it never asked for.
+      not a default   setdefault, so a real RAP_ID on a cluster is left
+                      exactly as it is and these suites go on exercising
+                      whatever is really configured there.
+      not JOB_MAIL    which warns and never blocks. Leaving it unset keeps the
+                      warn-versus-block distinction exercised rather than
+                      papered over, and getting those two the right way round
+                      is the thing test_preflight is about.
+
+    It cannot mask the checks that prove a missing RAP_ID blocks: those live in
+    test_preflight, which calls preflight.check() with explicit env dicts --
+    `preflight.check({})` -- and reads os.environ nowhere. Setting a variable
+    in this process is invisible to them by construction, and the assertion
+    below states that so the property cannot be lost quietly.
+    """
+    from genpipe import preflight
+
+    os.environ.setdefault("RAP_ID", FAKE_RAP_ID)
+    # The environment we just built really is submission-capable...
+    assert not preflight.blockers(os.environ), preflight.blockers(os.environ)
+    # ...and an empty one still is not, whatever we did to this process.
+    assert preflight.blockers({}), "a missing RAP_ID must still block"
+    return os.environ["RAP_ID"]
+
+
 class Report:
     """Counts passes and failures and prints one line per check.
 
