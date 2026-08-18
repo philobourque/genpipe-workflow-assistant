@@ -111,6 +111,14 @@ jobs:
         # GenPipes -- but it can no longer drift from the software silently.
         run: python tests/test_requirements.py
 
+      - name: The palette, and whether its colours can actually be read
+        # Computes a WCAG contrast ratio for every colour in both tuned
+        # palettes against the backgrounds theme.py says it chose them for.
+        # This is what stops the palette drifting back to "looks fine on my
+        # machine": a value edited to something prettier and less legible
+        # fails here rather than on somebody's laptop three weeks later.
+        run: python tests/test_theme.py
+
       - name: The line editor's wrapping and caret arithmetic
         run: python tests/test_ui.py
 
@@ -137,7 +145,7 @@ jobs:
         # A stdlib-only module that quietly grows a heavy import would break CI
         # in a confusing way later; catching it as its own step names the cause.
         run: |
-          python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui, modify, prep, readset; print('ok')"
+          python -c "from genpipe import gate, runs, fakecluster, display, preflight, slots, intake, ui, modify, prep, readset, theme; print('ok')"
           python -c "import genpipe, sys; assert 'biomni' not in sys.modules; print('no biomni')"
 
   agent:

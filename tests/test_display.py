@@ -18,6 +18,7 @@ Stdlib only, so it runs in CI.
 Run:  python tests/test_display.py
 """
 import io
+import os
 import re
 import sys
 from contextlib import redirect_stdout
@@ -26,6 +27,24 @@ from harness import Report
 
 from genpipe import display
 from genpipe import runs
+from genpipe import theme
+
+# The width /check's cause block reserves for its label column.
+_CAUSE_W = display._CAUSE_LABEL_W + 2
+
+
+def strip(text):
+    """The screen with every escape sequence removed -- what a NO_COLOR
+    terminal, a grayscale screenshot and `| tee log.txt` all reduce to."""
+    return re.sub(r"\033\[[0-9;]*[A-Za-z]", "", text)
+
+
+def painted(fn, *args, **kwargs):
+    """Call a renderer and return what it printed, escape sequences and all."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        fn(*args, **kwargs)
+    return buf.getvalue()
 
 
 def drawn(fn, *args, **kwargs):
@@ -307,7 +326,8 @@ def main():
     r.check("every row leads with its state in the same words",
             all(any(w in row(n) for w in (
                 "waiting for approval", "running", "queued", "failed",
-                "completed", "stopped", "nothing to run", "unknown"))
+                "completed", "stopped", "already up to date", "unknown",
+                "needs rebuilding", "submission"))
                 for n in ("waiting", "running-one", "half-broken",
                           "fully-dead", "all-done", "i-stopped-it",
                           "nothing-to-do", "cant-tell")))
@@ -356,8 +376,16 @@ def main():
     r.check("marked with the done tick", cells_of("all-done")[0] == "✓")
     r.check("and no completion time is invented for it",
             "completed Aug" not in out and " at " not in row("all-done"))
-    r.contains("a zero-job run says there was nothing to run",
-               row("nothing-to-do"), "nothing to run")
+    # "already up to date", not "nothing to run" and not "no jobs". A run that
+    # generated no work is a SUCCESS -- every output it was asked for was
+    # already on disk -- and both older wordings read as a failure to do
+    # something. _finished_line has always said it this way; the listing now
+    # agrees with it.
+    r.contains("a zero-job run says its outputs were already there",
+               row("nothing-to-do"), "already up to date")
+    for wrong in ("nothing to run", "no jobs", "failed"):
+        r.check(f"and never {wrong!r}, which reads as a fault",
+                wrong not in row("nothing-to-do"), row("nothing-to-do"))
     r.check("and is not given the tick that means jobs succeeded",
             cells_of("nothing-to-do")[0] != "✓")
 
@@ -398,15 +426,15 @@ def main():
     # The glyph and the status phrase, and nothing in between. A row with its
     # name, its counts and its status all lit up has four highlights competing,
     # which is the same as having none.
-    # Read from _MARKS rather than retyped. What this section is about is that
+    # Read from _marks() rather than retyped. What this section is about is that
     # a state's colour appears exactly TWICE on its row -- on the glyph and on
     # the status phrase -- and hardcoding which colour that is turned a palette
     # change into a failure of an assertion that was not about the palette.
     for name, shade in (
-            ("waiting", display._MARKS[runs.HELD_BUCKET][1]),
-            ("running-one", display._MARKS[runs.ACTIVE_BUCKET][1]),
-            ("half-broken", display._MARKS[runs.ATTENTION_BUCKET][1]),
-            ("all-done", display._MARKS[runs.FINISHED_BUCKET][1])):
+            ("waiting", display._marks()[runs.HELD_BUCKET][1]),
+            ("running-one", display._marks()[runs.ACTIVE_BUCKET][1]),
+            ("half-broken", display._marks()[runs.ATTENTION_BUCKET][1]),
+            ("all-done", display._marks()[runs.FINISHED_BUCKET][1])):
         if not colour:
             continue
         r.equal(f"{name}'s state colour is spent exactly twice",
@@ -437,7 +465,7 @@ def main():
                 display.DIM in painted_row("i-stopped-it")
                 and not any(c in painted_row("i-stopped-it")
                             for c in (display.RED, display.AMBER,
-                                      display.GREEN, display.CYAN)))
+                                      display.GREEN)))
 
     # The table has to fit the window, or the prompt box below it drifts -- see
     # display.fit and the three redraws that share it.
@@ -1382,9 +1410,237 @@ def main():
         r.check("...it is the terminal's own foreground, emphasised",
                 display.WHITE == display.BOLD)
         for bucket in runs.SECTION_ORDER:
-            shade = display._MARKS[bucket][1]
+            shade = display._marks()[bucket][1]
             r.check(f"{bucket}'s mark is not cyan", "36m" not in shade)
             r.check(f"{bucket}'s mark is not blue", "34m" not in shade)
+
+
+    # ------------------------------------------------------------------ #
+    r.section("? means one thing: not enough evidence to say more")
+    # The glyph was spent on two unrelated ideas. LAPSED is not one of them:
+    # a proposal whose gate interrupt is gone is FULLY established -- the
+    # command is on record and the only missing thing is the authorisation
+    # slot, which is exactly why it has to be rebuilt rather than approved.
+    # Marking a known state with the uncertainty mark taught the mark to mean
+    # "unusual", which is how a reader stops being able to tell it from the
+    # two rows where the tool genuinely cannot see.
+    lapsed = {"name": "gate-gone", "status": "lapsed",
+              "held_at": "2026-07-20T09:00:00", "submitted_at": None,
+              "job_list": None,
+              "reconciled_because": "no live gate — the decision was not left open",
+              "proposal": {"command": "genpipes ampliconseq"}}
+    unreachable_jobs = {"name": "manifest-lost", "status": "submitted",
+                        "held_at": None, "submitted_at": "2026-07-20T09:00:00",
+                        "job_list": None, "jobs_seen": 46,
+                        "proposal": {"command": "genpipes dnaseq"}}
+    glyphs = drawn(display.run_list,
+                   [(lapsed, None), (unreachable_jobs, None),
+                    (unreachable_record, unreachable_status),
+                    (up_to_date, None)])
+
+    def mark_of(name):
+        return next(l for l in glyphs.splitlines() if name in l).strip()[0]
+
+    r.equal("a lapsed proposal is marked rebuild, not unknown",
+            mark_of("gate-gone"), "\u21bb")
+    r.contains("and the row says what to do about it",
+               glyphs, "needs rebuilding")
+    r.equal("a submission whose manifest is gone IS unknown",
+            mark_of("manifest-lost"), "?")
+    r.equal("and so is a scheduler that could not be reached",
+            mark_of("cant-tell"), "?")
+    r.check("those two are the only rows ? is spent on",
+            [l for l in glyphs.splitlines() if l.strip()[:1] == "?"].__len__() == 2,
+            glyphs)
+    # Not "no jobs" and not "nothing to run". GenPipes generating no work means
+    # every output asked for was already on disk, which is a run that succeeded
+    # without spending an allocation.
+    r.equal("a run with nothing to do is marked terminal-but-empty",
+            mark_of("nothing-to-do"), "\u00b7")
+    r.contains("and is worded as the success it is",
+               glyphs, "already up to date")
+
+    r.section("a submission that did not finish says so, rather than counting to zero")
+    # "failed · 0 jobs" was the old rendering, and the number in it is about the
+    # wrong noun -- nothing failed 0 jobs. These three statuses reach the
+    # listing with no RunStatus at all, and what is known about them is what
+    # happened to the SUBMISSION.
+    trouble = []
+    for status_word, expect in (("submit_failed", "submission failed"),
+                                ("submit_unknown", "submission unconfirmed"),
+                                ("submitting", "submission interrupted")):
+        trouble.append(({"name": f"run-{status_word}", "status": status_word,
+                         "held_at": None, "submitted_at": "2026-07-24T09:00:00",
+                         "job_list": None,
+                         "proposal": {"command": "genpipes ampliconseq"}}, None))
+    out_t = drawn(display.run_list, trouble)
+    for status_word, expect in (("submit_failed", "submission failed"),
+                                ("submit_unknown", "submission unconfirmed"),
+                                ("submitting", "submission interrupted")):
+        row_t = next(l for l in out_t.splitlines() if f"run-{status_word}" in l)
+        r.contains(f"{status_word} is named as an event", row_t, expect)
+        r.check("and never as a job count", "0 jobs" not in row_t, row_t)
+    r.contains("with nothing on the scheduler said explicitly",
+               out_t, "nothing on the scheduler")
+    # SUBMIT_FAILED "says nothing about what it managed to submit first" (see
+    # runs.py's status table), and a failed submission with jobs already out is
+    # a different problem from one with none -- it decides whether retrying is
+    # safe.
+    partial = drawn(display.run_list,
+                    [({"name": "half-out", "status": "submit_failed",
+                       "held_at": None, "submitted_at": "2026-07-24T09:00:00",
+                       "job_list": None, "jobs_seen": 12,
+                       "proposal": {"command": "genpipes dnaseq"}}, None)])
+    r.contains("and jobs that did go out are counted", partial, "12 jobs went out first")
+
+    # ------------------------------------------------------------------ #
+    r.section("/check separates the failure from what followed from it")
+    # The old block hung all of this off one label, "root cause": the step, the
+    # limit, the individual jobs, and the downstream cancellations. Four of
+    # those are evidence about the failure and the fifth is its CONSEQUENCE,
+    # and nothing on screen said which was which.
+    cause_status = runs.RunStatus(
+        counts={"COMPLETED": 1, "TIMEOUT": 2, "CANCELLED": 43}, total=46,
+        resolved=46, unknown=0, finished=True, doomed=0, source="sacct",
+        at="09:38", reasons={}, verdict="failed, nothing still running",
+        root_cause={"step": "gatk_sam_to_fastq", "state": "TIMEOUT", "count": 2,
+                    "timelimit": "00:01:00", "cancelled_after": 43,
+                    "job": "gatk_sam_to_fastq.tumorPair_COLO829N",
+                    "elapsed": "00:01:01", "maxrss": None,
+                    "jobs": [{"name": "gatk_sam_to_fastq.tumorPair_COLO829N",
+                              "elapsed": "00:01:01"},
+                             {"name": "gatk_sam_to_fastq.tumorPair_COLO829T",
+                              "elapsed": "00:01:01"}]})
+    chk = strip(drawn(display.run_status, "walltimefail", cause_status))
+    # The LABEL COLUMN, not a substring search: "timed out" is also the last
+    # two words of the first-failure line, and a naive index() finds that one
+    # and reports the block as out of order.
+    labels = [l.split("▌")[-1][:_CAUSE_W].strip()
+              for l in chk.splitlines() if "▌" in l]
+    labels = [w for w in labels if w in
+              ("first failure", "walltime limit", "timed out", "impact")]
+    r.equal("four labels, in causal order", labels,
+            ["first failure", "walltime limit", "timed out", "impact"])
+    r.contains("what broke is the step, with how many of it",
+               chk, "gatk_sam_to_fastq")
+    r.contains("and how it broke, in the scheduler's own word",
+               chk, "2 jobs timed out")
+    r.contains("the limit is labelled as a limit", chk, "walltime limit      00:01:00")
+    r.contains("the jobs are labelled as the jobs that timed out",
+               chk, "tumorPair_COLO829N")
+    r.contains("and their elapsed time says it is elapsed time",
+               chk, "ran 00:01:01")
+    r.contains("the cancellations are impact, not cause", chk, "impact")
+    # /check reads sacct and nothing else. "root cause" claims to have found
+    # the reason, which is a claim about logs -- and /diagnose is the command
+    # that reads those.
+    r.check("nothing on this screen claims to be a root cause",
+            "root cause" not in chk, chk)
+    r.contains("and the log-level question is handed to /diagnose",
+               chk, "/diagnose walltimefail")
+
+    no_limit = runs.RunStatus(
+        counts={"OUT_OF_MEMORY": 1}, total=1, resolved=1, unknown=0,
+        finished=True, doomed=0, source="sacct", at="09:38", reasons={},
+        verdict="failed",
+        root_cause={"step": "picard_sort_sam", "state": "OUT_OF_MEMORY",
+                    "count": 1, "timelimit": None, "cancelled_after": 0,
+                    "maxrss": "31.4G",
+                    "jobs": [{"name": "picard_sort_sam.NA12878",
+                              "elapsed": "02:10:00", "maxrss": "31.4G"}]})
+    oom = strip(drawn(display.run_status, "oom", no_limit))
+    r.check("a walltime is not offered as the explanation for an OOM",
+            "walltime limit" not in oom, oom)
+    r.contains("the state's own word labels the jobs", oom, "out of memory")
+    r.contains("and the memory it actually reached is labelled", oom, "peak 31.4G")
+    r.check("an impact row appears only when something was cancelled",
+            "impact" not in oom, oom)
+
+    # ------------------------------------------------------------------ #
+    r.section("the helix is one continuous right-handed double helix")
+    art = display._HELIX
+    r.check("every row is the same width",
+            {len(row) for row in art} == {display.HELIX_W}, [len(x) for x in art])
+    r.check("and that width is what the module says it is",
+            display.HELIX_W == 13)
+    r.check("it is shorter than the panel beside it", len(art) <= 12)
+    r.check("no glyph outside the depth ramp and the rungs",
+            set("".join(art)) <= set(" \u2593\u2592\u2591\u00b7"), set("".join(art)))
+    r.check("two strands on every row, never one and never three",
+            all(sum(row.count(g) for g in "\u2593\u2592\u2591") == 2 for row in art),
+            [sum(row.count(g) for g in "\u2593\u2592\u2591") for row in art])
+
+    def strands(row):
+        return sorted(i for i, c in enumerate(row) if c in "\u2593\u2592\u2591")
+
+    # RIGHT-HANDED, which is the one claim here that is about biology rather
+    # than about drawing. In every side view of B-DNA the front-facing segments
+    # run lower-left to upper-right -- so reading DOWN the page, the strand in
+    # front moves right to left. Checked over each run of rows where a front
+    # strand (▓) is visible, and it must never once move the other way.
+    fronts = [row.index("\u2593") for row in art if "\u2593" in row]
+    runs_down, current = [], [fronts[0]]
+    for prev, nxt in zip(fronts, fronts[1:]):
+        (current.append(nxt) if nxt < prev else runs_down.append(current) or
+         current.__setitem__(slice(None), [nxt]))
+    runs_down.append(current)
+    r.check("the front strand only ever sweeps right to left, going down",
+            all(all(b < a for a, b in zip(seq, seq[1:])) for seq in runs_down),
+            fronts)
+    r.check("and it does so more than once, so the twist is a twist",
+            len(runs_down) >= 2, runs_down)
+    # The two backbones wind around ONE axis: every row's pair is symmetric
+    # about the same centre column.
+    centres = {sum(strands(row)) / 2 for row in art}
+    r.check("both backbones wind around one common axis", centres == {6.0}, centres)
+    # A rung is drawn only where a base pair is not edge-on to the viewer.
+    for row in art:
+        lo, hi = strands(row)
+        gap = hi - lo - 1
+        r.check(f"rungs span exactly the gap on {row!r}",
+                row.count("\u00b7") == (gap if gap >= 2 else 0), row)
+
+    r.section("and it survives the colour being taken away")
+    plain_logo = strip("\n".join(display._helix()))
+    r.check("depth is drawn in density as well as hue",
+            all(g in plain_logo for g in "\u2593\u2592\u2591"), plain_logo)
+    r.check("stripped, it is exactly the art", plain_logo.splitlines() == art)
+
+    # ------------------------------------------------------------------ #
+    r.section("both palettes reach every screen, and NO_COLOR reaches it too")
+    was = dict(os.environ)
+    try:
+        for name, env in (("dark", {"GENPIPE_THEME": "dark", "COLORTERM": "truecolor"}),
+                          ("light", {"GENPIPE_THEME": "light", "COLORTERM": "truecolor"}),
+                          ("none", {"NO_COLOR": "1"})):
+            got = display.retheme(env)
+            r.equal(f"retheme picks {name}", got, name)
+            screen = painted(display.run_list, listing_rows)
+            screen += painted(display.run_status, "walltimefail", cause_status)
+            screen += painted(display.banner, "Anthropic", "claude-sonnet-5")
+            if name == "none":
+                r.check("no escape sequence is emitted at all",
+                        "\033[" not in screen, screen[:200])
+            else:
+                r.contains(f"{name} paints in 24-bit colour", screen, "\033[38;2;")
+                r.check("and never in a shade chosen for the other background",
+                        theme.palette(
+                            {"GENPIPE_THEME": "light" if name == "dark" else "dark",
+                             "COLORTERM": "truecolor"})["muted"] not in screen)
+            # WHATEVER THE PALETTE, THE WORDS AND GLYPHS ARE THE SAME. This is
+            # the property that makes a wrongly-guessed theme a readability
+            # problem rather than a correctness one.
+            bare = strip(screen)
+            for needle in ("waiting for approval", "\u25c7", "first failure",
+                           "impact", "GenPipes assistant"):
+                r.contains(f"{name}: {needle!r} is there with or without colour",
+                           bare, needle)
+    finally:
+        os.environ.clear()
+        os.environ.update(was)
+        display.retheme()
+    r.check("and the palette is put back for whatever runs next",
+            display.THEME == theme.resolve())
 
     return r.finish()
 

@@ -68,6 +68,8 @@ from . import modify
 # that writes it, so a renderer cannot invent a fifth outcome the store has
 # never heard of.
 from . import runs
+# The palette, and the rule for choosing one. Stdlib-only like this module.
+from . import theme
 
 # ---------------------------------------------------------------------------
 # ANSI escape codes. \033[<n>m sets an attribute; \033[0m clears everything.
@@ -75,63 +77,50 @@ from . import runs
 # ---------------------------------------------------------------------------
 # HOW THIS PALETTE SURVIVES A TERMINAL IT KNOWS NOTHING ABOUT.
 #
-# The reported problem was real and was two problems: light blue is hard to
-# read on a dark background, and light grey is hard to read on a white one.
-# Both came from picking colours that only contrast with ONE background.
+# The values live in theme.py, which owns the choosing and states the whole
+# argument -- read that first. What is here is the BINDING: one name per
+# semantic role, resolved once, so that sixty call sites saying GREY do not
+# have to learn that there are now two greys and a rule for picking one.
 #
-# The fix is not to detect the theme. There is no reliable way to -- the
-# control sequence that asks (OSC 11) is unanswered by tmux, by screen, by
-# most CI terminals and by anything reading a pipe, so a detector is a thing
-# that is confidently wrong on the machines people actually use, and it fails
-# by making text invisible.
-#
-# So the rules are these, and they are about which colours are CHOSEN rather
-# than about which terminal is running:
+# The rules that survive from the single-palette version, unchanged, because
+# they are what make the rest a readability question rather than a
+# correctness one:
 #
 #   1. COLOUR IS NEVER THE ONLY CARRIER. Every state has a glyph (see _MARKS)
 #      and a word ("waiting for approval", "failed"). Strip every escape
-#      sequence and the screen still says the same things. That is what makes
-#      the rest of this a readability question rather than a correctness one.
+#      sequence and the screen still says the same things.
 #
-#   2. NOTHING IS PAINTED IN A COLOUR THAT ONLY WORKS ON ONE BACKGROUND.
-#      Bright blue and cyan are illegible on white; plain blue is illegible on
-#      black; ANSI 37 "white" is light grey, which vanishes on a white
-#      terminal. Red and green have adequate contrast against both, so the
-#      palette is built from those, from the terminal's own DEFAULT foreground
-#      -- which contrasts with the background by definition, whatever it is --
-#      and from bold, which is a weight rather than a colour.
+#   2. EMPHASIS IS A WEIGHT, NOT A HUE. WHITE is BOLD in every palette,
+#      including the two tuned ones. It is the one role a wrongly-guessed
+#      theme could render invisible rather than merely faint, so it is never
+#      guessed at -- bold contrasts with whatever is behind it because that
+#      is what the terminal's own foreground colour means. The blast radius
+#      of a wrong theme is confined to furniture.
 #
-#   3. MUTED MEANS 90, NOT 2. \033[2m (dim) is rendered as a large opacity drop
-#      by some terminals and ignored entirely by others, so it is both the
-#      least readable thing here and the least predictable. It stays for
-#      genuine background furniture; 90 (bright black) is the muted colour,
-#      because it is a real mid-grey and therefore the one shade that is
-#      legible against black and white alike.
+#   3. NO_COLOR AND TERM=dumb ARE HONOURED. See theme.colour_wanted().
 #
-#   4. NO_COLOR IS HONOURED. See _colour_wanted().
+# WHAT CHANGED. There are two greys now and they are real colours rather than
+# attributes. GREY is `muted` -- the readable quiet, what a pipeline name or
+# a hint is set in. DIM is `faint` -- furniture: rules, box edges, the
+# receipt line under a choice. On the tuned palettes both are RGB values
+# measured against their background; on SAFE they are exactly what they were
+# before (90 and SGR 2).
+#
+# AND SGR 2 IS STILL AVAILABLE, as FAINT. A handful of places want a hue
+# ATTENUATED rather than replaced -- a quiet green frame, the red of a
+# cancelled bar segment -- and `{GREEN}{DIM}` cannot mean that once DIM is
+# itself a colour, because the last sequence wins. Those sites say
+# `{GREEN}{FAINT}` and keep their hue.
 # ---------------------------------------------------------------------------
 
+_PALETTE = theme.palette()
 
-def _colour_wanted():
-    """Should anything be coloured at all?
+# Which of theme.py's four answers this session got: "dark", "light", "safe"
+# or "none". Printed by /where, asserted by the suites, and the one thing
+# somebody debugging "why is my terminal beige" needs to see.
+THEME = _PALETTE["theme"]
 
-    NO_COLOR is the informal standard (no-color.org): any value, even empty,
-    means do not emit colour. TERM=dumb is the older one. Both are honoured
-    because the alternative is escape sequences landing in a log file, and a
-    person who has set either has already said what they want.
-
-    Deliberately NOT conditioned on isatty(). Output is piped constantly here
-    -- `| tee`, `| less -R`, the test harness -- and stripping colour from a
-    pipe would take it away from `less -R`, which handles it perfectly well.
-    fit() and cells() already discount escape sequences when measuring, so a
-    redirected screen keeps its layout either way.
-    """
-    if os.environ.get("NO_COLOR") is not None:
-        return False
-    return os.environ.get("TERM", "") != "dumb"
-
-
-_COLOUR = _colour_wanted()
+_COLOUR = THEME != theme.NONE
 
 
 def _sgr(code):
@@ -140,33 +129,84 @@ def _sgr(code):
 
 RESET = _sgr("\033[0m")
 BOLD = _sgr("\033[1m")
-DIM = _sgr("\033[2m")
-RED = _sgr("\033[31m")
-# Bold yellow rather than plain. Plain 33 on a white background is the weakest
-# thing on that screen, and this is the colour of the one state that is waiting
-# for somebody to act -- the row that must not be the hardest to see. Bold is
-# rendered as a heavier or brighter yellow by every terminal that renders bold
-# at all, and by none as a lighter one.
-AMBER = _sgr("\033[1;33m")
-GREEN = _sgr("\033[32m")
-# Kept, and no longer used for any STATE. See _MARKS: cyan was the colour of a
-# live run, and cyan on a white terminal is the reported "light blue is hard to
-# read" defect. Anything still reaching for it should ask whether it wants the
-# default foreground instead.
-CYAN = _sgr("\033[36m")
-GREY = _sgr("\033[90m")
-# NOT \033[37m, which is ANSI "white" -- a LIGHT GREY that disappears against a
-# white background, and the other half of the reported defect. This is the
-# emphasis this name was always reaching for: the terminal's own foreground
-# colour, made heavier. It contrasts with the background whatever the
-# background is, because that is what a default foreground means.
-#
-# The name is left alone deliberately. Sixty call sites say WHITE where they
-# mean "the emphasised one", and renaming them would be a large diff over
-# working code to relabel a decision that is stated here.
-WHITE = BOLD
 REVERSE = _sgr("\033[7m")
 UNDER = _sgr("\033[4m")
+# The SGR 2 attribute itself. Not a role -- see the note above.
+FAINT = _sgr("\033[2m")
+
+RED = _PALETTE["error"]
+AMBER = _PALETTE["warning"]
+GREEN = _PALETTE["success"]
+GREY = _PALETTE["muted"]
+DIM = _PALETTE["faint"]
+SECONDARY = _PALETTE["secondary"]
+FOCUS = _PALETTE["focus"]
+# The old name for what is now the secondary role. It named a hue (cyan) that
+# was retired for being illegible on white; the role it was reaching for --
+# "quiet, but a different quiet from grey" -- is what SECONDARY is. Kept as an
+# alias rather than deleted so nothing that still says CYAN silently loses its
+# colour.
+CYAN = SECONDARY
+
+# The helix's four depth roles. Named rather than expressed as shades of GREEN
+# because they are a ramp -- front strand, turn, back strand, rung -- and the
+# ramp has to run the OTHER WAY on a light background, where further away is
+# lighter rather than darker. See theme.py's tables.
+DNA_FG = _PALETTE["dna_fg"]
+DNA_MID = _PALETTE["dna_mid"]
+DNA_BG = _PALETTE["dna_bg"]
+DNA_RUNG = _PALETTE["dna_rung"]
+
+# Emphasis, and deliberately not a colour. See rule 2 above; the name is left
+# alone because sixty call sites say WHITE where they mean "the emphasised
+# one", and renaming them would be a large diff over working code to relabel a
+# decision that is stated here.
+WHITE = BOLD
+
+# The names this module rebinds when the palette changes. Listed once so
+# retheme() cannot fall out of step with the block above by forgetting one.
+_THEMED = ("THEME", "_COLOUR", "RESET", "BOLD", "REVERSE", "UNDER", "FAINT",
+           "RED", "AMBER", "GREEN", "GREY", "DIM", "SECONDARY", "FOCUS",
+           "CYAN", "DNA_FG", "DNA_MID", "DNA_BG", "DNA_RUNG")
+
+
+def retheme(env=None):
+    """Recompute every colour from `env` (default: os.environ). Returns THEME.
+
+    The constants above are read at call time by everything in this module and
+    reached as `display.GREY` from everywhere else -- nothing from-imports them
+    -- so rebinding the module globals is enough to restyle the whole app.
+
+    Exists for two callers and no others: the suites, which have to render the
+    same screen under dark, light and NO_COLOR without three subprocesses; and
+    anything that changes the environment after import. It is not a feature of
+    the product and there is no command for it -- the palette is chosen once,
+    from the environment, at startup.
+    """
+    pal = theme.palette(env)
+    g = globals()
+    g["_PALETTE"] = pal
+    g["THEME"] = pal["theme"]
+    g["_COLOUR"] = pal["theme"] != theme.NONE
+    on = g["_COLOUR"]
+    g["RESET"] = "\033[0m" if on else ""
+    g["BOLD"] = "\033[1m" if on else ""
+    g["REVERSE"] = "\033[7m" if on else ""
+    g["UNDER"] = "\033[4m" if on else ""
+    g["FAINT"] = "\033[2m" if on else ""
+    g["RED"] = pal["error"]
+    g["AMBER"] = pal["warning"]
+    g["GREEN"] = pal["success"]
+    g["GREY"] = pal["muted"]
+    g["DIM"] = pal["faint"]
+    g["SECONDARY"] = g["CYAN"] = pal["secondary"]
+    g["FOCUS"] = pal["focus"]
+    g["DNA_FG"] = pal["dna_fg"]
+    g["DNA_MID"] = pal["dna_mid"]
+    g["DNA_BG"] = pal["dna_bg"]
+    g["DNA_RUNG"] = pal["dna_rung"]
+    g["WHITE"] = g["BOLD"]
+    return g["THEME"]
 
 WIDTH = 74
 
@@ -319,25 +359,79 @@ def terminal_cols():
 
 VERSION = "v0"
 
-# Two strands crossing. "\u259a" leans one way, "\u259e" the other, so a column of them
-# reads as a diagonal; the dashes between are the base pairs. Six rows is one
-# crossing -- enough to be unmistakably DNA, short enough to sit in a banner.
+# ---------------------------------------------------------------------------
+# THE HELIX. One continuous right-handed B-DNA double helix, side-on.
+#
+# The art below is a literal rather than something computed at startup -- it is
+# greppable, it diffs, and it cannot drift -- but it was GENERATED, and these
+# are the parameters, so that a later change is a re-render rather than a
+# freehand edit:
+#
+#     rows 11    period 10 rows/turn    amplitude 6 columns    phase +pi/2
+#     x_A(r) = cx - A sin(th)      depth_A =  cos(th)
+#     x_B(r) = cx + A sin(th)      depth_B = -cos(th)      th = pi/2 + 2 pi r/P
+#
+# WHY THE MINUS SIGN ON STRAND A, which is the entire biological content of
+# this block. With `+`, the strand that is in FRONT sweeps left-to-right as you
+# read DOWN the page -- a `\` front diagonal, which is a LEFT-handed helix.
+# B-DNA is right-handed, and in every side view of it the front-facing segments
+# run lower-left to upper-right. Reading downwards, the front strand moves
+# right to left. That is what the sign buys.
+#
+# The phase offset starts the figure at maximum separation, which puts the two
+# crossings at rows 2.5 and 7.5 -- between sampled rows, so the strands never
+# land in the same column and the twist is legible at every row. One full turn,
+# two crossings, and front-ness passes from one strand to the other at each of
+# them and never passes back: strand B is in front from row 1 to row 4 while
+# sweeping column 11 to column 1, then strand A takes over on the same
+# trajectory. Neither strand ever reverses.
+#
+# DEPTH IS DRAWN TWICE, in density and in colour, and that is deliberate: the
+# same rule the status glyphs follow (see _MARKS). Stripped of every escape
+# sequence the ramp is still there, because a light-shaded block IS further
+# away than a dark-shaded one to anybody who has ever seen a terminal.
+#
+#     ▓  front strand      ▒  the turn      ░  back strand      ·  base pairs
+#
+# The rungs stop where the strands come within three columns of each other,
+# which is not a rendering compromise: at the crossing a base pair is edge-on
+# to the viewer and there is nothing to draw.
+# ---------------------------------------------------------------------------
 _HELIX = [
-    "\u259a\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u259e",
-    "  \u259a\u254c\u254c\u254c\u259e  ",
-    "   \u259a\u254c\u259e   ",
-    "   \u259e\u254c\u259a   ",
-    "  \u259e\u254c\u254c\u254c\u259a  ",
-    "\u259e\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u259a",
+    "▒···········▒",
+    " ░·········▓ ",
+    "    ░···▓    ",
+    "    ▓···░    ",
+    " ▓·········░ ",
+    "▒···········▒",
+    " ░·········▓ ",
+    "    ░···▓    ",
+    "    ▓···░    ",
+    " ▓·········░ ",
+    "▒···········▒",
 ]
 
-_STRAND = {"\u259a": f"{BOLD}{GREEN}", "\u259e": f"{GREEN}{DIM}", "\u254c": f"{GREY}{DIM}"}
+# 13 columns. Asserted rather than assumed: _left_column centres this against
+# _LEFT_W, and a row that is one column wider than its neighbours centres half
+# a column off and makes the whole figure look bent.
+HELIX_W = 13
+
+
+def _strand():
+    """glyph -> colour, read at call time so retheme() reaches the logo too.
+
+    Four roles, not four shades of GREEN spelled out here, because the ramp
+    runs the OTHER WAY on a light background -- further away is lighter there
+    and darker on black. theme.py holds both directions; this only says which
+    role each glyph is.
+    """
+    return {"\u2593": DNA_FG, "\u2592": DNA_MID, "\u2591": DNA_BG, "\u00b7": DNA_RUNG}
 
 
 def _helix():
-    """The helix, coloured per glyph: one strand bright, the other shaded, the
-    base pairs quiet. Two tones is what stops it reading as a flat texture."""
-    return ["".join(f"{_STRAND[c]}{c}{RESET}" if c in _STRAND else c for c in row)
+    """The helix, coloured per glyph."""
+    strand = _strand()
+    return ["".join(f"{strand[c]}{c}{RESET}" if c in strand else c for c in row)
             for row in _HELIX]
 
 
@@ -447,7 +541,7 @@ def _centre(cell, w):
     return " " * max(0, (w - _vis_len(cell)) // 2) + cell
 
 
-def _left_column(user, source, model, path):
+def _left_column(user, source, model, path, returning=True):
     """The identity half: who you are, what this is.
 
     The model and the working directory used to close this column and now live
@@ -457,7 +551,12 @@ def _left_column(user, source, model, path):
     what made the box look badly balanced once the wordmark grew.
     """
     lines = [""]
-    lines.append(f"{BOLD}Welcome back, {user}{RESET}")
+    # "Welcome back" on a screen somebody is seeing for the first time is a
+    # small lie, and it is the first sentence the product says. GENPIPE_USER is
+    # only set once they have been introduced -- _require_name asks below this
+    # banner -- so its absence is exactly "we have not met".
+    lines.append(f"{BOLD}{'Welcome back' if returning else 'Welcome'}, "
+                 f"{user}{RESET}")
     lines.append("")
     lines += [_centre(f"{BOLD}{GREEN}{row}{RESET}", _LEFT_W) for row in _WORDMARK]
     # The name in real letters under the glyphs that draw it. The wordmark is a
@@ -471,7 +570,7 @@ def _left_column(user, source, model, path):
     # solely as box-drawing glyphs, which is exactly what the paragraph above
     # says must never be the case.
     lines.append(_centre(
-        f"{GREY}GenPipes assistant{RESET}  {GREY}{DIM}{VERSION}{RESET}",
+        f"{GREY}GenPipes assistant{RESET}  {DIM}{VERSION}{RESET}",
         _LEFT_W))
     lines.append("")
     # Centred with the wordmark, not on its old fixed indent: the two are one
@@ -536,7 +635,7 @@ def _right_column(w, source=None, model=None, path=None):
     # -- and because putting it here is what makes the two columns the same
     # height instead of padding one to match the other.
     lines.append("")
-    lines.append(f"{GREY}{DIM}{chr(0x2500) * w}{RESET}")
+    lines.append(f"{DIM}{chr(0x2500) * w}{RESET}")
     lines.append("")
     # Both read from what this session settled on, never hardcoded. On a first
     # launch there is no key yet and no model chosen, and saying so is the
@@ -560,6 +659,7 @@ def banner(source=None, model=None):
     them. ready() states them again once they're settled.
     """
     user = who()
+    returning = bool((os.environ.get("GENPIPE_USER") or "").strip())
     # The checkout, not the package directory: what someone reads off the
     # banner is the thing they would cd into or git pull.
     path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -577,20 +677,20 @@ def banner(source=None, model=None):
     # forced, so stack instead: same content, no box.
     if right_w < 49:
         print()
-        for line in _left_column(user, source, model, path):
+        for line in _left_column(user, source, model, path, returning):
             print(f"  {line}" if line else "")
         for line in _right_column(min(cols - 4, 60), source, model, path):
             print(f"  {line}" if line else "")
         print()
         return
 
-    left = _left_column(user, source, model, path)
+    left = _left_column(user, source, model, path, returning)
     right = _right_column(right_w, source, model, path)
     rows = max(len(left), len(right))
     left += [""] * (rows - len(left))
     right += [""] * (rows - len(right))
 
-    edge = f"{GREEN}{DIM}"
+    edge = f"{GREEN}{FAINT}"
     print()
     print(f" {edge}\u256d{'\u2500' * (left_w + 2)}\u252c{'\u2500' * (right_w + 2)}\u256e{RESET}")
     for l, r in zip(left, right):
@@ -973,7 +1073,6 @@ def parse(message):
 # glyphs, on every block of every turn. Nothing was emphasised because
 # everything was.
 _CONSEQUENTIAL = ("GENERATE", "SUBMIT")
-_LOUD = AMBER
 
 # The rule colour of a block whose closing blank line has not been printed yet,
 # or None. A command and the output it produced are one act, but they arrive as
@@ -1243,7 +1342,7 @@ def _draw(event):
         label = event.get("label") or "CODE"
         # Held open: the output of this command, if there is any, belongs to
         # the same block and arrives on the next message.
-        _rule(_LOUD if label in _CONSEQUENTIAL else GREY,
+        _rule(AMBER if label in _CONSEQUENTIAL else GREY,
               "\u258f", label.lower(), event["text"], dim_body=True, hold=True)
 
     elif k == "observation":
@@ -1488,7 +1587,7 @@ def farewell():
     being only that.
     """
     print()
-    print(f"  {GREEN}{DIM}{random.choice(_GOODBYES)}{RESET}\n")
+    print(f"  {GREEN}{FAINT}{random.choice(_GOODBYES)}{RESET}\n")
 
 
 def fresh(pending=()):
@@ -2707,7 +2806,7 @@ def _bar(status):
     return (f"{WHITE}{'▓' * n_done}{RESET}"
             f"{WHITE}{'▒' * n_live}{RESET}"
             f"{RED}{'█' * n_broke}{RESET}"
-            f"{RED}{DIM}{'▒' * n_cancel}{RESET}"
+            f"{RED}{FAINT}{'▒' * n_cancel}{RESET}"
             f"{RED}{'?' * n_unknown}{RESET}"
             f"{DIM}{'░' * n_rest}{RESET}")
 
@@ -2746,6 +2845,104 @@ def _job_tail(job, step):
     if step and text.startswith(f"{step}."):
         text = text[len(step) + 1:]
     return text if len(text) <= _CAUSE_NAME_W else "…" + text[-(_CAUSE_NAME_W - 1):]
+
+
+# The scheduler's word for a failure, as a phrase a row can be labelled with.
+# Derived from sacct's State and nothing else -- these are translations, not
+# interpretations, which is the whole reason /check may print them.
+_BROKE_LABEL = {
+    "TIMEOUT": "timed out",
+    "OUT_OF_MEMORY": "out of memory",
+    "NODE_FAIL": "node failed",
+    "PREEMPTED": "preempted",
+    "BOOT_FAIL": "boot failed",
+    "DEADLINE": "past deadline",
+    "FAILED": "failed",
+}
+
+_CAUSE_LABEL_W = 20
+
+
+def _cause_row(label, body, gutter, colour=""):
+    return print(f"{gutter}  {colour}{label:<{_CAUSE_LABEL_W}}{RESET}{body}")
+
+
+def _cause_block(cause, gutter):
+    """The failure, in four labelled rows, in causal order.
+
+    WHY IT IS NOT ONE BLOCK UNDER "root cause" ANY MORE. It used to be, and
+    everything in it hung off that one word: the step, the scheduler state, the
+    limit, the individual jobs, and the downstream cancellations. Four of those
+    are evidence about the failure and the fifth is its CONSEQUENCE, and a
+    reader with no way to tell them apart is left asking whether the forty-three
+    cancelled jobs are part of what went wrong. They are not. They are what went
+    wrong next, and they are the reason a run that lost two jobs shows 93%
+    cancelled.
+
+    So one label per question, in the order somebody asks them:
+
+        first failure    what broke, and how many of it       (step, count)
+        walltime limit   what the scheduler measured it       (Timelimit)
+                         against -- only when there IS one
+        timed out        WHICH jobs, and what each of them     (Elapsed,
+                         actually did                           MaxRSS)
+        impact           what followed from it                 (CANCELLED)
+
+    "FIRST FAILURE", NOT "ROOT CAUSE", and the change is not cosmetic. What
+    runs._root_cause computes is the earliest job that broke on its own --
+    orderable, checkable, and entirely within what sacct reports. "Root cause"
+    claims to have found the reason, which is a claim about logs and about
+    science, and this screen has read neither. /diagnose is where that claim
+    may be made; the line offering it is three rows below.
+
+    The `impact` wording keeps its one inference and keeps it visible:
+    "downstream" is read off the shape of a GenPipes DAG, not off sacct, which
+    reports a cancellation without saying what cancelled it.
+    """
+    print(gutter)
+    state = cause.get("state") or ""
+    kind = _BROKE_LABEL.get(state, str(state or "failed").lower().replace("_", " "))
+    count = cause.get("count") or 1
+    _cause_row("first failure",
+               f"{WHITE}{cause['step']}{RESET}  {DIM}·{RESET}  "
+               f"{count} job{'s' if count != 1 else ''} {kind}",
+               gutter, RED)
+
+    # Only for a state that WAS measured against a limit. sacct reports
+    # Timelimit on every job; printing it under an out-of-memory failure would
+    # offer the wrong number as the explanation.
+    if cause.get("timelimit"):
+        _cause_row("walltime limit", f"{DIM}{cause['timelimit']}{RESET}", gutter)
+
+    # The jobs themselves, under a heading that says what the list IS. Named
+    # here rather than left to /jobs, because a failure without its jobs is a
+    # count: "2 jobs timed out" does not say that one is the tumour and one the
+    # matched normal, or that they died 28 seconds apart. Capped, because one
+    # step failing across ninety samples is a normal shape and printing ninety
+    # rows buries the tally above it.
+    listed = cause.get("jobs") or []
+    for i, job in enumerate(listed[:_CAUSE_JOBS]):
+        # "ran 00:01:01", not a bare "00:01:01" in an unlabelled column. The
+        # number sat two rows under a limit in the same format and there was
+        # nothing on screen saying which was which.
+        detail = f"ran {job['elapsed']}" if job.get("elapsed") else ""
+        if job.get("maxrss"):
+            detail = f"{detail}  peak {job['maxrss']}".strip()
+        _cause_row(kind if i == 0 else "",
+                   f"{DIM}{_job_tail(job.get('name'), cause['step']):<{_CAUSE_NAME_W}}"
+                   f"{RESET}{DIM}{detail}{RESET}",
+                   gutter)
+    if len(listed) > _CAUSE_JOBS:
+        _cause_row("", f"{GREY}+{len(listed) - _CAUSE_JOBS} more{RESET}", gutter)
+    if cause.get("maxrss") and not listed:
+        _cause_row(kind, f"{DIM}peak memory {cause['maxrss']}{RESET}", gutter)
+
+    if cause.get("cancelled_after"):
+        n = cause["cancelled_after"]
+        _cause_row("impact",
+                   f"{DIM}{n} job{'s' if n != 1 else ''} cancelled downstream "
+                   f"— they never started{RESET}",
+                   gutter)
 
 
 def run_status(name, status):
@@ -2799,35 +2996,7 @@ def run_status(name, status):
 
     cause = status.root_cause
     if cause:
-        print(gutter)
-        print(f"{gutter}  {RED}{'root cause':<20}{RESET}{WHITE}{cause['step']}{RESET}"
-              f"  {DIM}·{RESET}  {cause['count']} job(s) "
-              f"{(cause['state'] or '').lower()}")
-        if cause.get("timelimit"):
-            print(f"{gutter}  {'':<20}{DIM}against a limit of "
-                  f"{cause['timelimit']}{RESET}")
-        # The jobs themselves. Named here rather than left to /jobs, because a
-        # root cause without its jobs is a count: "2 job(s) timeout" does not
-        # say that one is the tumour and one the matched normal, or that they
-        # died 28 seconds apart. Capped, because one step failing across ninety
-        # samples is a normal shape and printing ninety rows buries the tally
-        # above it.
-        listed = cause.get("jobs") or []
-        for job in listed[:_CAUSE_JOBS]:
-            detail = job.get("elapsed") or ""
-            if job.get("maxrss"):
-                detail = f"{detail}  {job['maxrss']}".strip()
-            print(f"{gutter}  {'':<20}"
-                  f"{DIM}{_job_tail(job.get('name'), cause['step']):<{_CAUSE_NAME_W}}"
-                  f"{RESET}{DIM}{detail}{RESET}")
-        if len(listed) > _CAUSE_JOBS:
-            print(f"{gutter}  {'':<20}{GREY}+{len(listed) - _CAUSE_JOBS} more"
-                  f"{RESET}")
-        if cause.get("maxrss") and not listed:
-            print(f"{gutter}  {'':<20}{DIM}peak memory {cause['maxrss']}{RESET}")
-        if cause.get("cancelled_after"):
-            print(f"{gutter}  {'':<20}{DIM}{cause['cancelled_after']} job(s) "
-                  f"cancelled downstream — they never started{RESET}")
+        _cause_block(cause, gutter)
 
     if status.reasons:
         print(gutter)
@@ -2850,10 +3019,15 @@ def run_status(name, status):
 
     if any(s in _BROKE for s in status.counts):
         print(gutter)
-        print(f"{gutter}  {DIM}/diagnose {RESET}{WHITE}{name}{RESET}"
-              f"{DIM}    read what the logs say{RESET}")
-        print(f"{gutter}  {DIM}/jobs {RESET}{WHITE}{name}{RESET}"
-              f"{DIM}   every job and its state{RESET}")
+        # Padded to a common column. These were two hand-spaced strings and
+        # their descriptions started wherever `name` happened to end, so the
+        # pair read as ragged on every run whose name was not exactly four
+        # characters longer than the other's.
+        for verb, note in (("/diagnose", "read what the logs say"),
+                           ("/jobs", "every job and its state")):
+            left = f"{verb} {name}"
+            print(f"{gutter}  {DIM}{verb} {RESET}{WHITE}{name}{RESET}"
+                  f"{' ' * max(2, 34 - cells(left))}{DIM}{note}{RESET}")
 
     print(gutter)
     resolved = (f"{RED}{status.resolved}/{status.total} jobs resolved · "
@@ -3025,14 +3199,30 @@ def _tag(record):
     return _STATUS_TAG.get(record.get("status"), lambda: f"{DIM}?{RESET}")()
 
 
-_TAG_COLOUR = {
-    HELD_BUCKET: RED,
-    LAPSED_BUCKET: AMBER,
-    ACTIVE_BUCKET: GREEN,
-    ATTENTION_BUCKET: RED,
-    FINISHED_BUCKET: DIM,
-    UNAVAILABLE_BUCKET: GREY,
-}
+# ---------------------------------------------------------------------------
+# TABLES THAT HOLD COLOURS ARE FUNCTIONS, NOT DICTS, and the reason is one
+# rule with teeth: a module-level dict built from RED and GREY captures the
+# STRINGS those names had at import, and retheme() rebinds the names. A table
+# that captured them keeps painting in the palette the session started with
+# while everything around it changes -- which is how a NO_COLOR screen ends up
+# with exactly one escape sequence left on it, in the marker column.
+#
+# So every table below that mentions a colour is a call. _STATUS_TAG already
+# worked this way (its values are lambdas); these are the same idea written
+# the same way. The cost is a dict literal per row rendered, which is nothing
+# next to the print it feeds.
+# ---------------------------------------------------------------------------
+
+
+def _tag_colours():
+    return {
+        HELD_BUCKET: RED,
+        LAPSED_BUCKET: AMBER,
+        ACTIVE_BUCKET: GREEN,
+        ATTENTION_BUCKET: RED,
+        FINISHED_BUCKET: DIM,
+        UNAVAILABLE_BUCKET: GREY,
+    }
 
 # The marker column for a /list row: one glyph and one colour per state.
 #
@@ -3051,19 +3241,36 @@ _TAG_COLOUR = {
 # never be confused: a run that completed and a run somebody stopped. Tagging a
 # cancellation with a green tick would report it as a success.
 _HELD_MARK = "◇"          # ◇ waiting on you
+_REBUILD_MARK = "↻"       # ↻ a proposal that has to be rebuilt before it can go
 _LIVE_MARK = "▶"          # ▶ working
 _BROKE_MARK = "✗"         # ✗ something failed
 _DONE_MARK = "✓"          # ✓ finished cleanly
 _STOPPED_MARK = "⊘"       # ⊘ stopped on purpose
-_NOTHING_MARK = "·"       # · terminal, but nothing happened
-_UNKNOWN_MARK = "?"       # ? the scheduler would not say
+_NOTHING_MARK = "·"       # · terminal, and there was nothing to do
+# ? MEANS ONE THING AND IT IS NOT "SOMETHING ODD HERE": there is not enough
+# authoritative evidence to make a stronger claim. It is a statement about what
+# is KNOWN, never about what happened.
+#
+# It used to be spent on two unrelated ideas. The other one was LAPSED -- a
+# proposal whose gate interrupt is gone -- and nothing about that state is
+# unknown: the command is on record, complete, and the only missing thing is
+# the authorisation slot, which is precisely why it cannot be approved and has
+# to be rebuilt. Marking a fully-established state with the uncertainty glyph
+# taught the glyph to mean "unusual", which is how a reader stops being able to
+# tell it from the two rows where the tool genuinely cannot see.
+#
+# So LAPSED has ↻ now, which says the same thing its STATUS column says --
+# rebuild it -- and ? is left to the two states that earn it: a scheduler that
+# could not be reached, and a submission whose job manifest is not on disk.
+_UNKNOWN_MARK = "?"       # ? not enough evidence to say more
 
-_MARKS = {
+def _marks():
+    return {
     HELD_BUCKET: (_HELD_MARK, AMBER),
     # Grey, not amber. A lapsed proposal is not urgent and not broken -- it is
     # simply not a decision any more, and colouring it like one that is would
     # put it back in the queue this whole change exists to clear.
-    LAPSED_BUCKET: (_UNKNOWN_MARK, GREY),
+    LAPSED_BUCKET: (_REBUILD_MARK, GREY),
     # Bold green, not cyan. Cyan is unreadable on a light terminal, and a run
     # that is running is not a fourth kind of thing -- it is healthy, like a
     # finished one, and doing something, unlike a finished one. Green says the
@@ -3072,7 +3279,7 @@ _MARKS = {
     ATTENTION_BUCKET: (_BROKE_MARK, RED),
     FINISHED_BUCKET: (_DONE_MARK, GREEN),
     UNAVAILABLE_BUCKET: (_UNKNOWN_MARK, GREY),
-}
+    }
 
 
 def _mark(bucket, status, record=None):
@@ -3099,7 +3306,7 @@ def _mark(bucket, status, record=None):
         if record is not None and runs.jobs_are_unreachable(record):
             return _UNKNOWN_MARK, GREY
         return _NOTHING_MARK, DIM
-    return _MARKS[bucket]
+    return _marks()[bucket]
 
 
 def _progress(status):
@@ -3225,6 +3432,16 @@ def _broke_phrase(status):
     return f"{lead}{kind} in {cause['step']}"
 
 
+# What each of the three "the submission did not finish cleanly" statuses says
+# about itself. Worded as the EVENT rather than as a job count -- see the note
+# in _row_status where these are used.
+_SUBMISSION_TROUBLE = {
+    "submitting": "submission interrupted",
+    "submit_failed": "submission failed",
+    "submit_unknown": "submission unconfirmed",
+}
+
+
 def _row_status(bucket, record, status):
     """The last column: the run's state in a word, then why, if there is a why.
 
@@ -3267,6 +3484,24 @@ def _row_status(bucket, record, status):
     if bucket == ACTIVE_BUCKET:
         return "running" if counts.get("RUNNING") else "queued"
     if bucket == ATTENTION_BUCKET:
+        # THE SUBMISSION ITSELF, before there is anything to count. These three
+        # statuses reach ATTENTION with no RunStatus at all, and fell through
+        # to the generic wording below, which rendered "failed · 0 jobs" -- a
+        # sentence in which the number is the only concrete thing and it is
+        # about the wrong noun. Nothing failed 0 jobs. What happened is that
+        # the submission did not complete, and that is what these say.
+        #
+        # jobs_seen is named wherever there is one, because SUBMIT_FAILED
+        # explicitly "says nothing about what it managed to submit first" (see
+        # runs.py's status table) -- a failed submission with 12 jobs already
+        # on the scheduler is a different problem from one with none, and the
+        # difference decides whether a retry is safe.
+        submission = _SUBMISSION_TROUBLE.get(record.get("status"))
+        if submission and status is None:
+            seen = record.get("jobs_seen")
+            if seen:
+                return f"{submission} · {seen} job{'s' if seen != 1 else ''} went out first"
+            return f"{submission} · nothing on the scheduler"
         if status is not None and status.unknown and not status.root_cause:
             why = f"{status.unknown} unaccounted for"
         elif (status is not None and status.doomed
@@ -3298,10 +3533,14 @@ def _row_status(bucket, record, status):
             seen = record.get("jobs_seen")
             return (f"submitted · {seen} job{'s' if seen != 1 else ''} · "
                     f"no job list on disk")
-        # Never "no jobs". GenPipes creating no jobs means every output it was
-        # asked for is already on disk, which is a successful outcome rather
-        # than an absence of one.
-        return "nothing to run"
+        # Never "no jobs", and no longer "nothing to run" either. Both read as
+        # a failure to do something, and this is the opposite: GenPipes
+        # creating no jobs means every output the run asked for is already on
+        # disk, which is a SUCCESSFUL outcome reached without spending an
+        # allocation. _finished_line has always worded it this way ("no jobs --
+        # everything was already up to date"); the listing said something else
+        # about the same fact, and the listing is the screen people read.
+        return "already up to date"
     return "completed"
 
 # Held first -- it is the one state waiting on a person to make a decision.
@@ -3497,13 +3736,14 @@ def run_list(rows):
 #                            and stays honest about being an archive.
 #   last known outcome       _last_seen() below, printed as a separate, dated,
 #                            explicitly stale clause.
-_ARCHIVE_TAG = {
+def _archive_tag():
+    return {
     "held": ("awaiting approval", AMBER),
     "lapsed": ("proposal expired", GREY),
     "submitted": ("submitted", ""),
     "gone": ("artifacts gone", GREY),
     "abandoned": ("abandoned", GREY),
-}
+    }
 
 # How a run got into the registry, said as a verb rather than as a noun.
 # "agent" and "manual" were the stored values and neither reads as anything on
@@ -3584,7 +3824,7 @@ def history(records, limit=None):
         # screen is about sequencing events; it is about finding a run again,
         # and the day is how anybody remembers which one they mean.
         when = str(r.get("submitted_at") or r.get("held_at") or "")[:10]
-        word, colour = _ARCHIVE_TAG.get(r.get("status"), ("?", GREY))
+        word, colour = _archive_tag().get(r.get("status"), ("?", GREY))
         origin = _ORIGIN.get(r.get("source"), str(r.get("source") or "?"))
         tail = _last_seen(r)
         line = (f"  {DIM}{when:<{w_when}}{RESET}"
@@ -3619,7 +3859,7 @@ def history_detail(record):
     and this is the screen that shows it, reached by naming the run.
     """
     name = str(record.get("name") or "?")
-    word, colour = _ARCHIVE_TAG.get(record.get("status"), ("?", GREY))
+    word, colour = _archive_tag().get(record.get("status"), ("?", GREY))
     origin = _ORIGIN.get(record.get("source"), str(record.get("source") or "?"))
     when = str(record.get("submitted_at") or record.get("held_at") or "").replace("T", " ")
 

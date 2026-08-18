@@ -413,7 +413,14 @@ def main():
         r.contains("reports the failures loudly", screen.lower(), "failed")
         r.contains("counts the completed jobs", screen, "COMPLETED")
         r.contains("and the out-of-memory ones", screen, "OUT_OF_MEMORY")
-        r.contains("names the step that actually broke", screen, "root cause")
+        # "first failure", not "root cause": what runs._root_cause computes is
+        # the earliest job that broke on its own, which is orderable and
+        # entirely inside what sacct reports. Claiming a ROOT CAUSE is a claim
+        # about logs, and this screen has read none -- that is what /diagnose
+        # is for, and the line offering it is three rows below.
+        r.contains("names the step that actually broke", screen, "first failure")
+        r.contains("and separates the consequence from the cause",
+                   screen, "impact")
         r.contains("and says where the answer came from", screen, "sacct")
         r.contains("with how much of the manifest it covered",
                    screen, "jobs resolved")

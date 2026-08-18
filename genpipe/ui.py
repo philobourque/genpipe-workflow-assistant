@@ -402,7 +402,7 @@ class _Editor:
         self.rows = rows
         self.cols = cols
         self.span = span_for(cols)
-        self.rule = " " + display.GREY + display.DIM + "─" * self.span + display.RESET
+        self.rule = " " + display.DIM + "─" * self.span + display.RESET
         # "  ❯ " occupies four columns; leave one at the far end so a full line
         # never touches the rule's last character.
         self.room = max(1, self.span - 5)
