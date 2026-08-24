@@ -222,6 +222,74 @@ def _list_bucket_checks(r):
                "will never run")
 
 
+def _trace_owner_checks(r):
+    """Which tracked run a past-run config came from -- and when that cannot be
+    said at all.
+
+    A trace names the script it generated (`-g cmd.sh` in its header) and a run
+    record names the same thing in proposal["script"], which is a real link and
+    NOT a unique one: a regeneration overwrites the script under the same name.
+    In the directory this was designed against, two traces sixteen minutes apart
+    both name dnaseq_somatic_fastpass_cit.sh. Choosing one of those two runs
+    would be an association invented rather than established.
+    """
+    r.section("associating a past config with the run that wrote it")
+    here, there = "/proj/run-a", "/proj/run-b"
+    records = [
+        {"name": "germline-0804", "workdir": here, "status": "submitted",
+         "proposal": {"script": "germline.sh"}, "held_at": "2026-08-04"},
+        {"name": "cit-a", "workdir": here, "status": "submitted",
+         "proposal": {"script": "cit.sh"}, "held_at": "2026-07-30"},
+        {"name": "cit-b", "workdir": here, "status": "failed",
+         "proposal": {"script": "cit.sh"}, "held_at": "2026-07-30"},
+        {"name": "elsewhere", "workdir": there, "status": "submitted",
+         "proposal": {"script": "germline.sh"}, "held_at": "2026-06-01"},
+    ]
+
+    def owner(script, where=here):
+        got = runs.trace_owner({"script": script, "path": f"{where}/t.ini"},
+                               records, where)
+        return got["name"] if got else None
+
+    r.equal("exactly one match is the run", owner("germline.sh"),
+            "germline-0804")
+    r.equal("a full path in the trace still matches by basename",
+            owner("/some/where/germline.sh"), "germline-0804")
+    r.equal("TWO matches is not a match", owner("cit.sh"), None)
+    r.equal("and no match is not a match", owner("nothing.sh"), None)
+    r.equal("a trace with no script names no run", owner(""), None)
+    r.equal("the directory is part of the evidence",
+            owner("germline.sh", there), "elsewhere")
+    r.equal("no records at all is None, not an error",
+            runs.trace_owner({"script": "germline.sh"}, [], here), None)
+
+    # NOTHING ELSE COUNTS AS EVIDENCE. A record whose pipeline or protocol
+    # happens to match is not thereby the run that wrote a trace, and this must
+    # never start reading them.
+    r.equal("a matching pipeline is not evidence",
+            runs.trace_owner({"script": "unknown.sh", "pipeline": "dnaseq"},
+                             records, here), None)
+
+    r.section("which directories 'search other tracked runs' may look in")
+    # The registry's own, and nothing else: these are directories this app knows
+    # about because it recorded a run in each. It never walks a project space.
+    seen = runs.tracked_workdirs(records + [{"name": "x", "workdir": None}])
+    r.check("only directories that exist are offered",
+            all(os.path.isdir(d) for d in seen), seen)
+    real = tempfile.mkdtemp(prefix="trace-where-")
+    try:
+        got = runs.tracked_workdirs([
+            {"name": "a", "workdir": real, "held_at": "2026-01-01"},
+            {"name": "b", "workdir": real, "held_at": "2026-02-01"},
+            {"name": "c", "workdir": None, "held_at": "2026-03-01"}])
+        r.equal("each directory once, however many runs are in it",
+                got, [os.path.abspath(real)])
+        r.equal("and a record with no directory contributes none",
+                runs.tracked_workdirs([{"name": "c"}]), [])
+    finally:
+        shutil.rmtree(real, ignore_errors=True)
+
+
 def main():
     r = Report("runs and jobs")
     workdir = tempfile.mkdtemp(prefix="genpipe_runs_test_")
@@ -533,6 +601,7 @@ Human time spent on this pipeline: 0:41:02
         _list_bucket_checks(r)
         _reconcile_checks(r)
         _stale_submission_checks(r)
+        _trace_owner_checks(r)
 
         return r.finish()
     finally:
@@ -928,6 +997,62 @@ def _stale_submission_checks(r):
         open(empty, "w").close()
         record, why = reg.track("empty-1", empty)
         r.equal("nor is an empty file", record, None)
+
+        # ---------------------------------------------------------------- #
+        r.section("what an absent job list is, and is not, evidence of")
+        # TWO COMPLETELY DIFFERENT RUNS LOOK IDENTICAL IN THE ONE FIELD:
+        # `submitted`, no job_list. One finished with nothing to do; the other
+        # was never measured. ran_already() is explicit that "absence of a
+        # manifest is not evidence of absence of a submission", and the
+        # listing was reading exactly that absence as a confirmed success.
+        # These two predicates are what separate the three cases.
+        counted_zero = {"status": runs.SUBMITTED, "job_list": None,
+                        "jobs_seen": 0, "expected_jobs": 0}
+        never_counted = {"status": runs.SUBMITTED, "job_list": None,
+                         "jobs_seen": None, "expected_jobs": None}
+        jobs_out = {"status": runs.SUBMITTED, "job_list": None, "jobs_seen": 46}
+
+        r.check("a counted zero is 'there was nothing to do'",
+                runs.submitted_nothing(counted_zero))
+        r.check("and it is not 'we cannot see its jobs'",
+                not runs.jobs_are_unreachable(counted_zero))
+        r.check("46 jobs and no manifest is 'we cannot see its jobs'",
+                runs.jobs_are_unreachable(jobs_out))
+        r.check("and it is certainly not 'there was nothing to do'",
+                not runs.submitted_nothing(jobs_out))
+        r.check("an unmeasured record is neither",
+                not runs.submitted_nothing(never_counted)
+                and not runs.jobs_are_unreachable(never_counted))
+
+        # A count of zero on an UNFINISHED submission proves nothing about the
+        # run: the submission itself never settled, so there is no outcome to
+        # read off it. Only `submitted` means the submission is established.
+        for unsettled in (runs.SUBMITTING, runs.SUBMIT_FAILED,
+                          runs.SUBMIT_UNKNOWN):
+            r.check(f"{unsettled} may not borrow that answer",
+                    not runs.submitted_nothing(dict(counted_zero,
+                                                    status=unsettled)))
+        r.check("nor may a run that still has a manifest",
+                not runs.submitted_nothing(dict(counted_zero,
+                                                job_list="/s/x.job_list.T1")))
+        # True and False are 1 and 0 in Python, and neither is a job count.
+        r.check("a boolean is not a count of zero",
+                not runs.submitted_nothing(dict(counted_zero, jobs_seen=False,
+                                                expected_jobs=False)))
+        # The route a real run takes to get there: reconcile() seeing a script
+        # that declares no jobs, a clean exit, and no new rows. Three facts
+        # agreeing -- which is what makes the outcome a finding rather than an
+        # absence, and what record_outcome() then stores as jobs_seen 0.
+        empty_script = _script(os.path.join(work, "nothing.sh"), total=0,
+                               outdir=work)
+        nothing_to_do = runs.reconcile(script=empty_script, observation="ok",
+                                       baseline=None, after=None)
+        r.equal("and that is what a nothing-to-do submission reconciles to",
+                nothing_to_do.status, runs.SUBMITTED)
+        r.equal("with the count recorded as zero", nothing_to_do.jobs_seen, 0)
+        r.equal("and the declared total as zero too", nothing_to_do.expected, 0)
+        r.contains("said in the words the listing borrows",
+                   nothing_to_do.detail, "already up to date")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

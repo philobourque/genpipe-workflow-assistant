@@ -1518,6 +1518,98 @@ def reconcile(script=None, observation=None, baseline=None, after=None,
 UNKNOWN = "?"
 
 
+def trace_owner(trace, records, directory=None):
+    """The tracked run a past-run config came from, or None when it cannot be
+    established.
+
+    NONE IS THE COMMON ANSWER AND THE HONEST ONE. A trace names the script it
+    generated (`-g cmd.sh` in its header) and a run record names the same thing
+    in `proposal["script"]`, which is a real link -- but not a unique one: a
+    regeneration overwrites the script under the same name, so two traces in
+    this very directory name `dnaseq_somatic_fastpass_cit.sh`, sixteen minutes
+    apart. Matching them to one record would mean choosing between two runs on
+    no evidence.
+
+    So this answers only when EXACTLY ONE record matches, on both the script and
+    the directory. Zero matches and several matches are the same answer -- None
+    -- and the caller shows the script name from the file instead, which is a
+    fact rather than an association.
+
+    Nothing here reads a pipeline, a protocol or a status to decide. Those are
+    metadata the view displays; they are not evidence about which run this was
+    and must never be used as if they were.
+    """
+    script = str((trace or {}).get("script") or "").strip()
+    if not script:
+        return None
+    where = os.path.abspath(directory or (trace or {}).get("path") and
+                            os.path.dirname((trace or {}).get("path") or "") or ".")
+    hits = []
+    for record in records or ():
+        named = ((record or {}).get("proposal") or {}).get("script")
+        if not named or os.path.basename(str(named)) != os.path.basename(script):
+            continue
+        home = (record or {}).get("workdir")
+        if home and os.path.abspath(str(home)) != where:
+            continue
+        hits.append(record)
+    return hits[0] if len(hits) == 1 else None
+
+
+def tracked_workdirs(records):
+    """The distinct directories tracked runs live in, newest first.
+
+    What "search other tracked runs" is allowed to look at, and the boundary is
+    the point: these are directories this application already knows about
+    because it recorded a run in each. It never walks a project space, a scratch
+    filesystem or a home directory looking for more.
+    """
+    seen = []
+    for record in sorted(records or (),
+                         key=lambda r: str((r or {}).get("held_at") or ""),
+                         reverse=True):
+        home = (record or {}).get("workdir")
+        if not home:
+            continue
+        home = os.path.abspath(str(home))
+        if home not in seen and os.path.isdir(home):
+            seen.append(home)
+    return seen
+
+
+def interrupt_claim(entries):
+    """What may honestly be said about the scheduler after an interruption.
+
+    `entries` is [(name, status, why)] for the runs the interruption could
+    plausibly have been in the middle of -- read off the registry by the caller,
+    which is the only part of this that touches state.
+
+    WHY THIS IS NOT A CONSTANT STRING. The ctrl-c handler used to print
+    "Nothing reached the scheduler." unconditionally, from a function that had
+    looked at nothing. It is usually true -- nothing reaches Slurm without a
+    typed /approve -- and "usually true" is the wrong standard for the one
+    sentence on the screen whose entire job is to stop somebody going to check.
+    The case it is wrong in is the expensive one: ctrl-c during /approve, after
+    begin_submission() has written and while the submission command is running.
+
+    So a run already past approval makes this say so instead. AFTER_APPROVAL is
+    the same set every other reader of a record uses, and `why` comes from
+    classify() -- this invents no opinion of its own, it only decides which of
+    two true things is the one worth printing.
+    """
+    risky = [(name, why) for name, status, why in entries or ()
+             if status in AFTER_APPROVAL]
+    if not risky:
+        return "Nothing reached the scheduler — the conversation is still here."
+    if len(risky) == 1:
+        name, why = risky[0]
+        return (f"'{name}' had already been approved"
+                + (f" — {why}" if why else "")
+                + f". /check {name} before assuming either way.")
+    return (f"{len(risky)} runs here had already been approved — "
+            f"/list before assuming nothing ran.")
+
+
 class Standing:
     """What a record's evidence supports: a status, and why it says so.
 
@@ -1687,6 +1779,52 @@ def jobs_are_unreachable(record):
         return False
     seen = record.get("jobs_seen")
     return bool(seen)
+
+
+def submitted_nothing(record):
+    """This submission created no jobs BECAUSE there was nothing left to do,
+    and somebody counted. True/False.
+
+    The evidenced half of an absence that used to be read as a claim. A run
+    with `submitted` and no job list is one of two completely different things:
+
+      nothing to do   reconcile() saw a script declaring `# TOTAL: 0`, a clean
+                      exit, and no new job rows -- three facts agreeing that
+                      GenPipes generated no work because every output the run
+                      asked for was already on disk. record_outcome() then
+                      stored jobs_seen 0 and expected_jobs 0. This is a real,
+                      successful, terminal outcome and any run can reach it by
+                      being re-run after it has already finished.
+
+      nobody counted  a record from before begin_submission() existed, or one
+                      whose reconciliation never ran. jobs_seen is None, which
+                      means unmeasured -- NOT zero. Absence of a manifest is
+                      not evidence of absence of a submission (see
+                      ran_already), so nothing here may be read as success.
+
+    /list used to render both as "already up to date", which turned "we never
+    looked" into "it finished cleanly with nothing to do" -- a confirmed
+    success invented out of a missing field. This is the predicate that
+    separates them, so the second one can say `unknown` instead.
+
+    Deliberately narrower than jobs_are_unreachable's AFTER_APPROVAL: only
+    `submitted` means the submission itself is established. `submitting`,
+    `submit_failed` and `submit_unknown` are all unfinished business, and none
+    of them may borrow this answer.
+    """
+    if record.get("status") != SUBMITTED:
+        return False
+    if record.get("job_list"):
+        return False
+    for field in ("jobs_seen", "expected_jobs"):
+        value = record.get(field)
+        # `is not None` and an int, because the whole distinction is
+        # "counted zero" against "not counted". A bool is excluded on
+        # principle: True == 1 and False == 0 in Python, and neither is a
+        # job count.
+        if isinstance(value, int) and not isinstance(value, bool) and value == 0:
+            return True
+    return False
 
 
 def ran_already(record):
@@ -2783,27 +2921,153 @@ def list_tag(record, status):
     return LIST_TAG[bucket]
 
 
-def resolve_log(job, record):
-    """Find a job's log file on disk, returning a path or None.
+# A GenPipes artifact filename ends in the run's own timestamp:
+#   gatk_sam_to_fastq.tumorPair_COLO829N_2026-07-30T16.17.43.o
+# That stamp is the only thing in the name that distinguishes one execution of a
+# step from another, which makes it this module's notion of run identity for
+# files on disk. Captured from the manifest, never invented.
+_LOG_STAMP = re.compile(r"_(\d{4}-\d\d-\d\dT[\d.]+)\.(?:o|sh|submit)$")
 
-    The path in the job_list is relative to the directory the run was launched
-    from, which is why the run record carries `workdir` -- without it, a log
-    lookup only works if you happen to still be sitting in the same place. If
-    that path misses, fall back to searching job_output for a file named after
-    the job, since GenPipes' own naming is more stable than its layout.
+
+def run_stamp(record, jobs=None):
+    """The timestamp that identifies this run's artifacts on disk, or None.
+
+    Read from the manifest, in the order the manifest states it most plainly:
+    the job_list filename first (`<Pipeline>.<protocol>.job_list.<STAMP>`), then
+    a declared log path, which carries the same stamp in its own name.
+
+    None means the run's identity could not be established from what is
+    recorded -- and callers must treat that as "cannot verify" rather than as
+    permission to match on something weaker. See resolve_log().
     """
+    listing = record.get("job_list")
+    if listing:
+        found = _JOB_LIST.match(os.path.basename(listing))
+        if found and found.group("stamp"):
+            return found.group("stamp")
+    for job in jobs or ():
+        if job.log:
+            found = _LOG_STAMP.search(os.path.basename(job.log))
+            if found:
+                return found.group(1)
+    return None
+
+
+def declared_log(job, record):
+    """The log path the job_list declares, resolved against disk, or None.
+
+    Column 4 of a GenPipes job_list is relative to `job_output/`, not to the
+    directory the run was launched from:
+
+        17957639\tgatk_sam_to_fastq.tumorPair_COLO829N\t\tgatk_sam_to_fastq/gat…o
+
+    Joining it to `workdir` alone -- which is what this did -- produces
+    `<workdir>/gatk_sam_to_fastq/…` and misses every time, so the declared path,
+    the one artifact that carries the run's own timestamp, never resolved and
+    every lookup fell through to the name glob below. That was not a rare
+    fallback: on a 46-job run it was 46 of 46.
+
+    All three joins are tried because the second and third are cheap and a
+    manifest that ever writes an absolute path, or one already including
+    `job_output/`, should still resolve.
+    """
+    if not job.log:
+        return None
     workdir = record.get("workdir") or os.getcwd()
-    candidates = []
-    if job.log:
-        candidates += [job.log, os.path.join(workdir, job.log)]
-    if job.name:
-        candidates += glob.glob(os.path.join(workdir, "job_output", "**",
-                                            f"{job.name}*.o"), recursive=True)
-        if job.job_id:
-            candidates += glob.glob(os.path.join(workdir, "job_output", "**",
-                                                 f"*{job.job_id}*"), recursive=True)
-    for path in candidates:
-        if path and os.path.isfile(path):
+    for path in (os.path.join(workdir, "job_output", job.log),
+                 os.path.join(workdir, job.log),
+                 job.log):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def resolve_log(job, record, stamp=None):
+    """Find THIS run's log file for a job on disk, returning a path or None.
+
+    The declared path first. When it misses -- a run adopted from a directory
+    that has since been reorganised, a manifest written by an older GenPipes --
+    the fallbacks are allowed only where they can still name one execution:
+
+      the job id      a Slurm id belongs to exactly one submission, so a file
+                      carrying it cannot be another run's.
+      the run stamp   the job name plus this run's timestamp. The name ALONE is
+                      not identity: `trim_fastp.tumorPair_COLO829N*.o` matches
+                      every time that step has ever run in this directory, and
+                      glob returns them in os.scandir order, so the answer was
+                      whichever file the filesystem happened to list first.
+
+    That is the July-30/August-5 collision: a job CANCELLED on July 30 wrote no
+    log at all, the glob found the August 5 run's, and forty lines of an
+    unrelated -- successful -- execution went into the diagnosis prompt as this
+    run's evidence.
+
+    So a log that cannot be tied to this run is NOT RETURNED. `not found` is a
+    true statement about a run and a useful one; another run's file is neither.
+    """
+    found = declared_log(job, record)
+    if found:
+        return found
+
+    workdir = record.get("workdir") or os.getcwd()
+    output = os.path.join(workdir, "job_output")
+    if job.job_id:
+        for path in sorted(glob.glob(os.path.join(output, "**",
+                                                  f"*{job.job_id}*"),
+                                     recursive=True)):
+            if os.path.isfile(path):
+                return path
+    if job.name and stamp:
+        for path in sorted(glob.glob(os.path.join(output, "**",
+                                                  f"{job.name}*{stamp}*.o"),
+                                     recursive=True)):
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def sibling_script(log):
+    """The .sh GenPipes wrote next to a .o, or None.
+
+    genpipes.md calls this "the artifact most often skipped and most often
+    decisive": it is what the tool was TOLD to do, with every flag and input
+    path, and it separates "needed more resources" from "given the wrong input".
+    Named here and not read -- see triage()'s note on why the path is the
+    deliverable.
+    """
+    if not log:
+        return None
+    root = log[:-2] if log.endswith(".o") else os.path.splitext(log)[0]
+    path = f"{root}.sh"
+    return path if os.path.isfile(path) else None
+
+
+def config_trace(record, stamp=None):
+    """This run's `<Pipeline>.<protocol>.<STAMP>.config.trace.ini`, or None.
+
+    Which ini section produced which value, for the exact generation this run
+    came from. Located by the manifest's own stamp and returned only if that
+    file is really there: a trace from a neighbouring generation would answer
+    config questions about a different command, which is the same class of
+    mistake resolve_log() exists to prevent.
+    """
+    listing = record.get("job_list")
+    if not listing:
+        return None
+    found = _JOB_LIST.match(os.path.basename(listing))
+    if not found:
+        return None
+    stamp = stamp or found.group("stamp")
+    if not stamp:
+        return None
+    name = found.group("pipeline")
+    if found.group("protocol"):
+        name = f"{name}.{found.group('protocol')}"
+    workdir = record.get("workdir") or os.getcwd()
+    for base in (workdir, os.path.dirname(os.path.dirname(listing) or "."),
+                 os.path.dirname(listing) or "."):
+        path = os.path.join(base, f"{name}.{stamp}.config.trace.ini")
+        if os.path.isfile(path):
             return path
     return None
 
@@ -2854,11 +3118,21 @@ def triage(record, jobs=None, limit=5, log_lines=40):
     order.sort(key=lambda step: not any(j.state in BROKE_STATES
                                         for j in by_step[step]))
 
+    stamp = run_stamp(record, jobs)
     findings = []
     for step in order[:limit]:
         group = by_step[step]
         first = group[0]
-        path = resolve_log(first, record)
+        # A JOB THAT NEVER RAN HAS NOTHING TO READ.
+        #
+        # CANCELLED means the scheduler killed it in the queue because something
+        # upstream failed: it never started, so it never wrote a log. Asking the
+        # disk for one anyway is how a diagnosis ends up quoting a DIFFERENT
+        # run's file -- the only `.o` with that job's name in it belongs to some
+        # other execution of the same step. The state stays visible, because the
+        # cancellation is a real fact about this run; only the search stops.
+        ran = first.state in BROKE_STATES
+        path = resolve_log(first, record, stamp) if ran else None
         findings.append({
             "step": step,
             "count": len(group),
@@ -2867,8 +3141,16 @@ def triage(record, jobs=None, limit=5, log_lines=40):
             "state": first.state,
             "maxrss": first.maxrss,
             "exit_code": first.exit_code,
+            "ran": ran,
             "log": path,
-            "log_tail": tail(path, log_lines),
+            "log_tail": tail(path, log_lines) if path else None,
+            # NAMED, NOT READ. genpipes.md calls the .sh decisive and the
+            # trace necessary for cross-checking, but pasting both for every
+            # finding would put tens of kilobytes into every prompt to answer a
+            # question that has not been asked yet. So the path is established
+            # here -- which is evidence identity, and deterministic -- and
+            # whether it is worth opening stays with the reader.
+            "script": sibling_script(path),
         })
     return {
         "failed_total": len(failed),
@@ -2876,6 +3158,8 @@ def triage(record, jobs=None, limit=5, log_lines=40):
         "cancelled_total": sum(1 for j in failed if j.state == "CANCELLED"),
         "steps_affected": len(order),
         "truncated": max(0, len(order) - limit),
+        "stamp": stamp,
+        "trace": config_trace(record, stamp),
         "findings": findings,
     }
 

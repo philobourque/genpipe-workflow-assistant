@@ -16,6 +16,7 @@ from biomni.llm import get_llm
 from . import display
 from . import intake
 from . import mirror
+from . import metering
 from . import modify
 from . import override
 from . import preflight
@@ -448,6 +449,14 @@ def build_agent(path=None, llm=None, source=None):
     #    argument we could have passed to prevent it.
     _drop_sampling_params(agent.llm, source)
 
+    #    Then put the meter in front of it. This is the seam the compiled graph
+    #    reads on every step (see _switch_model below), which makes it the only
+    #    place a cache breakpoint, the provider's token counts and the malformed
+    #    -tag repair can all be reached -- biomni's generate node builds its own
+    #    SystemMessage and parses its own response inside one call, so a wrapper
+    #    around the node is too late for two of the three. See genpipe/metering.py.
+    agent.llm = metering.Metered(agent.llm, agent.telemetry)
+
     # 5. Switch off biomni's tool retriever, which is on by default.
     #
     #    It spends an extra model call at the top of every turn asking which of
@@ -553,7 +562,13 @@ def _apply_llm(agent, source, model):
               f"{display._identity(os.environ.get('GENPIPE_LLM_SOURCE', DEFAULT_SOURCE), getattr(agent.llm, 'model', None))}."
               f"{display.RESET}\n")
         return False
-    agent.llm = candidate
+    # Re-wrapped, because the meter belongs to the session rather than to any
+    # one model: switching provider mid-session must not silently switch off
+    # caching and usage accounting for the rest of it.
+    # getattr, because this function's job is switching models and it should
+    # not acquire a hard dependency on an unrelated attribute to do it --
+    # Metered's own telemetry argument is optional for the same reason.
+    agent.llm = metering.Metered(candidate, getattr(agent, "telemetry", None))
     # display._identity, not a second f-string saying the same thing: the
     # banner and the readiness line already render this pair, and a private
     # copy here is one edit away from the two disagreeing about how a model is
@@ -762,7 +777,7 @@ def _cmd_reject(agent, args):
     agent.abandon(name, " ".join(rest) or None)
 
 
-def _rework(agent, name, feedback, warnings=(), changed=()):
+def _rework(agent, name, feedback, warnings=(), changed=(), declared=None):
     """Send a run back to the model with feedback and return to the gate.
 
     The single seam every /modify path funnels through -- direct, guided, and
@@ -777,9 +792,23 @@ def _rework(agent, name, feedback, warnings=(), changed=()):
     back green. The guided flow knows them exactly; a prose change does not, and
     passes nothing rather than guessing -- a green line that did not move is
     worse than no green at all.
+
+    `declared` is the same change set restated as checkable claims about the
+    command that comes back -- see modify.declaration. `changed` says which
+    rows were asked about and is answered by diffing two proposals; this says
+    what each of them was asked to BECOME and is answered by reading the one
+    proposal that came back. The second survives a fork, where there is no
+    earlier proposal under that name to diff against.
     """
     agent._gate_note = {"warnings": list(warnings or ()),
-                        "changed": list(changed or ())}
+                        "changed": list(changed or ()),
+                        # A LIST, like modify.declaration returns. This was
+                        # dict(), which raised ValueError on every in-place
+                        # /modify that changed a declarable row -- a declaration
+                        # entry has three keys and dict() reads a sequence of
+                        # pairs. The fork path never hit it because it stores
+                        # the list unwrapped.
+                        "declared": list(declared or ())}
     with ui.Activity("modifying") as act:
         status = agent.resume(name, approved=False, feedback=feedback,
                               on_step=_narrate(act))
@@ -1036,13 +1065,130 @@ def _fork_prose(agent, name, record, change, wanted=None):
     display.forked(name, new_name, _standing(record))
 
 
+def _past_configs(agent, directory, widened=False):
+    """The `Past run configs…` view: every trace GenPipes wrote, scanned now.
+
+    Returns the chosen trace's path, or None.
+
+    NOTHING IS REMEMBERED BETWEEN OPENINGS. Each call lists the directory and
+    reads a few header lines from each trace it finds; nothing is cached, no
+    index is written, and closing the view leaves no state behind. That is the
+    whole reason this is a view rather than a slice of the candidate list: a
+    project directory gains a trace every time a command is generated, so
+    anything that held on to them would only grow.
+
+    `widened` adds the other directories tracked runs live in. Bounded by the
+    registry -- see runs.tracked_workdirs -- and never a walk: these are the
+    directories this application already knows about because it recorded a run
+    in each, and nothing here goes looking for more.
+    """
+    records = agent.registry.live(prune=False)
+    places = [directory]
+    if widened:
+        places += [w for w in runs_store.tracked_workdirs(records)
+                   if os.path.abspath(w) != os.path.abspath(directory or ".")]
+
+    found, seen = [], set()
+    for place in places:
+        for trace in intake.traces(place):
+            if trace["path"] in seen:
+                continue
+            seen.add(trace["path"])
+            label, note = modify.trace_row(
+                trace, runs_store.trace_owner(trace, records, place))
+            found.append((trace, label, note))
+
+    # WHERE EACH ONE CAME FROM, once the answer varies. Decided from the
+    # directories that actually PRODUCED something rather than from the ones
+    # that were searched -- widening to three tracked runs that turn out to hold
+    # no traces still yields one directory's worth of results, and a column
+    # repeating that one path beside every row says nothing.
+    homes = {os.path.dirname(trace["path"]) for trace, _, _ in found}
+    rows = []
+    for trace, label, note in found:
+        if len(homes) > 1:
+            note += f" · {display._tilde(os.path.dirname(trace['path']))}"
+        rows.append((trace, slots.Option(trace["path"], label, note)))
+    # One list across every directory, ordered by when each config was written.
+    # Sorting per-directory and concatenating would put an old trace from the
+    # first directory above a new one from the second, which is not an order
+    # anybody reading a dated list would expect.
+    rows = [option for _, option in
+            sorted(rows, key=lambda pair: intake.trace_order(pair[0]),
+                   reverse=True)]
+
+    if not rows:
+        display.nothing(
+            "No past run configs here.",
+            f"GenPipes writes one beside every command it generates; "
+            f"{display._tilde(directory or '.')} has none yet."
+            + ("" if widened else "  ·  other tracked runs may."))
+        if widened:
+            return None
+
+    if not widened:
+        rows.append(slots.Option(
+            modify.SEARCH_TRACKED, "› Search other tracked runs…",
+            "the directories this app already knows runs in — no wider search"))
+
+    picked = ui.choose(
+        f"Past run configs   ·   {len(seen)} found"
+        + ("" if widened else f" in {display._tilde(directory or '.')}"),
+        rows, free_text=False,
+        note="a resolved config from a run that already happened")
+    if picked is None:
+        return None
+    if picked == modify.SEARCH_TRACKED:
+        return _past_configs(agent, directory, widened=True)
+    return picked
+
+
+def _use_or_add(agent, proposal, changes, path, workdir=None):
+    """How a chosen past-run config joins the `-c` stack. Returns True if it did.
+
+    ASKED, NEVER ASSUMED, and that is the point of this screen. A resolved trace
+    already contains everything the run it came from was given, so the two
+    readings of "use this config" are genuinely different runs: laid on top of
+    the current stack it overrules most of what is under it, and used as the
+    stack it is the starting point for whatever gets added next.
+
+    Neither is marked as the right one. There is no recommendation here and no
+    default beyond the cursor having to start somewhere -- which of the two
+    somebody means is not something this code can know, and guessing it would be
+    exactly the kind of decision this application keeps out of deterministic
+    code.
+    """
+    choice = ui.choose(
+        "Use this resolved config",
+        [slots.Option("use", "use as config stack",
+                      "-c becomes this one config · anything you add layers "
+                      "on top of it"),
+         slots.Option("add", "add to current stack",
+                      "one more ordered -c entry · the stack keeps everything "
+                      "it has"),
+         slots.Option("cancel", "cancel", "leave -c as it is")],
+        free_text=False,
+        note=display._tilde(path))
+    if choice == "use":
+        changes[modify.CONFIG] = modify.use_config(proposal, changes, path)
+    elif choice == "add":
+        changes[modify.CONFIG] = modify.toggle_config(proposal, changes, path,
+                                                      workdir=workdir)
+    else:
+        return False
+    if changes[modify.CONFIG] == modify.config_stack(proposal):
+        changes.pop(modify.CONFIG, None)
+    return True
+
+
 def _run_panel(agent, name, proposal, m, offered, candidates, changes,
-               required, fork_as=None):
+               required, fork_as=None, workdir=None):
     """The in-place panel. Returns (outcome, row) and mutates `changes`.
 
         ("done",   None)   review what has been changed
         ("else",   None)   describe it instead, in prose
         ("ask",    row)    resources -- see below
+        ("past",   row)    past run configs -- a flow, for the same reason
         ("cancel", None)   escape with nothing open
 
     Enter OPENS a row rather than ticking it, and picking a choice collapses it
@@ -1068,13 +1214,26 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
              # notes rather than being printed, because anything printed above
              # a panel that repaints over itself is gone by the next keystroke
              # -- which is how the same wrong answer gets typed twice.
-             "problem": None}
+             "problem": None,
+             # Inis taken off the -c stack during this pass, in the order they
+             # were taken off. DETERMINISTIC UI STATE, owned here because this
+             # is the only thing that knows what was pressed.
+             #
+             # It exists because "removed" cannot be derived from the stack.
+             # modify.options_for used to infer it as "in the original stack and
+             # not in the pending one", which is right for cit.ini and wrong for
+             # an ini added and removed in the same pass -- that one was never
+             # in the original, so it fell back into the candidate list with a
+             # blank marker while cit.ini in the same situation showed ✗. One
+             # keystroke, two renderings, and the difference invisible.
+             "removed": []}
 
     def choices():
         if not state["open"]:
             return ()
         return modify.options_for(state["open"], proposal, candidates,
-                                  pending=changes)
+                                  pending=changes, removed=state["removed"],
+                                  workdir=workdir)
 
     def entries():
         return modify.panel_entries(m, offered, state["open"], choices(),
@@ -1105,7 +1264,33 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
             # which sentence() then correctly reports as no change at all,
             # rather than as a -c edit that happens to be a no-op.
             state["typed"] = ""
-            stack = modify.toggle_config(proposal, changes, picked)
+            if picked == modify.PAST_CONFIGS:
+                # A DOOR, NOT A VALUE -- so config_stack, toggle_config and
+                # everything downstream never see a sentinel and go on dealing
+                # in inis alone.
+                #
+                # AND IT LEAVES THE PANEL, exactly as `resources` does and for
+                # the same reason that row states: what is behind it is a flow
+                # (a list, then a choice of two), not a field. Opening a second
+                # ui.choose from inside this one cannot work -- paint() rewrites
+                # its own block by walking up its own line count, and a nested
+                # panel drawn below would be half-overwritten by the outer one's
+                # next repaint. So this hands control back to _modify_guided,
+                # which runs the flow and comes straight back to a freshly
+                # drawn panel.
+                state.update(out="past", row=row)
+                return False
+            before = modify.config_stack(proposal, changes)
+            stack = modify.toggle_config(proposal, changes, picked,
+                                         workdir=workdir)
+            # Which way it went, recorded from the two stacks rather than
+            # guessed at from the marker that was on screen. Shorter means it
+            # came off, and an ini that comes back on stops being removed.
+            state["removed"] = [
+                x for x in state["removed"]
+                if not modify.locate(picked, [x], workdir)]
+            if len(stack) < len(before):
+                state["removed"].append(picked)
             if stack == modify.config_stack(proposal):
                 # Toggled back to where it started. Dropping the entry rather
                 # than storing a list that equals the original is what keeps
@@ -1160,6 +1345,48 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
             return True
         return False
 
+    # `[` and `]` move the ini under the cursor up and down the -c stack. Which
+    # keys, and which way, is modify.REORDER_KEYS -- so the footer below and the
+    # behaviour here cannot come to disagree.
+    #
+    # ONLY on the config row, and only on a row that is actually ON the stack.
+    # Reordering something that is merely available is meaningless, and letting
+    # the key fall through to on_text on every other row would put a `[` into
+    # the narrowing filter and empty the list.
+    def on_reorder(key, value):
+        by = modify.reorder_key(key)
+        if by is None or state["open"] != modify.CONFIG:
+            return False
+        # THE KEY IS CLAIMED FROM HERE ON, whatever it turns out to move.
+        #
+        # Returning False hands it to the next hook, and the next hook on a
+        # printable character is on_text -- which types it into the narrowing
+        # filter. So pressing `[` on the ini already at the top of the stack
+        # (a no-op, and the most likely accidental press there is) put a `[`
+        # in the filter, matched no ini, and emptied the row until somebody
+        # worked out to press backspace. A key that means "move this" must
+        # never also mean "type this", including on the presses where there is
+        # nowhere to move to.
+        if not isinstance(value, tuple) or value[0] != modify.CHOICE:
+            return True
+        ini = value[2]
+        stack = modify.move_config(proposal, changes, ini, by, workdir=workdir)
+        if stack == modify.config_stack(proposal, changes):
+            return True           # already at the end it was moved towards
+        if stack == modify.config_stack(proposal):
+            changes.pop(modify.CONFIG, None)
+        else:
+            changes[modify.CONFIG] = stack
+        # Follow the row that moved. A cursor that stayed put would leave the
+        # highlight on whatever slid into the vacated position, so a second
+        # press would move a different ini -- and the obvious way to move
+        # something two places is to press the key twice.
+        for entry in modify.selectable(entries()):
+            if (entry.kind == modify.CHOICE and entry.pick is not None
+                    and modify.locate(ini, [entry.value[2]], workdir)):
+                return entry.pick
+        return True
+
     def on_text(key):
         if not state["open"]:
             return False
@@ -1186,6 +1413,14 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
                                 details=ui.details_on)
     def keys():
         if state["open"]:
+            if state["open"] == modify.CONFIG:
+                # `-c` gets its own hint because it is the one row where Enter
+                # does not close anything and the one row with a second verb.
+                # The panel has claimed "applied in order — later wins" since it
+                # was written; naming the keys that change that order is what
+                # makes the claim actionable rather than a caption.
+                return ("↑↓ · enter puts an ini on or off · [ ] moves it "
+                        "earlier/later · esc closes the row")
             if choices():
                 return "↑↓ · 1-9 to pick · type to narrow · esc closes the row"
             return "type the new value · enter confirms · esc closes the row"
@@ -1233,7 +1468,7 @@ def _run_panel(agent, name, proposal, m, offered, candidates, changes,
                        cursor=modify.cursor_of(entries(), "name"),
                        on_enter=on_enter, on_escape=on_escape, on_text=on_text,
                        typing=lambda: bool(state["open"]) and not choices(),
-                       hotkeys=hotkeys, note=keys)
+                       hotkeys=hotkeys, on_key=on_reorder, note=keys)
     if state["out"]:
         return state["out"], state["row"]
     return ("cancel", None) if picked is None else ("done", None)
@@ -1341,9 +1576,14 @@ def _modify_guided(agent, name, record, fork_as=None):
         offered = [line.row for line in m.lines
                    if line.row in {row for row, _ in rows}]
 
+        # `directory` is the RUN's workdir, not this process's cwd, and that
+        # is what decides whether `override_walltime.ini` on the -c line and
+        # the absolute path the scan found are the same file. Resolving a
+        # relative ini against wherever the app happens to be running would
+        # make two unrelated files one, or one file two.
         outcome, row = _run_panel(agent, editing, proposal, m, offered,
                                   candidates, changes, required,
-                                  fork_as=fork_as)
+                                  fork_as=fork_as, workdir=directory)
         if outcome == "cancel":
             if fork_as:
                 display.nothing("Nothing created.",
@@ -1359,6 +1599,15 @@ def _modify_guided(agent, name, record, fork_as=None):
             if text:
                 _modify_direct(agent, name, text)
             return
+        if outcome == "past":
+            # Past run configs -- a flow rather than a field, like resources.
+            # The view scans on demand and remembers nothing; what comes back is
+            # one path, and how it joins the stack is asked separately.
+            chosen = _past_configs(agent, directory)
+            if chosen:
+                _use_or_add(agent, proposal, changes, chosen, workdir=directory)
+                required.pop(row, None)
+            continue
         if outcome == "ask":
             # Resources -- the one row that is a flow rather than a field. Its
             # screen writes an override ini and hands back the path, which goes
@@ -1430,7 +1679,7 @@ def _modify_guided(agent, name, record, fork_as=None):
                   or (fork_as if isinstance(fork_as, str) else None))
         _fork_run(agent, name, record, proposal, changes, wanted=wanted)
         return
-    _apply_changes(agent, name, proposal, changes)
+    _apply_changes(agent, name, proposal, changes, workdir=directory)
 
 
 # _ask_ending() lived here: a three-row menu asking whether a finished change
@@ -1714,14 +1963,20 @@ def _fork_run(agent, name, record, proposal, changes, wanted=None):
             display.problem(stop, f"Nothing was changed; '{name}' is unchanged.")
             return
 
-    agent._gate_note = {"warnings": risks, "changed": list(changes)}
+    # The declaration matters MORE on this path than on the in-place one. A
+    # fork lands under a new name, so there is no earlier proposal to diff
+    # against and modify.compare() correctly declines to say anything; without
+    # this the panel's whole change set would reach the gate unverified.
+    agent._gate_note = {"warnings": risks, "changed": list(changes),
+                        "declared": modify.declaration(proposal, changes,
+                                                       directory)}
     thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
     with ui.Activity("building the variant") as act:
         agent.run(request, thread, on_step=_narrate(act), name=new_name)
     display.forked(name, new_name, _standing(record))
 
 
-def _apply_changes(agent, name, proposal, changes):
+def _apply_changes(agent, name, proposal, changes, workdir=None):
     """Apply a validated change set: at most one model call, then the rename.
 
     The rename goes LAST, after resume() returns, so the gate re-renders once
@@ -1743,7 +1998,16 @@ def _apply_changes(agent, name, proposal, changes):
             if stop:
                 display.problem(stop, "Nothing was changed.")
                 return
-        _rework(agent, name, sentence, warnings=risks, changed=list(changes))
+        # `workdir` is the RUN's directory, and it is passed for the same
+        # reason the panel resolves inis against it: modify.declaration diffs
+        # the -c stack through locate(), so a relative ini on the command line
+        # would otherwise be resolved against wherever the app happens to be
+        # running. The fork path has always passed it; this one silently did
+        # not, and a config add or remove could be mis-diffed into the wrong
+        # applied/ignored verdict whenever the app was launched from somewhere
+        # other than the run's own directory.
+        _rework(agent, name, sentence, warnings=risks, changed=list(changes),
+                declared=modify.declaration(proposal, changes, workdir))
 
     if new_name:
         settled = agent.rename(name, new_name)
@@ -1890,8 +2154,11 @@ def _cmd_monitor(agent, args):
         print(f"\n  {display.DIM}Stopped watching. {name} is still on the "
               f"scheduler.{display.RESET}\n")
         return
+    # The same words /check, /list and /diagnose use for this verb. done()
+    # carries a one-line hint rather than an Actions block -- it is a two-line
+    # confirmation, and a heading over a single suggestion is furniture.
     display.done(f"{name} · {last[1] if last else 'finished'}",
-                 f"/jobs {name} for the detail")
+                 f"/jobs {name}  ·  {display.action_text('/jobs')}")
 
 
 def _cmd_hold(agent, args):
@@ -2290,20 +2557,47 @@ def _cmd_where(agent, args):
 
 
 def _cmd_telemetry(agent, args):
-    """/telemetry -- counts and timings from the generate/execute loop, when
-    GENPIPE_TELEMETRY=1 turned them on. Off by default; see genpipe/telemetry.py."""
-    if not agent.telemetry.enabled:
-        display.nothing("Telemetry is off.",
-                        "Set GENPIPE_TELEMETRY=1 before starting the app to "
-                        "record generate/execute/checkpoint timings.")
+    """/telemetry -- counts and timings from the generate/execute loop, plus
+    what the provider says each model call cost.
+
+    Two sources, and they answer different questions. The node timings come
+    from genpipe/telemetry.py and are off unless GENPIPE_TELEMETRY=1, because
+    recording them costs a dict append per graph step. The model rows come from
+    genpipe/metering.py, which is in the call path either way -- so the tokens
+    are reported whether or not the flag was set, and the flag is only about
+    the graph's own bookkeeping.
+    """
+    meter = getattr(agent, "llm", None)
+    usage = meter.summary() if hasattr(meter, "summary") else None
+
+    rows = []
+    if usage and usage["calls"]:
+        # Rendered as prose per row rather than a table: a run with no cache
+        # and a run with one have different fields worth showing, and a table
+        # would print two empty columns to keep its shape.
+        parts = [f"{usage['calls']} call(s), {usage['seconds']:.2f}s total"]
+        if usage["input"] is not None:
+            parts.append(f"{usage['input']:,} in / {usage['output']:,} out")
+        if usage["cache_read"] is not None:
+            parts.append(f"cache {usage['cache_read']:,} read, "
+                         f"{usage['cache_write'] or 0:,} written")
+        elif not usage["caching"]:
+            parts.append("caching not available for this provider")
+        if usage["repairs"]:
+            parts.append(f"{usage['repairs']} malformed reply repaired")
+        rows.append(("model", " · ".join(parts)))
+
+    summary = agent.telemetry.summary() if agent.telemetry.enabled else {}
+    rows += [(kind, f"{row['count']} call(s), {row['total']:.2f}s total, "
+                    f"{row['mean']:.2f}s mean")
+             for kind, row in sorted(summary.items()) if kind != "model"]
+
+    if not rows:
+        display.nothing(
+            "Nothing recorded yet this session.",
+            "Node timings also need GENPIPE_TELEMETRY=1 before startup."
+            if not agent.telemetry.enabled else None)
         return
-    summary = agent.telemetry.summary()
-    if not summary:
-        display.nothing("Nothing recorded yet this session.")
-        return
-    rows = [(kind, f"{row['count']} call(s), {row['total']:.2f}s total, "
-                   f"{row['mean']:.2f}s mean")
-            for kind, row in sorted(summary.items())]
     display.where(rows)
 
 
@@ -2484,9 +2778,18 @@ def _dispatch_line(agent, line, focus=None):
         return
     try:
         handler(agent, args)
-    except KeyboardInterrupt:
-        print()
-        display.nothing("Stopped.")
+    except KeyboardInterrupt as stop:
+        # /approve is why this is not a bare "Stopped.". Every other command
+        # here reads state, but an interrupt during an approval can land after
+        # the submission has begun -- and the registry knows, because
+        # begin_submission() writes before the command runs. The runs this
+        # command NAMED are the ones asked about; a command with no run
+        # argument gets the general answer.
+        left = getattr(stop, "genpipe_unreaped", 0)
+        display.interrupted(
+            _scheduler_claim(agent, args),
+            note=(f"a tool was still finishing in the background "
+                  f"({left} worker{'' if left == 1 else 's'})" if left else None))
     except Exception as e:
         print(f"  {display.RED}{type(e).__name__}: {e}{display.RESET}\n")
 
@@ -2554,6 +2857,52 @@ def _at_the_gate(agent, thread, line):
     return True
 
 
+def _names_on(agent, thread):
+    """Every run this conversation has produced, whatever state it is in.
+
+    registry.held_for_thread() answers a narrower question -- which run is
+    WAITING on this thread -- and is the wrong one to ask after an interrupt: a
+    run that has already been approved is exactly the one worth checking and is
+    exactly the one that lookup skips.
+    """
+    try:
+        return [r["name"] for r in agent.registry.live(prune=False)
+                if r.get("thread_id") == str(thread)]
+    except Exception:                      # noqa: BLE001
+        # An unreadable registry must cost the reassurance, not the prompt.
+        return []
+
+
+def _scheduler_claim(agent, names=()):
+    """What may honestly be said about the scheduler after an interruption.
+
+    "Nothing reached the scheduler" used to be printed unconditionally by the
+    ctrl-c handler, which is a claim about the cluster made by a function that
+    had looked at nothing. It is usually true -- nothing reaches Slurm without a
+    typed /approve -- and "usually true" is the wrong standard for the one
+    sentence on the screen whose job is to stop somebody going and looking.
+
+    So it is checked. `names` are the runs this interruption could plausibly
+    have been in the middle of; for a conversational turn that is whatever the
+    thread holds, and for /approve it is the run being approved. A run sitting
+    in one of the AFTER_APPROVAL states has been through submission and may have
+    reached the scheduler, and this says so rather than reassuring.
+
+    The evidence is the registry's own, read through the same standing_of() that
+    /list and /check use -- not a second opinion invented here. The wording is
+    runs.interrupt_claim's, so the decision about what may be claimed is one
+    stdlib-only function that CI checks rather than a sentence in a handler.
+    """
+    entries = []
+    for name in dict.fromkeys(n for n in names if n):
+        record = agent.registry.get(name)
+        if not record:
+            continue
+        entries.append((name, record.get("status"),
+                        agent.standing_of(record).why))
+    return runs_store.interrupt_claim(entries)
+
+
 def _turn(agent, thread, text, raw=None, label="thinking"):
     """One exchange: the user's line in, the agent's work out.
 
@@ -2563,8 +2912,11 @@ def _turn(agent, thread, text, raw=None, label="thinking"):
     Ctrl+C interrupts the AGENT, not the session. It abandons this answer and
     returns to the prompt with the conversation intact, which is what people
     expect from every other assistant with a spinner in it: stopping a reply is
-    not the same as leaving. Nothing that was on its way to the scheduler can
-    survive it, because nothing reaches the scheduler without /approve.
+    not the same as leaving. The conversation, the run records and everything
+    already on screen survive; only the reply in flight does not.
+
+    WHAT IT DOES NOT DO is claim anything about the scheduler it has not
+    checked. See _scheduler_claim.
     """
     if _at_the_gate(agent, thread, raw if raw is not None else text):
         return
@@ -2572,11 +2924,16 @@ def _turn(agent, thread, text, raw=None, label="thinking"):
         with ui.Activity(label) as act:
             agent.on_ask = _asker(act)
             agent.run(text, thread_id=thread, on_step=_narrate(act))
-    except KeyboardInterrupt:
-        print()
-        display.nothing("Stopped.",
-                        "Nothing reached the scheduler. The conversation is "
-                        "still here — say something else, or /new to start over.")
+    except KeyboardInterrupt as stop:
+        # A tool that was still finishing when the deadline expired. Named
+        # rather than swallowed: its output is muted from here on, so this line
+        # is the only thing that says it exists.
+        left = getattr(stop, "genpipe_unreaped", 0)
+        note = (f"a tool was still finishing in the background "
+                f"({left} worker{'' if left == 1 else 's'}) — its output is "
+                f"suppressed from here on" if left else None)
+        display.interrupted(
+            _scheduler_claim(agent, _names_on(agent, thread)), note=note)
     except Exception as e:
         display.problem(f"{type(e).__name__}: {e}")
     finally:
@@ -2907,7 +3264,7 @@ def main(argv=None):
         asked = _require_api_key()
     agent = build_agent()
     if fake_llm:
-        agent.llm = fakecluster.DevLLM()
+        agent.llm = metering.Metered(fakecluster.DevLLM(), agent.telemetry)
     elif asked:
         # Only when a key was pasted a moment ago. See _confirm_new_key.
         _confirm_new_key(agent)

@@ -391,24 +391,31 @@ VERSION = "v0"
 # sequence the ramp is still there, because a light-shaded block IS further
 # away than a dark-shaded one to anybody who has ever seen a terminal.
 #
-#     ▓  front strand      ▒  the turn      ░  back strand      ·  base pairs
+#     ▓  front strand      ▒  the turn      ░  back strand      ─  base pairs
+#
+# A base pair is a BOND, not a bead, so the rung glyph is a box-drawing
+# horizontal rule: adjacent cells join, and the rung renders as one unbroken
+# line from backbone to backbone. `·` sampled the same span as a row of
+# points and read as dotted rather than as a pair held together; ╌ was tried
+# against it and is the same figure with half the ink, but the solid stroke
+# is the one that reads as a bond at this size.
 #
 # The rungs stop where the strands come within three columns of each other,
 # which is not a rendering compromise: at the crossing a base pair is edge-on
 # to the viewer and there is nothing to draw.
 # ---------------------------------------------------------------------------
 _HELIX = [
-    "▒···········▒",
-    " ░·········▓ ",
-    "    ░···▓    ",
-    "    ▓···░    ",
-    " ▓·········░ ",
-    "▒···········▒",
-    " ░·········▓ ",
-    "    ░···▓    ",
-    "    ▓···░    ",
-    " ▓·········░ ",
-    "▒···········▒",
+    "▒───────────▒",
+    " ░─────────▓ ",
+    "    ░───▓    ",
+    "    ▓───░    ",
+    " ▓─────────░ ",
+    "▒───────────▒",
+    " ░─────────▓ ",
+    "    ░───▓    ",
+    "    ▓───░    ",
+    " ▓─────────░ ",
+    "▒───────────▒",
 ]
 
 # 13 columns. Asserted rather than assumed: _left_column centres this against
@@ -425,7 +432,7 @@ def _strand():
     and darker on black. theme.py holds both directions; this only says which
     role each glyph is.
     """
-    return {"\u2593": DNA_FG, "\u2592": DNA_MID, "\u2591": DNA_BG, "\u00b7": DNA_RUNG}
+    return {"\u2593": DNA_FG, "\u2592": DNA_MID, "\u2591": DNA_BG, "\u2500": DNA_RUNG}
 
 
 def _helix():
@@ -610,8 +617,20 @@ def _right_column(w, source=None, model=None, path=None):
     # The example is the most important line on this screen and is deliberately
     # NOT green: it is a thing to say, not a command to type, and colouring it
     # like the commands below would file it under the same idea.
+    #
+    # AND IT IS NOT EMPHASISED EITHER. WHITE is BOLD (see the palette note
+    # above), so setting the example in it put a second bold line directly
+    # under a bold heading and a few rows below the wordmark -- three claims on
+    # the loudest weight this terminal has, competing on the one screen where
+    # the branding is supposed to be the thing you see first. What the example
+    # is, is helper text: an illustration of the heading above it, exactly like
+    # "type / to browse commands" is an illustration of the heading above that.
+    # So it gets the same treatment as that line -- GREY, the readable quiet --
+    # which leaves the headings and the wordmark as the only emphasised things
+    # on the left half of the screen and costs the example nothing in
+    # legibility (`muted` clears 4.5:1 on every background theme.py tunes for).
     lines.append(f"{WHITE}Ask naturally{RESET}")
-    lines.append(f"  {WHITE}run dnaseq germline_snv on my readset, "
+    lines.append(f"  {GREY}run dnaseq germline_snv on my readset, "
                  f"all steps{RESET}")
     lines.append("")
 
@@ -620,8 +639,13 @@ def _right_column(w, source=None, model=None, path=None):
     # sequences as characters, so a coloured command inside it either clips or
     # breaks the wrap. The padding is measured on the plain text for the same
     # reason.
-    for cmd, what in (("/list", "see your runs"),
-                      ("/check all", "refresh statuses")):
+    # Read from _ACTION_TEXT where the command is one of the shared verbs, so
+    # the first screen anybody sees teaches the same words every later screen
+    # uses. "/check all" is its own form and gets its own line: "refresh
+    # statuses" described a scheduler round-trip to somebody who wanted to know
+    # how their runs were doing, which is the implementation talking.
+    for cmd, what in (("/list", _ACTION_TEXT["/list"]),
+                      ("/check all", "see how every run is doing")):
         lines.append(f"  {GREEN}{cmd}{RESET}"
                      f"{' ' * max(1, _CMD_W - len(cmd))}{GREY}{what}{RESET}")
     lines.append("")
@@ -2047,9 +2071,26 @@ def modify_panel(entries_of, changes=None, notes=None, required=None,
                          else entry.label)
                 num = f"{DIM}{entry.pick + 1:>2}{RESET}"
                 line = f"{pad[:-4]}{mark} {num}  {label}"
-                if entry.description and showing:
+                # WHAT THE KEYS DO TO THIS ROW GOES ON THIS ROW ONLY.
+                #
+                # `[` and `]` move the ini the cursor is on, so the hint belongs
+                # where the cursor is. Carried on every option instead -- which
+                # is how it started, as `· [ ] reorders` in each description --
+                # it is the same sentence repeated down the list, and it sits
+                # beside removed and merely-available inis where those keys do
+                # nothing at all.
+                #
+                # Read off the MARKER, which is the row's state and is already
+                # in the label because a description is the first thing a narrow
+                # terminal drops. Only a `-c` row that is on the stack has
+                # anywhere to be moved to.
+                note = entry.description
+                if (here and entry.row == modify.CONFIG
+                        and entry.label.startswith(modify.ON_MARK)):
+                    note = f"{note} {modify.REORDER_HINT}".strip()
+                if note and showing:
                     line += (f"{' ' * max(1, choicew - len(entry.label))}"
-                             f"{DIM}{entry.description}{RESET}")
+                             f"{DIM}{note}{RESET}")
                 out.append(line)
                 continue
 
@@ -2184,6 +2225,155 @@ def _action(verb, consequence):
     """
     return (f"      {WHITE}{verb:<{_MIRROR_LABEL + _MIRROR_FLAG}}{RESET}"
             f"{DIM}{consequence}{RESET}")
+
+
+# ---------------------------------------------------------------------------
+#  PROPOSED NEXT ACTIONS, SAID THE SAME WAY EVERYWHERE
+# ---------------------------------------------------------------------------
+# ONE DESCRIPTION PER COMMAND, IN ONE PLACE. These were written independently
+# in six renderers, and they had drifted into six vocabularies for the same
+# seven verbs: /jobs was "inspect its jobs" on one screen, "every job and its
+# state" on two others and "for its jobs" on a fourth; /diagnose was "explain
+# what went wrong", "read what the logs say", "investigate a problem" and "for
+# what went wrong". A person reading those four screens in one session has no
+# way to know they are being offered the same command, which is the entire
+# thing a command vocabulary is for.
+#
+# THE DESCRIPTION TEACHES THE COMMAND, NOT THE SITUATION. "/diagnose  explain
+# what went wrong" is true of /diagnose everywhere it is offered; "/diagnose
+# read what the logs say" describes a mechanism, and "/diagnose  inspect the
+# timeout in gatk_sam_to_fastq" would describe one run. The screen around the
+# block is where a situation gets explained -- /check prints the failing step
+# three lines above these, and that is the right place for it.
+#
+# WHAT IS DELIBERATELY NOT IN HERE. The gate's verb block (_VERBS["held"], via
+# gate_box) keeps its own wording -- "submits to Slurm — cannot be undone" is a
+# consequence, printed at the one screen where a wrong keystroke spends an
+# allocation, and a safety line is not a description. See the note there.
+_ACTION_TEXT = {
+    # The investigation ladder, in the order it is climbed. Each rung answers
+    # a question the one above it raised.
+    "/check":     "see a run's current status",
+    "/diagnose":  "explain what went wrong",
+    "/jobs":      "inspect individual jobs",
+    # Before anything is launched.
+    "/modify":    "change a run before launch",
+    "/approve":   "launch a run",
+    "/reject":    "discard a run",
+    # Bringing something in, and looking things up.
+    "/scan":      "bring an existing run into the assistant",
+    "/list":      "see your runs",
+    "/view":      "see the command a run was built from",
+    "/track":     "attach a job list by hand",
+    "/history":   "see what is recorded about a run",
+    "/monitor":   "watch a run until it stops changing",
+}
+
+
+def action_text(verb):
+    """The canonical one-line description of a command, or "".
+
+    Public because two callers outside this module offer a command in a place
+    an Actions block does not fit -- a one-line confirmation, a hint under a
+    small message -- and the words still have to be the same words.
+    """
+    return _ACTION_TEXT.get(verb, "")
+
+
+def _action_rows(group):
+    """[(command, argument, description)] with the canonical text filled in.
+
+    A row may be given as (command,), (command, argument) or with an explicit
+    description as the third field. The explicit form exists for the two places
+    that genuinely need their own words -- see _VERBS -- and is not the way any
+    ordinary screen should spell a verb it shares with five others.
+    """
+    rows = []
+    for row in group:
+        verb = row[0]
+        arg = row[1] if len(row) > 1 else ""
+        note = row[2] if len(row) > 2 else _ACTION_TEXT.get(verb, "")
+        rows.append((verb, str(arg or ""), note))
+    return rows
+
+
+def actions(groups, gutter=" "):
+    """Print an `Actions` block: a heading, then one line per command.
+
+        <gutter> Actions
+        <gutter>
+        <gutter>   /diagnose  rnaseq-0810    explain what went wrong
+        <gutter>   /jobs      rnaseq-0810    inspect individual jobs
+
+    `groups` is a list of rows, or a tuple of such lists -- one blank line
+    between groups, which is how /list separates "understanding a run" from
+    "preparing one". `gutter` is whatever prefix the surrounding screen puts on
+    every line: " " for a plain screen, the panel's own "  ▌" for /check and
+    /diagnose, so a block dropped into a framed screen stays inside its frame.
+
+    EXISTS SO SIX SCREENS CANNOT DISAGREE ABOUT WHAT A PROPOSED COMMAND LOOKS
+    LIKE. They each formatted their own -- two loose lines here, a middle-dot
+    run-on there, a heading and two padded columns somewhere else -- so the one
+    thing every one of them was trying to say ("you could type this next") had
+    no consistent shape to be recognised by. The heading is the shape.
+
+    Deliberately small. It owns the heading, the spacing, the two columns and
+    the canonical descriptions, and nothing else: which commands to offer is
+    the caller's, because that is the part that has to change with the run's
+    state. A screen with no useful next command calls nothing and prints no
+    heading -- an empty Actions block is worse than none, because it promises
+    a way forward and then does not name one.
+    """
+    if groups and isinstance(groups[0], (list, tuple)) and groups[0] \
+            and isinstance(groups[0][0], (list, tuple)):
+        blocks = [_action_rows(g) for g in groups]
+    else:
+        blocks = [_action_rows(groups)]
+    blocks = [b for b in blocks if b]
+    if not blocks:
+        return
+    every = [row for b in blocks for row in b]
+    # Both columns measured across EVERY group, not per group, so the three
+    # blocks of /list read as one list rather than as three that happen to be
+    # stacked. cells() rather than len() because a run name may hold anything.
+    w_cmd = max(len(verb) for verb, _, _ in every)
+    w_arg = max(cells(arg) for _, arg, _ in every)
+    gap = "  " if w_arg else ""
+    # NARROW WINDOWS GET TWO LINES, NEVER A TRUNCATED ONE. `/diagnose
+    # dnaseq-somatic-fastpass-0805    explain what went wrong` is 66 columns
+    # before the gutter, and on a 60-column login-node window the terminal
+    # soft-wraps the overflow to column ZERO -- left of and underneath the
+    # panel edge it was supposed to sit beside. This is the fault _hint()
+    # existed to fix for /diagnose's two lines, generalised: when a row will
+    # not fit, the description drops to its own indented line rather than being
+    # cut, because a description cut in half is the half that mattered.
+    room = (terminal_cols() if _tty() else WIDTH) - cells(gutter) - 3
+    fits = all(w_cmd + len(gap) + w_arg + 4 + len(note) <= room
+               for _, _, note in every)
+    print(f"{gutter} {BOLD}Actions{RESET}")
+    for block in blocks:
+        # rstrip, because a gutter that is only indentation (" ") would
+        # otherwise leave trailing whitespace on a blank row -- which
+        # `git diff --check` flags and which shows as a stray cell in a
+        # terminal recording. A gutter that DRAWS something ends in an escape
+        # sequence, so rstrip leaves the ▌ and the panel edge unbroken.
+        print(gutter.rstrip())
+        for verb, arg, note in block:
+            # A PLACEHOLDER IS QUIET, A REAL NAME IS NOT. "<name>" is grammar --
+            # it tells you the shape of the command and there is nothing to
+            # copy. An actual run name is the thing somebody is about to type or
+            # paste, so it gets the emphasis, which is also what makes
+            # `/check all`'s footer and `/check rnaseq-0810`'s block visibly
+            # different kinds of offer.
+            tint = DIM if arg.startswith("<") or not arg else WHITE
+            head = (f"{gutter}   {DIM}{verb:<{w_cmd}}{RESET}"
+                    f"{gap}{tint}{arg}{RESET}")
+            if fits:
+                pad_arg = " " * max(0, w_arg - cells(arg))
+                print(f"{head}{pad_arg}    {GREY}{note}{RESET}")
+            else:
+                print(head)
+                print(f"{gutter}   {' ' * w_cmd}{gap}{GREY}{note}{RESET}")
 
 
 def fill_header(m, row, changes, current, step="", note=""):
@@ -2468,38 +2658,50 @@ def gate(proposal, thread_id, blockers=(), warnings=(), changed=(),
 # DO rather than by what the record says.
 _UNREACHABLE = "submitted:no-jobs"
 
-# What each status lets you do, and what that costs. Held is the gate's own
-# list; the others are what remains once a name is tied to a job list.
+# WHICH COMMANDS EACH STATUS SUPPORTS. Selection only -- the descriptions come
+# from _ACTION_TEXT, because these are the same seven verbs the rest of the
+# product offers and a run's status changes WHICH of them are worth offering,
+# never what any one of them means. This table used to carry its own wording
+# and had drifted: /diagnose was "read the logs and explain a failure" here,
+# "read what the logs say" in /check and "explain what went wrong" in /list.
+#
+# ORDER IS THE INVESTIGATION LADDER where a run has already been launched
+# (/check, then /diagnose, then the low-level view) and the pre-launch order
+# everywhere else (/modify, then /approve, then /reject) -- the same order
+# /list uses, so a person meets the verbs in one sequence wherever they are.
 _VERBS = {
-    "held": [("/approve", "submits to Slurm — cannot be undone"),
-             ("/modify", "rewrites the command and asks you again"),
-             ("/reject", "abandons this run; nothing is submitted")],
+    # NOTE these three are ALSO what the gate offers, and the gate deliberately
+    # does not read them from here -- see gate_box, where /approve carries a
+    # consequence rather than a description because that screen is where the
+    # allocation is actually spent.
+    "held": [("/modify",), ("/approve",), ("/reject",)],
     # NO /approve. This is the whole point of the status existing: the verbs
     # under a run have to be the ones that will actually work, and offering an
     # approval that /approve would refuse is the contradiction that started
     # this. What is left is real -- the command is intact and /modify rebuilds
     # it into a proposal that can be approved.
-    # /modify on a lapsed run FORKS it, the same way it forks a submitted one,
-    # and the wording says so rather than promising an in-place rebuild. There
-    # is no live gate to rework against, and a verb that describes a mechanism
-    # the code does not have is the same defect as a status that does.
-    "lapsed": [("/modify", "copies it into a new run and gates that"),
-               ("/reject", "abandons this run; nothing was submitted")],
-    "submitted": [("/check", "how it is doing on the scheduler"),
-                  ("/modify", "copies it into a new run; this one is untouched"),
-                  ("/diagnose", "read the logs and explain a failure")],
+    "lapsed": [("/modify",), ("/reject",)],
+    # NO /diagnose, AND THAT IS A SEMANTIC POINT RATHER THAN A TRIM. /view asks
+    # the scheduler nothing -- it is the "what IS this run" screen -- so it
+    # cannot know whether anything went wrong, and /diagnose means "explain
+    # what went wrong". Offering it under every submitted run proposed an
+    # explanation for a run that may be queued, running, or finished cleanly.
+    #
+    # The ladder still reaches it, one rung later and on evidence: /view offers
+    # /check, /check asks sacct, and /check offers /diagnose exactly when
+    # something actually broke. Gating this on the record's cached last_check
+    # was the alternative and was rejected -- that verdict can be three weeks
+    # old, and this table is about what a run can SUPPORT, not about what
+    # probably happened to it.
+    "submitted": [("/check",), ("/modify",)],
     # A run that submitted real jobs and left no manifest. NOT the same list as
     # `submitted`, because two of those three verbs cannot do anything here:
     # /check and /diagnose both need job ids to ask the scheduler about, and
-    # there are none. /modify is the one that still works -- the generation
-    # command is on the record, so a copy of this run can be built and gated
-    # like any other. See runs.jobs_are_unreachable.
-    _UNREACHABLE: [("/modify", "copies it into a new run; this one is untouched"),
-                   ("/track", "adopts a job list by hand, if you still have it"),
-                   ("/history", "what is recorded about it")],
-    "abandoned": [("/modify", "copies it into a new run to try again")],
-    "gone": [("/modify", "copies it into a new run"),
-             ("/history", "what is recorded about it")],
+    # there are none. /track is what recovers one; /modify builds a fresh run
+    # from the command still on the record. See runs.jobs_are_unreachable.
+    _UNREACHABLE: [("/track",), ("/modify",), ("/history",)],
+    "abandoned": [("/modify",)],
+    "gone": [("/modify",), ("/history",)],
 }
 
 
@@ -2556,12 +2758,12 @@ def run_view(proposal, name, status, resources="", blockers=(), record=None):
         print(f"      {DIM}{'fix':<17}{RESET}{WHITE}{finding.fix}{RESET}")
     if blockers:
         print()
-    for verb, consequence in _verbs_for(status, record):
-        if verb == "/approve" and (blockers or missing):
-            continue
-        print(_action(verb, consequence))
-    print(f"      {'':<{_MIRROR_LABEL + _MIRROR_FLAG}}{DIM}tab completes the "
-          f"name{RESET}")
+    offered = [row for row in _verbs_for(status, record)
+               if not (row[0] == "/approve" and (blockers or missing))]
+    if offered:
+        actions([(verb, name) for (verb, *_) in offered])
+        print()
+        print(f"    {DIM}tab completes the name{RESET}")
     print()
 
 
@@ -2636,9 +2838,14 @@ def post_approve(name, record):
         else:
             head = "submitted"
         print(f"  {DIM}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  {DIM}{head}{RESET}")
+        # ONLY WHERE THERE IS SOMETHING TO CHECK. A submission that created no
+        # jobs is finished -- there is nothing on the scheduler for /check to
+        # look at -- so it gets no Actions block rather than an empty gesture
+        # towards one. Same rule /check and /list follow for `up to date`.
         if seen:
-            print(f"  {DIM}\u258c{RESET}")
-            print(f"  {DIM}\u258c{RESET}   /check {WHITE}{name}{RESET}")
+            gut = f"  {DIM}\u258c{RESET}"
+            print(gut)
+            actions([("/check", name)], gutter=gut)
         print()
         return
 
@@ -2652,28 +2859,43 @@ def post_approve(name, record):
             print(f"  {AMBER}\u258c{RESET}   {WHITE}{seen} job{'s' if seen != 1 else ''} "
                   f"were recorded before it stopped{RESET}"
                   f"{DIM} \u2014 they are on the scheduler{RESET}")
-        print(f"  {AMBER}\u258c{RESET}")
+        gut = f"  {AMBER}\u258c{RESET}"
+        print(gut)
         if (record or {}).get("retry_safe"):
-            print(f"  {AMBER}\u258c{RESET}   {DIM}Slurm has no jobs from this "
-                  f"attempt \u2014 it is safe to try again.{RESET}")
-            print(f"  {AMBER}\u258c{RESET}   /modify {WHITE}{name}{RESET}"
-                  f"{DIM}, or /reject it{RESET}")
+            # The scheduler was ASKED and came back empty -- the one condition
+            # under which nothing is out there, so a rebuild is the next move.
+            print(f"{gut}   {DIM}Slurm has no jobs from this attempt \u2014 it "
+                  f"is safe to try again.{RESET}")
+            print(gut)
+            actions([("/modify", name), ("/reject", name)], gutter=gut)
         else:
-            # The default, and deliberately the cautious one. Anything that is
-            # not positively known to be quiet may already have work queued.
-            print(f"  {AMBER}\u258c{RESET}   {DIM}Some jobs may already be "
-                  f"queued. Check before resubmitting \u2014 approving again is "
-                  f"how a pipeline gets run twice.{RESET}")
-            print(f"  {AMBER}\u258c{RESET}   /check {WHITE}{name}{RESET}"
-                  f"{DIM}  \u00b7  squeue -u $USER{RESET}")
+            # THE DEFAULT, AND /check COMES FIRST. A failed submission is not a
+            # failed run: what broke is the launch, so there are no pipeline
+            # logs for /diagnose to read, and the question that actually
+            # decides what to do next is whether anything reached the scheduler
+            # before it died. Only /check can answer that, and answering it
+            # wrong costs a pipeline run twice.
+            print(f"{gut}   {DIM}Some jobs may already be queued. Check before "
+                  f"resubmitting \u2014 approving again is how a pipeline gets "
+                  f"run twice.{RESET}")
+            print(gut)
+            actions([("/check", name), ("/modify", name)], gutter=gut)
+            print(gut)
+            print(f"{gut}   {DIM}squeue -u $USER says the same thing from "
+                  f"outside this tool{RESET}")
         print()
         return
 
     if status == runs.SUBMITTING:
+        gut = f"  {AMBER}\u258c{RESET}"
         print(f"  {AMBER}\u258c {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  "
               f"{AMBER}still submitting{RESET}")
-        print(f"  {AMBER}\u258c{RESET}   {DIM}The command was started and has "
-              f"not reported back.{RESET}")
+        print(f"{gut}   {DIM}The command was started and has not reported "
+              f"back.{RESET}")
+        # Same reasoning as the unsafe-retry branch above: what is unknown is
+        # whether anything reached the scheduler, and /check is what asks.
+        print(gut)
+        actions([("/check", name)], gutter=gut)
         print()
         return
 
@@ -3017,17 +3239,39 @@ def run_status(name, status):
         print(f"{gutter}  {AMBER}⚠{RESET}  {WHITE}{job.name}{RESET}   "
               f"{DIM}{job.elapsed} of {job.timelimit}   near its limit{RESET}")
 
-    if any(s in _BROKE for s in status.counts):
+    # WHAT TO DO NEXT, CHOSEN FROM WHAT THE EVIDENCE SUPPORTS. Three cases,
+    # and the third is the one that used to be wrong by omission.
+    #
+    #   something broke        /diagnose, then /jobs. There are logs, because a
+    #                          job that broke ran far enough to write one.
+    #   jobs unaccounted for   /jobs ONLY. status.unknown is jobs in THIS
+    #                          MANIFEST that sacct would not account for -- the
+    #                          shape an accounting database aging ids out
+    #                          leaves. There is no log for /diagnose to read,
+    #                          so offering it would send somebody to a screen
+    #                          that can only report finding nothing.
+    #
+    #                          NOT to be confused with /list's `? unknown`,
+    #                          which is a wider display-level state with six
+    #                          sources; five of them never reach this function
+    #                          with a manifest at all, and the next action for
+    #                          `? unknown` on a listing row is /check -- which
+    #                          is what /list offers. This branch is what /check
+    #                          then says for the one source that does arrive
+    #                          here.
+    #   anything else          nothing. A run that is queued, running, finished
+    #                          cleanly or had no work to do has no next command
+    #                          worth naming, and an Actions block that exists
+    #                          for symmetry teaches people to stop reading it.
+    #
+    # /check ITSELF IS NEVER IN THIS LIST. The reader is already inside it.
+    broke = any(s in _BROKE for s in status.counts) or status.doomed
+    if broke:
         print(gutter)
-        # Padded to a common column. These were two hand-spaced strings and
-        # their descriptions started wherever `name` happened to end, so the
-        # pair read as ragged on every run whose name was not exactly four
-        # characters longer than the other's.
-        for verb, note in (("/diagnose", "read what the logs say"),
-                           ("/jobs", "every job and its state")):
-            left = f"{verb} {name}"
-            print(f"{gutter}  {DIM}{verb} {RESET}{WHITE}{name}{RESET}"
-                  f"{' ' * max(2, 34 - cells(left))}{DIM}{note}{RESET}")
+        actions([("/diagnose", name), ("/jobs", name)], gutter=gutter)
+    elif status.unknown:
+        print(gutter)
+        actions([("/jobs", name)], gutter=gutter)
 
     print(gutter)
     resolved = (f"{RED}{status.resolved}/{status.total} jobs resolved · "
@@ -3143,6 +3387,30 @@ def nothing(text, hint=None):
     print()
 
 
+def interrupted(hint=None, note=None):
+    """Ctrl-C, said the way an interruption should be said.
+
+    NOT AN ERROR AND NOT A FAILURE. Stopping a reply is an ordinary thing to do
+    and the screen has to read that way: no red, no traceback, no apology. It
+    used to print "Stopped." over a bare claim that nothing had been submitted,
+    which was two problems at once -- it looked like a crash report, and the
+    reassurance underneath it had been checked by nobody.
+
+    `hint` is what is actually known about the scheduler, and it is passed in
+    rather than written here because only the caller has the evidence. `note`
+    is for the rarer thing worth saying: a tool that was still finishing when
+    the prompt came back.
+    """
+    print()
+    print(f"  {DIM}⎿{RESET} {DIM}Interrupted{RESET}"
+          f"{DIM} · what should I do instead?{RESET}")
+    if note:
+        print(f"  {DIM}⎿{RESET} {AMBER}{note}{RESET}")
+    if hint:
+        print(f"  {DIM}⎿{RESET} {GREY}{hint}{RESET}")
+    print()
+
+
 def done(text, hint=None):
     """A completed action, confirmed."""
     print()
@@ -3237,16 +3505,37 @@ def _tag_colours():
 # is bold, the pipeline grey, the counts plain -- so a row reads as one state
 # stated at both ends rather than as four competing highlights.
 #
-# Six marks for five buckets, because FINISHED holds two outcomes that must
-# never be confused: a run that completed and a run somebody stopped. Tagging a
-# cancellation with a green tick would report it as a success.
+# SEVEN MARKS FOR SIX BUCKETS, because two buckets hold outcomes that must
+# never be confused. FINISHED holds a run somebody stopped as well as two that
+# succeeded -- tagging a cancellation with a green tick would report it as a
+# success. ATTENTION holds a confirmed failure and a state nobody could
+# establish, which ask for opposite next actions. _marks() below is the BUCKET
+# default; _row_state is where a sub-state overrides it, and it is the only
+# place that decides.
+#
+# A GLYPH MAY COVER TWO PHRASES, and three of them do. That is not a lapse: the
+# pair always belongs to one idea and differs in something the reader acts on
+# -- ● is wait-and-wait-while-watching-the-age, ✓ is work-happened-or-was-not
+# -needed, ✗ is there-are-logs-or-there-are-not. What no glyph may do is cover
+# two ideas, which is what ✗ was doing across a confirmed and an unestablished
+# submission, and what ? was doing across LAPSED and genuine uncertainty.
 _HELD_MARK = "◇"          # ◇ waiting on you
 _REBUILD_MARK = "↻"       # ↻ a proposal that has to be rebuilt before it can go
-_LIVE_MARK = "▶"          # ▶ working
+# ● AND NOT ▶, WHICH IS A BUTTON. Every media control on earth uses ▶ for
+# "press to start", so on a row describing a run that has ALREADY been launched
+# it says the opposite of what is true -- and it reads as an affordance on a
+# screen where the glyph column is not clickable and never was. ● is the status
+# -LED convention instead: a filled dot means live, and it needs no learning.
+# It is also the only symmetric mark that fits here; ▶ pointed off the edge of
+# its cell and was the one glyph breaking the column's optical rhythm.
+#
+# The dot ▪ that "terminal with nothing to do" used to carry has LEFT this
+# column -- see _row_state, where a zero-job run joins the ✓ family -- so there
+# is no longer a lighter circle for ● to be confused with.
+_LIVE_MARK = "●"          # ● live: the cluster has it
 _BROKE_MARK = "✗"         # ✗ something failed
-_DONE_MARK = "✓"          # ✓ finished cleanly
+_DONE_MARK = "✓"          # ✓ finished, and the outcome is good
 _STOPPED_MARK = "⊘"       # ⊘ stopped on purpose
-_NOTHING_MARK = "·"       # · terminal, and there was nothing to do
 # ? MEANS ONE THING AND IT IS NOT "SOMETHING ODD HERE": there is not enough
 # authoritative evidence to make a stronger claim. It is a statement about what
 # is KNOWN, never about what happened.
@@ -3259,9 +3548,35 @@ _NOTHING_MARK = "·"       # · terminal, and there was nothing to do
 # taught the glyph to mean "unusual", which is how a reader stops being able to
 # tell it from the two rows where the tool genuinely cannot see.
 #
-# So LAPSED has ↻ now, which says the same thing its STATUS column says --
-# rebuild it -- and ? is left to the two states that earn it: a scheduler that
-# could not be reached, and a submission whose job manifest is not on disk.
+# So LAPSED has ↻, which says the same thing its STATUS column says -- rebuild
+# it -- and ? is left to the states that earn it, every one of which is a
+# sentence about what could not be established rather than about what happened:
+#
+#   scheduler unreachable      nothing about these jobs is known right now
+#   no job manifest on disk    it submitted N jobs; there is no list to ask about
+#   jobs sacct will not own    the accounting database aged the ids out
+#   submit_unknown             the submission's outcome was never established
+#   submitting                 the launch was written down and never came back
+#   submitted, never counted   a legacy record; absent is not zero
+#
+# ALL SIX SAY THE SAME WORD, and that is a deliberate display-level collapse.
+# They reached the screen as three different phrases -- "submission
+# unconfirmed", "submission interrupted" and "unknown" -- which is three
+# vocabulary items for one fact ("this dashboard cannot establish the state")
+# and one next action (/check). Two of the three differed from each other only
+# in WHERE OUR OWN PROCESS DIED, which is not a fact about anybody's run.
+#
+# WHAT THE COLLAPSE IS NOT. Nothing underneath merges. SUBMITTING and
+# SUBMIT_UNKNOWN remain distinct registry statuses, jobs_are_unreachable and
+# `source == "unavailable"` remain distinct findings, and reconcile(),
+# /check, /history and the startup reconciliation all keep reading them
+# exactly as before. This is one column on one screen choosing one word;
+# the evidence model is untouched, and /check is where the six diverge again.
+#
+# The three submission rows are also the ones that moved here from ✗. They used
+# to be drawn in red, identically to a confirmed failure, because
+# runs.list_bucket files them under ATTENTION and ATTENTION owned the glyph --
+# see the long note above _row_state, which is where that is now decided.
 _UNKNOWN_MARK = "?"       # ? not enough evidence to say more
 
 def _marks():
@@ -3274,7 +3589,7 @@ def _marks():
     # Bold green, not cyan. Cyan is unreadable on a light terminal, and a run
     # that is running is not a fourth kind of thing -- it is healthy, like a
     # finished one, and doing something, unlike a finished one. Green says the
-    # first; the weight and the glyph (\u25b6 against \u2713) say the second.
+    # first; the weight and the glyph (\u25cf against \u2713) say the second.
     ACTIVE_BUCKET: (_LIVE_MARK, BOLD + GREEN),
     ATTENTION_BUCKET: (_BROKE_MARK, RED),
     FINISHED_BUCKET: (_DONE_MARK, GREEN),
@@ -3282,31 +3597,233 @@ def _marks():
     }
 
 
-def _mark(bucket, status, record=None):
-    """Glyph and colour for one row.
+# ---------------------------------------------------------------------------
+#  THE PRIMARY STATE OF A RUN, WHICH IS THE ONLY THING /list ANSWERS
+# ---------------------------------------------------------------------------
+# /list is a dashboard. The question it exists to answer is "what state is
+# each run in", once, per row, in the same words every time. It is NOT a
+# diagnosis, and every attempt to make it one has cost it the thing it was for:
+# the STATUS column had grown a `· <reason>` tail carrying the step that broke,
+# the count that broke, how many jobs went out before a submission died, and
+# what the scheduler last said -- all of it then truncated at the column edge
+# to "failed · 2× timeout in gatk_sam_to_…", which is simultaneously too much
+# detail for a listing and too little to act on.
+#
+# The layers underneath it already answer those questions properly:
+#
+#     /list             what state is everything in
+#     /check <name>     what is happening with this run, with the tally
+#     /diagnose <name>  why it broke and what to do
+#     /jobs <name>      the individual scheduler jobs
+#
+# So the tail is gone, the reserved width came DOWN rather than up (see
+# run_list), and every phrase below is short enough to be printed whole. If a
+# phrase here ever needs an ellipsis, it is the wrong phrase.
+#
+# WHAT THE GLYPH MEANS, AND WHY EACH ROW HAS THE ONE IT HAS. The glyph is the
+# PRIMARY STATE, never the reason for it, and the word beside it is the same
+# state said in words -- which is what makes the STATUS column its own legend
+# and why there is no legend block on this screen.
+#
+#   ◇  waiting on a person       the only row that stops until somebody acts
+#   ↻  waiting on a rebuild      established, but not approvable as it stands
+#   ▶  the cluster has it        queued or running, confirmed by the scheduler
+#   ✓  finished, cleanly
+#   ⊘  finished, because somebody stopped it
+#   ·  finished, with nothing to do
+#   ✗  something went wrong      a CONFIRMED failure, and nothing else
+#   ?  not enough evidence       a statement about what is KNOWN, never about
+#                                what happened
+#
+# THE ONE THAT WAS WRONG, and the reason this function exists rather than a
+# bucket lookup. `submit_unknown` and `submitting` were rendered ✗ in red,
+# identically to a confirmed failure -- because list_bucket files all three
+# submission-trouble statuses under ATTENTION, and ATTENTION owned the glyph.
+# runs.py is explicit that SUBMIT_UNKNOWN "is the honest state, and the one
+# that must never be quietly upgraded to either neighbour", and a red cross IS
+# that upgrade: it tells a reader the submission definitely did not happen,
+# when what we actually have is a submission whose outcome was never
+# established and which may have put a full pipeline on the cluster. Those two
+# ask for opposite next actions. They get ? now, and only SUBMIT_FAILED -- the
+# submission command itself running and reporting failure -- keeps the cross.
+#
+# The same correction applies inside a resolved run: jobs the scheduler will
+# not account for (status.unknown) used to read "failed · 12 unaccounted for".
+# Nothing failed. sacct did not recognise the ids, which is what happens when
+# an accounting database ages them out, and the honest word for it is unknown.
+#
+# NOTHING HERE RE-DERIVES A RUN'S STATE FROM ANYTHING NEW. The bucket is still
+# runs.list_bucket()'s, the submission statuses are still the registry's, and
+# the two claims that are stronger than a bucket -- "these jobs cannot be
+# reached" and "this submission created no jobs" -- are runs.py predicates over
+# recorded evidence (jobs_are_unreachable, submitted_nothing). This function
+# chooses words and glyphs; it establishes nothing.
 
-    Held is amber rather than red. Red is for something that went wrong, and a
+
+# What each "the submission did not finish cleanly" registry status says about
+# itself, and which glyph that earns. Worded as the EVENT, because that is what
+# is known: none of the three has a job tally to report.
+#
+# Glyphs rather than colours, because the colour has to be read at call time --
+# retheme() rebinds RED and GREY, and a module-level table freezing them would
+# survive a palette change with the old escape sequences in it. _row_state
+# pairs each glyph with its colour there. Same reason _marks() is a function.
+_SUBMISSION_STATE = {
+    # The command ran and reported failure. Confirmed, so it keeps the cross,
+    # and it keeps its own phrase -- it is the one member of this group whose
+    # next action differs. `failed` means jobs broke and /diagnose has logs to
+    # read; this means the LAUNCH broke and /diagnose has nothing, so the
+    # useful question is "did anything get out first", which is /check's.
+    # What reached the scheduler is /check's to explain and reconcile()'s
+    # `retry_safe` to answer; the uncertainty here is about what escaped, never
+    # about whether it failed.
+    "submit_failed": ("submission failed", _BROKE_MARK),
+    # The outcome could not be established. NOT a failure, and the display must
+    # not round it into one.
+    "submit_unknown": ("unknown", _UNKNOWN_MARK),
+    # /approve was accepted, the record was written before the irreversible
+    # act, and nothing ever came back to reconcile it. Also unestablished, and
+    # it says the same word as its neighbour above on purpose: the two differ
+    # only in where this tool's own process died, which is not a fact about the
+    # run. The registry keeps them apart; this column does not need to.
+    "submitting": ("unknown", _UNKNOWN_MARK),
+}
+
+# EVERY PHRASE THE STATUS COLUMN CAN PRINT, with the glyph it is printed
+# beside. Written down rather than left implicit in the branches below for
+# three reasons, and all three are things that used to go wrong quietly:
+#
+#   the column sizes itself from it   w_status is max(len(word)) -- so a phrase
+#                                     can never be added that does not fit, and
+#                                     the table can never reserve width for a
+#                                     phrase that no longer exists.
+#   the mapping is assertable         a suite can check every state is reachable
+#                                     and that no two states share a glyph
+#                                     without agreeing on what the glyph means.
+#   it is the vocabulary, in one place. This IS the legend. There is no legend
+#                                     block on the screen because each word sits
+#                                     beside its own glyph on every row, which
+#                                     is a legend that cannot go out of date.
+_STATE_WORDS = (
+    ("waiting for approval", _HELD_MARK),     # a person has to decide
+    ("needs rebuilding",     _REBUILD_MARK),  # established, not approvable
+    ("queued",               _LIVE_MARK),     # the scheduler has it
+    ("running",              _LIVE_MARK),     # ...and has started it
+    ("completed",            _DONE_MARK),     # finished; the work ran
+    ("up to date",           _DONE_MARK),     # finished; there was no work
+    ("stopped",              _STOPPED_MARK),  # finished, somebody cancelled
+    ("failed",               _BROKE_MARK),    # confirmed: jobs broke
+    ("submission failed",    _BROKE_MARK),    # confirmed: the launch broke
+    ("unknown",              _UNKNOWN_MARK),  # not enough evidence to say
+)
+
+
+def _row_state(bucket, record, status):
+    """(glyph, colour, word) -- the primary state of one /list row.
+
+    THE single place a listing row's state is decided, so the glyph and the
+    STATUS word cannot disagree with each other. They used to be computed by
+    two functions that both re-derived the answer from the bucket, which is how
+    a row ended up marked ? while its status column said "submitted".
+
+    Held is amber rather than red: red is for something that went wrong, and a
     run waiting for approval has not gone wrong -- it is doing exactly what
-    this tool exists to make it do. Colouring it the same as a failure made
-    every second row on a busy list look like a problem.
-
-    A stopped run and a run that had nothing to do are both DIM: they are
-    terminal and neither is an outcome to celebrate or worry about, and dim is
-    how this table says "nothing further here".
+    this tool exists to make it do. A stopped run and a run that had nothing to
+    do are both DIM: terminal, and neither an outcome to celebrate nor one to
+    worry about.
     """
-    if bucket == FINISHED_BUCKET and status is not None:
-        if status.counts and status.counts.get("CANCELLED"):
-            return _STOPPED_MARK, DIM
-        if not status.counts:
-            return _NOTHING_MARK, DIM
-    if bucket == FINISHED_BUCKET and status is None:
-        # A run whose jobs cannot be reached is not "nothing happened here" --
-        # it ran, and the glyph should not say otherwise. Grey question rather
-        # than the dim dot: what is unknown is the jobs, not the run.
-        if record is not None and runs.jobs_are_unreachable(record):
-            return _UNKNOWN_MARK, GREY
-        return _NOTHING_MARK, DIM
-    return _marks()[bucket]
+    # The bucket's own glyph and colour, from the one table, and the sub-states
+    # below override it where the bucket is not the whole answer. Read from
+    # _marks() rather than retyped per branch: a second copy of "held is amber"
+    # is a second thing to forget when the palette moves.
+    glyph, colour = _marks()[bucket]
+    uncertain = (_UNKNOWN_MARK, GREY)
+
+    if bucket == HELD_BUCKET:
+        return glyph, colour, "waiting for approval"
+    if bucket == LAPSED_BUCKET:
+        # Worded as the next action rather than as the internal state.
+        # "lapsed" is what the registry calls it; what somebody reading a list
+        # needs to know is that this row will not approve and what to type
+        # instead. The reason it lapsed -- which gate went, and why -- is
+        # /check's, and used to be truncated to death here.
+        return glyph, colour, "needs rebuilding"
+    if bucket == UNAVAILABLE_BUCKET:
+        # The scheduler could not be reached, so nothing about this run's jobs
+        # is known RIGHT NOW. The last cached verdict is still on the record
+        # and is still worth reading -- in /check, dated, and said as the
+        # explicitly stale thing it is (_unavailable_line).
+        return glyph, colour, "unknown"
+    counts = (status.counts if status is not None and status.counts else {})
+    if bucket == ACTIVE_BUCKET:
+        # Two words, one state. Not a detail tail: a run that has been queued
+        # for three days is a starving allocation and a run that is executing
+        # is spending one, and the AGE column beside it only means something
+        # once you know which of the two you are looking at.
+        return glyph, colour, "running" if counts.get("RUNNING") else "queued"
+    if bucket == ATTENTION_BUCKET:
+        # THE SUBMISSION ITSELF, before there is anything to count. These three
+        # statuses reach ATTENTION with no RunStatus at all -- see the note
+        # above for why only one of them is a failure.
+        trouble = _SUBMISSION_STATE.get(record.get("status"))
+        if trouble and status is None:
+            word, mark = trouble
+            return (glyph, colour, word) if mark == glyph else (*uncertain, word)
+        broke = any(s in _BROKE for s in counts)
+        doomed = bool(status is not None and status.doomed)
+        if not broke and not doomed and status is not None and status.unknown:
+            # Jobs in the manifest that the scheduler would not account for --
+            # what an accounting database aging ids out looks like. An absence
+            # of evidence, and the one ATTENTION row that is not a failure.
+            # list_bucket is right to raise it (it wants a person) but the word
+            # for it is not "failed".
+            return (*uncertain, "unknown")
+        return glyph, colour, "failed"
+    # FINISHED, in its four flavours.
+    if counts.get("CANCELLED"):
+        # Nothing broke and it is over, so it is not ATTENTION -- but a green
+        # tick on a cancellation would report somebody stopping a run as a
+        # success, which is the one thing a status column must never do.
+        return _STOPPED_MARK, DIM, "stopped"
+    if status is None or not counts:
+        if runs.jobs_are_unreachable(record):
+            # It ran, it put N jobs on the scheduler, and there is no manifest
+            # to ask about them. "submitted · 46 jobs · no job list on disk" was
+            # the old row, and the noun in it is a past EVENT rather than a
+            # current state -- which is the question this column answers. What
+            # is true now is that the live state cannot be established.
+            return (*uncertain, "unknown")
+        if runs.submitted_nothing(record) or (status is not None
+                                              and not status.total):
+            # A real, successful, TERMINAL outcome: GenPipes generated no work
+            # because every output the run asked for was already on disk. Never
+            # "no jobs" and never "nothing to run" -- both read as a failure to
+            # do something, and this is the opposite. Reached only on positive
+            # evidence (see runs.submitted_nothing); a record where nobody ever
+            # counted falls through to unknown below rather than borrowing a
+            # success it cannot show.
+            #
+            # ✓ AND THE SAME GREEN AS `completed`, which reverses an earlier
+            # call that gave this row a dim dot on the grounds that no job
+            # succeeded. The tick is not "jobs succeeded", it is "this is done
+            # and the outcome is good", and by that reading these two belong
+            # together: one ran the work, one found the work already done, and
+            # both leave the user with the outputs they asked for.
+            #
+            # It keeps its own WORD, though, and that is the half worth
+            # preserving. A run that spent no allocation when you expected it
+            # to spend one is a surprise, and a green tick saying "completed"
+            # over zero jobs invites the reading "I computed your results" when
+            # the truth is "your results were already there". The glyph says
+            # the outcome; the word says whether anything was computed.
+            #
+            # "up to date", not "already up to date". The dropped adverb was
+            # reporting on an EVENT that had just happened, and this column
+            # describes a state: what is true of this run is that its outputs
+            # are current.
+            return _DONE_MARK, GREEN, "up to date"
+        return (*uncertain, "unknown")
+    return glyph, colour, "completed"
 
 
 def _progress(status):
@@ -3370,19 +3887,6 @@ def _age(record, now):
     return f"{int(seconds // 86400)}d"
 
 
-# Slurm's state names, said the way a person would. The raw names are shouted
-# constants that read as machine output; this column is prose.
-_BROKE_WORD = {
-    "TIMEOUT": "timeout",
-    "OUT_OF_MEMORY": "out of memory",
-    "NODE_FAIL": "node failure",
-    "FAILED": "failed",
-    "PREEMPTED": "preempted",
-    "BOOT_FAIL": "boot failure",
-    "DEADLINE": "deadline",
-}
-
-
 def _what(record):
     """The pipeline and protocol this run is, or "" if it never said.
 
@@ -3399,149 +3903,6 @@ def _what(record):
             parts.append(str(value).strip())
     return " ".join(p for p in parts if p)
 
-
-def _broke_phrase(status):
-    """"timeout in gatk_haplotype", "5× out of memory in sambamba_merge".
-
-    resolve() already worked this out -- root_cause names the earliest job that
-    broke on its own, its step, and how many broke the same way. The old
-    listing computed none of it and printed a "1" in a FAIL column instead,
-    which is the same width and answers a strictly smaller question: a step
-    name and a failure kind tell you whether to reach for /modify or /diagnose,
-    and a count does not.
-
-    The count here is root_cause's -- jobs that broke the same way in the same
-    step -- not the raw total of everything in a bad state. In a GenPipes DAG
-    one failure cancels everything downstream of it, so the raw total reports
-    a dozen casualties as though they were a dozen problems.
-    """
-    cause = status.root_cause if status is not None else None
-    if not cause or not cause.get("step"):
-        return ""
-    state = cause.get("state")
-    count = cause.get("count") or 1
-    lead = f"{count}× " if count > 1 else ""
-    # The generic FAILED contributes no word, because the column has already
-    # said "failed" and "failed · failed in stringtie" says it twice. Every
-    # other state names something the first word does not -- a timeout and an
-    # out-of-memory are different problems with different fixes.
-    if state == "FAILED":
-        return f"{lead}{cause['step']}"
-    kind = _BROKE_WORD.get(state,
-                           str(state or "failed").lower().replace("_", " "))
-    return f"{lead}{kind} in {cause['step']}"
-
-
-# What each of the three "the submission did not finish cleanly" statuses says
-# about itself. Worded as the EVENT rather than as a job count -- see the note
-# in _row_status where these are used.
-_SUBMISSION_TROUBLE = {
-    "submitting": "submission interrupted",
-    "submit_failed": "submission failed",
-    "submit_unknown": "submission unconfirmed",
-}
-
-
-def _row_status(bucket, record, status):
-    """The last column: the run's state in a word, then why, if there is a why.
-
-    One vocabulary, said the same way every time -- waiting for approval,
-    running, queued, failed, completed, stopped, nothing to run, unknown -- so
-    the column can be read down rather than parsed row by row. The state word
-    comes first on every row, always in the same place, and anything after the
-    `·` is detail that only some states have.
-
-    What follows `failed` is the part the old FAIL column could not carry.
-    resolve() already worked out which step broke and how (root_cause); the
-    listing used to compute none of it and print a bare count instead, which
-    is the same width and answers a strictly smaller question -- a step name
-    and a failure kind tell you whether to reach for /modify or /diagnose, and
-    a number does not.
-
-    Two details are deliberately absent. `completed` and `stopped` carry no
-    tail: the PROGRESS column beside them already says 17/17 and 4/10, and a
-    cancellation has no error to report. And `queued` is a word of its own
-    rather than a flavour of running, because a run that has been queued for
-    three days is a starving allocation, which the AGE column then dates.
-    """
-    if bucket == HELD_BUCKET:
-        return "waiting for approval"
-    if bucket == LAPSED_BUCKET:
-        # Worded as the next action rather than as the internal state. "lapsed"
-        # is what the registry calls it; what somebody reading a list needs to
-        # know is that this row will not approve and what to type instead.
-        why = (record.get("reconciled_because") or "").strip()
-        return f"needs rebuilding · {why}" if why else "needs rebuilding"
-    if bucket == UNAVAILABLE_BUCKET:
-        # The ? already says it could not be resolved, so the tail is spent on
-        # the part it cannot carry: what the scheduler said the last time it
-        # answered at all.
-        last = record.get("last_check")
-        if not last:
-            return "unknown · nothing known yet"
-        return f"unknown · last known: {last.get('verdict', '?')}"
-    counts = (status.counts if status is not None and status.counts else {})
-    if bucket == ACTIVE_BUCKET:
-        return "running" if counts.get("RUNNING") else "queued"
-    if bucket == ATTENTION_BUCKET:
-        # THE SUBMISSION ITSELF, before there is anything to count. These three
-        # statuses reach ATTENTION with no RunStatus at all, and fell through
-        # to the generic wording below, which rendered "failed · 0 jobs" -- a
-        # sentence in which the number is the only concrete thing and it is
-        # about the wrong noun. Nothing failed 0 jobs. What happened is that
-        # the submission did not complete, and that is what these say.
-        #
-        # jobs_seen is named wherever there is one, because SUBMIT_FAILED
-        # explicitly "says nothing about what it managed to submit first" (see
-        # runs.py's status table) -- a failed submission with 12 jobs already
-        # on the scheduler is a different problem from one with none, and the
-        # difference decides whether a retry is safe.
-        submission = _SUBMISSION_TROUBLE.get(record.get("status"))
-        if submission and status is None:
-            seen = record.get("jobs_seen")
-            if seen:
-                return f"{submission} · {seen} job{'s' if seen != 1 else ''} went out first"
-            return f"{submission} · nothing on the scheduler"
-        if status is not None and status.unknown and not status.root_cause:
-            why = f"{status.unknown} unaccounted for"
-        elif (status is not None and status.doomed
-                and not any(s in _BROKE for s in counts)):
-            why = f"{status.doomed} will never run"
-        else:
-            broke = sum(n for s, n in counts.items() if s in _BROKE)
-            why = _broke_phrase(status) or f"{broke} jobs"
-        # Named only when there are any. A run that is half broken and half
-        # still burning allocation is a different decision from one that is
-        # simply over, and that difference is the whole reason to look at this
-        # row now rather than later.
-        active = sum(n for s, n in counts.items() if s in ACTIVE_STATES)
-        if active:
-            why += f" · {active} still running"
-        return f"failed · {why}"
-    # FINISHED, in its three flavours.
-    if counts.get("CANCELLED"):
-        return "stopped"
-    if status is None or not counts:
-        # KNOWN TO HAVE SUBMITTED, and no manifest to ask about it. Checked
-        # before the generic wording because the two are opposite claims made
-        # from the same absence: "nothing to run" says GenPipes generated no
-        # work, and this run generated 46 jobs. Reconciliation established the
-        # count from the conversation's own record of the launch, and a row
-        # that then reports zero is throwing away the only thing anybody knows
-        # about it.
-        if runs.jobs_are_unreachable(record):
-            seen = record.get("jobs_seen")
-            return (f"submitted · {seen} job{'s' if seen != 1 else ''} · "
-                    f"no job list on disk")
-        # Never "no jobs", and no longer "nothing to run" either. Both read as
-        # a failure to do something, and this is the opposite: GenPipes
-        # creating no jobs means every output the run asked for is already on
-        # disk, which is a SUCCESSFUL outcome reached without spending an
-        # allocation. _finished_line has always worded it this way ("no jobs --
-        # everything was already up to date"); the listing said something else
-        # about the same fact, and the listing is the screen people read.
-        return "already up to date"
-    return "completed"
 
 # Held first -- it is the one state waiting on a person to make a decision.
 # Live and needs attention next, because they describe something actually
@@ -3590,6 +3951,50 @@ def _unavailable_line(record):
     return f"last known: {last.get('verdict', '?')} (as of {at})"
 
 
+# WHAT SOMEBODY DOES NEXT, IN THE ORDER THEY ARE LIKELY TO DO IT. Three
+# groups, and the grouping is the argument.
+#
+# The first group is why this screen was opened. Nobody types /list to launch
+# something -- they type it because they want to know what is going on with
+# runs that already exist, and the path from "I see a row" to an answer is:
+#
+#     /check      what is happening with this run
+#       -> /diagnose   why did it go wrong
+#            -> /jobs       show me the actual scheduler jobs
+#
+# /jobs IS DELIBERATELY LAST OF THE THREE, and it is the one ordering choice
+# here worth defending. Half the reason this tool exists is so nobody has to
+# read a job list by hand; putting /jobs before /diagnose advertises the
+# manual path first and quietly says the interpretation is the fallback. It is
+# the other way round: the agent's reading comes first, and the raw jobs are
+# there for when you want to check its work.
+#
+# The pre-launch verbs come second. They are still reachable from here -- a
+# held row is the first thing on the table -- but somebody preparing a run
+# usually meets them at the gate, in the moment, rather than by opening a
+# listing. /modify leads them because a proposal is much more often adjusted
+# than discarded, and /approve is the irreversible one, which is not the
+# member of a group that should be nearest the top.
+#
+# /scan is on its own because it is a different job entirely: not acting on a
+# run in this list, but putting one INTO it.
+#
+# The descriptions say why you would use the command, not what it does
+# internally. "refresh a launched run" described the implementation -- a
+# scheduler call -- to somebody who wanted to know how their run was doing;
+# "adopt runs already on disk" used this project's own word for it. Neither
+# reads as an answer to "which of these do I want".
+# Descriptions come from _ACTION_TEXT, not from here. This table is the one
+# thing that IS local to /list: which commands, in which groups, in which
+# order. (No "awaiting approval" note on /approve -- the STATUS column already
+# says which rows are, on the rows themselves, a few lines up the same screen.)
+_LIST_ACTIONS = (
+    (("/check", "<name>"), ("/diagnose", "<name>"), ("/jobs", "<name>")),
+    (("/modify", "<name>"), ("/approve", "<name>"), ("/reject", "<name>")),
+    (("/scan", "<path>"),),
+)
+
+
 def run_list(rows):
     """/list -- every run still worth acting on, one row each, tagged.
 
@@ -3607,8 +4012,14 @@ def run_list(rows):
          NAME               PIPELINE                 PROGRESS  AGE  STATUS
       \u25c7  rnaseq-0804        rnaseq stringtie                \u00b7  13d  waiting for approval
       \u25b6  rnaseq-0810        rnaseq stringtie            18/44   3h  running
-      \u2717  Test_walltimefail  dnaseq somatic_fastpass      1/44   9d  failed \u00b7 2\u00d7 timeout in \u2026
+      \u2717  Test_walltimefail  dnaseq somatic_fastpass      1/44   9d  failed
       \u2713  rnaseq-light-0726  rnaseq_light                17/17  16d  completed
+
+    ONE STATE PER ROW AND NOTHING ELSE. Every phrase in the STATUS column
+    comes from _row_state and every one of them is printed whole -- there is
+    no `\u00b7 <reason>` tail any more, and the width reserved for the column went
+    DOWN when the tails went, from 30 to 22. See the long note above
+    _row_state for why the reasons left and where they went.
 
     It replaced three stacked lines per run -- name and tag, then a sentence
     restating the tag, then a bare job-list filename -- which cost forty lines
@@ -3623,8 +4034,8 @@ def run_list(rows):
     What replaced them is one fact each, populated on every row: how far along
     (_progress, a fraction, because "29" without a denominator cannot be read),
     how long it has been sitting there (_age, which the listing had no
-    equivalent of at all), and what state it is in (_row_status, which names
-    the step that broke rather than counting the casualties).
+    equivalent of at all), and what state it is in (_row_state, which names
+    the state and leaves the reason to /check).
 
     The job-list filename is gone from the listing and lives in /jobs and
     /view, which is what those commands are for; it was the widest thing on
@@ -3653,12 +4064,20 @@ def run_list(rows):
     w_prog, w_age = 8, 4
     fixed = 2 + 1 + 2 + 2 + 2 + w_prog + 2 + w_age + 2
     # STATUS is reserved BEFORE the name and pipeline columns get to bid, not
-    # left whatever they happen not to use. It is the column carrying the one
-    # thing no other column can say -- "failed · 2× timeout in gatk_haplotype",
-    # "unknown · last known: 6 running" -- and a run name is allowed to be
-    # abbreviated long before that is. 30, because "waiting for approval" is
-    # 20 and the shortest useful failure phrase is longer than that.
-    w_status = 30
+    # left whatever they happen not to use: it carries the one thing no other
+    # column can say, and a run name is allowed to be abbreviated long before
+    # it is.
+    #
+    # 20, DOWN FROM 30, and the direction is the point. The column used to
+    # carry a reason after the state ("failed · 2× timeout in gatk_sam_to_f…")
+    # and 30 was not enough for it either -- the fix for a truncated
+    # explanation is not a wider table, it is not putting the explanation
+    # there. What is left is the state alone, and the reserve is COMPUTED from
+    # _STATE_WORDS rather than typed, so it is exactly the longest phrase
+    # _row_state can produce ("waiting for approval") and nothing in this
+    # column is ever elided. Ten columns went back to the name and the
+    # pipeline, and a phrase can never be added that does not fit.
+    w_status = max(len(word) for word, *_ in _STATE_WORDS)
     budget = max(24, cols - 1 - fixed - w_status)
     w_name = min(max(len(n) for n in names), max(12, budget * 3 // 5))
     w_what = min(max(len(w) for w in whats), max(10, budget - w_name))
@@ -3669,7 +4088,6 @@ def run_list(rows):
                 f"  {'PROGRESS':>{w_prog}}  {'AGE':>{w_age}}  STATUS")
         print(f"  {DIM}{fit(head, cols - 3)}{RESET}")
     for bucket, record, status in ordered:
-        glyph, colour = _mark(bucket, status, record)
         name = str(record["name"])
         # Truncated with an ellipsis rather than allowed to push the columns
         # apart. A name too long for its column is a formatting problem; a table
@@ -3679,12 +4097,13 @@ def run_list(rows):
         # on the glyph, and on the whole status phrase including its reason.
         # Everything between them is bold, grey or plain, so the row has one
         # highlight rather than four competing ones.
+        glyph, colour, word = _row_state(bucket, record, status)
         line = (f"  {colour}{glyph}{RESET}  "
                 f"{BOLD}{pad(name, w_name)}{RESET}"
                 f"  {GREY}{pad(_what(record), w_what)}{RESET}"
                 f"  {_progress(status):>{w_prog}}"
                 f"  {ages[id(record)]:>{w_age}}"
-                f"  {colour}{_row_status(bucket, record, status)}{RESET}")
+                f"  {colour}{word}{RESET}")
         print(fit(line, cols - 1))
 
     # Provenance for the whole listing rather than a timestamp per row: every
@@ -3698,23 +4117,7 @@ def run_list(rows):
         print(f"     {DIM}states read from the scheduler at {at}{RESET}")
 
     print()
-    print(f"  {BOLD}Actions{RESET}")
-    print()
-    for cmd, args, note in (
-        ("/approve", "<name>", "launch a run awaiting approval"),
-        ("/modify", "<name>", "edit a run before launch"),
-        ("/reject", "<name>", "discard a run before launch"),
-        ("/check", "<name>", "refresh a launched run"),
-        ("/jobs", "<name>", "inspect its jobs"),
-        ("/diagnose", "<name>", "investigate a problem"),
-        ("/scan", "<path>", "adopt runs already on disk"),
-    ):
-        # Both columns padded, not just the second. Padding `args` alone left
-        # the descriptions starting wherever the command name happened to end,
-        # so /approve and /modify -- one character apart -- put their notes in
-        # different columns and the block read as ragged. /help gets this right
-        # and this is the same list; it should look the same.
-        print(f"    {DIM}{cmd:<9} {args:<8}{RESET}  {GREY}{note}{RESET}")
+    actions(_LIST_ACTIONS)
     print()
 
 
@@ -3838,9 +4241,12 @@ def history(records, limit=None):
     print()
     if limit and len(rows) > limit:
         print(f"  {DIM}{len(rows) - limit} older record(s) not shown{RESET}")
-    # Where the detail went, named on the screen it was taken off.
-    print(f"  {DIM}/view <name> for the command  \u00b7  /jobs <name> for its jobs"
-          f"  \u00b7  /diagnose <name> for what went wrong{RESET}")
+    # Where the detail went, named on the screen it was taken off. /view leads
+    # because /history is an archive: what somebody comes here for is a run
+    # they have forgotten, and the first question about a forgotten run is what
+    # it was. The scheduler-facing pair follow in their usual order.
+    print()
+    actions([("/view", "<name>"), ("/diagnose", "<name>"), ("/jobs", "<name>")])
     print()
 
 
@@ -3975,8 +4381,17 @@ def triage(name, report):
             print(f"  {RED}\u258c{RESET}   {DIM}{'peak memory':<13}{f['maxrss']}{RESET}")
         if f.get("exit_code"):
             print(f"  {RED}\u258c{RESET}   {DIM}{'exit code':<13}{f['exit_code']}{RESET}")
-        print(f"  {RED}\u258c{RESET}   {DIM}{'log':<13}"
-              f"{os.path.basename(f['log']) if f.get('log') else 'not found'}{RESET}")
+        # WHY THERE IS NO LOG, WHEN THERE IS NO LOG. A cancelled job never
+        # started and so never wrote one; that is not the same as a file that
+        # should be there and is missing, and printing "not found" for both sent
+        # people hunting for the first. See runs.triage.
+        if f.get("log"):
+            note = os.path.basename(f["log"])
+        elif f.get("ran") is False:
+            note = "never ran, no log"
+        else:
+            note = "not found for this run"
+        print(f"  {RED}\u258c{RESET}   {DIM}{'log':<13}{note}{RESET}")
     if report.get("truncated"):
         print(f"  {RED}\u258c{RESET}   {GREY}+{report['truncated']} more step(s){RESET}")
     print(f"  {RED}\u258c{RESET}")
@@ -4031,43 +4446,138 @@ def diagnosis(name, parsed, logs=()):
         print(f"  {RED}▌{RESET}")
         for i, path in enumerate(logs):
             _labelled(f"  {RED}▌{RESET}", "read it yourself" if i == 0 else "",
-                      _tilde(str(path)), style=DIM, wrap=False)
+                      _tilde(str(path)), style=DIM, wrap="path")
     if parsed.get("fix"):
         print(f"  {RED}▌{RESET}")
         _labelled(f"  {RED}▌{RESET}", "fix", parsed["fix"], style=WHITE)
     for section, keys in (parsed.get("override") or {}).items():
         print(f"  {RED}▌{RESET}")
-        print(f"  {RED}▌{RESET}   {'':<18}{WHITE}[{section}]{RESET}")
+        print(f"  {RED}▌{RESET}   {'':<{LABEL_W}}{WHITE}[{section}]{RESET}")
         for key, value in keys.items():
-            print(f"  {RED}▌{RESET}   {'':<18}{DIM}{key} = {RESET}{value}")
+            print(f"  {RED}▌{RESET}   {'':<{LABEL_W}}{DIM}{key} = {RESET}{value}")
     if parsed.get("relaunch"):
         print(f"  {RED}▌{RESET}")
+        # PRINTED, NOT ANNOTATED. There used to be a second line here saying
+        # "the whole range -- GenPipes skips steps that already have output",
+        # under whatever range came back. The claim is true of GenPipes and not
+        # necessarily true of THIS answer: RELAUNCH_RULE asks the model for the
+        # full range but cannot make it comply, so a narrowed range was
+        # captioned with a sentence asserting it was not narrowed. The rule
+        # belongs where it already is -- in the prompt and in genpipes.md --
+        # rather than in a caption the renderer cannot verify.
         _labelled(f"  {RED}▌{RESET}", "resubmit", parsed["relaunch"])
-        print(f"  {RED}▌{RESET}   {'':<18}{DIM}the whole range — GenPipes skips "
-              f"steps that already have output{RESET}")
-    print(f"  {RED}▌{RESET}")
-    if parsed.get("override"):
-        print(f"  {RED}▌{RESET}   {DIM}/modify {RESET}{WHITE}{name}{RESET}"
-              f"{DIM}   writes this into the run's override ini{RESET}")
-    print(f"  {RED}▌{RESET}   {DIM}/jobs {RESET}{WHITE}{name}{RESET}"
-          f"{DIM}    every job and its state{RESET}")
+    gut = f"  {RED}▌{RESET}"
+    print(gut)
+    # /modify only where there IS a fix to apply. What it does to this run --
+    # write the recommended override and gate a fresh copy -- is already stated
+    # by the `fix` and `resubmit` rows a few lines above, which is where a
+    # situation belongs; the description here teaches the command.
+    rows = ([("/modify", name)] if parsed.get("override") else []) + \
+           [("/jobs", name)]
+    actions(rows, gutter=gut)
     print()
 
 
-def _labelled(gutter, label, text, style="", wrap=True):
-    """A label column and a wrapped body, the shape the gate uses. The label is
-    printed once and the continuation lines align under the body, so a long
-    sentence stays one visual block instead of becoming several rows.
+# The label column in a /diagnose row, and the gap between the gutter and it.
+# Named because the wrap budget is computed from them: a line whose body is
+# measured against a different prefix than the one it is printed with is
+# exactly the bug this replaced.
+LABEL_W = 18
+LABEL_GAP = 3
 
-    `wrap=False` is for paths. Wrapping one breaks it across lines mid-token,
-    which costs the only thing a printed path is for: being copied. Letting the
-    terminal overflow is uglier and works.
+
+def _body_width(gutter, cols=None):
+    """How many columns a labelled row's body may occupy.
+
+    THE BUG THIS FIXES. The budget used to be `WIDTH - 26`, where WIDTH was the
+    constant 74 -- the only reference to it in this module, while every other
+    block that has to fit the window (the listing, the history table, the plan
+    checklist) asks terminal_cols(). On a window narrower than 74 the body
+    overflowed; the terminal then soft-wrapped the overflow to COLUMN ZERO,
+    which is left of and underneath the gutter, so a long line ran under the
+    very rule it was supposed to sit beside. On a window wider than 74 it threw
+    away the extra space.
+
+    The prefix is measured with cells(), not len(), because the gutter carries
+    colour codes that occupy no columns and a block-drawing glyph that does.
     """
-    body = (textwrap.wrap(str(text), max(24, WIDTH - 26)) or [""] if wrap
-            else [str(text)])
+    if cols is None:
+        # A real window when there is one. Off-screen -- redirected to a file,
+        # captured in a test -- there is nothing to overflow, so the old fixed
+        # width stands and output stays stable.
+        cols = terminal_cols() if _tty() else WIDTH
+    return max(24, cols - cells(gutter) - LABEL_GAP - LABEL_W - 1)
+
+
+def _wrap_path(text, width):
+    """A path broken onto several lines at its separators.
+
+    Paths used to be printed unwrapped, on the reasoning that breaking one costs
+    the only thing a printed path is for -- being copied -- and that letting the
+    terminal overflow was merely ugly. It is not merely ugly: the terminal
+    restarts the overflow at column zero, so a 138-column log path prints its
+    tail underneath the gutter.
+
+    Breaking at "/" keeps every line copyable as a piece and keeps the whole
+    thing readable as a path, which mid-token wrapping does neither of. A single
+    segment longer than the budget is cut, because a name that cannot fit has
+    to go somewhere and off the edge of the screen is the one place it must
+    not.
+    """
+    text = str(text)
+    if len(text) <= width:
+        return [text]
+    # Each separator stays with the segment it follows, so a line ends on "/"
+    # and the eye can see the path continues.
+    parts = text.split("/")
+    pieces = [c + ("/" if i < len(parts) - 1 else "")
+              for i, c in enumerate(parts)]
+    out, line = [], ""
+    for piece in pieces:
+        if len(line) + len(piece) <= width:
+            line += piece
+            continue
+        if len(piece) <= width:
+            if line:
+                out.append(line)
+            line = piece
+            continue
+        # A single segment too long for any line -- GenPipes job names run to
+        # sixty characters. Fill the room left on this line before cutting, so
+        # the break is at the edge of the screen rather than wherever the
+        # segment happened to start.
+        room = width - len(line)
+        if room > 0:
+            line += piece[:room]
+            piece = piece[room:]
+        out.append(line)
+        while len(piece) > width:
+            out.append(piece[:width])
+            piece = piece[width:]
+        line = piece
+    if line:
+        out.append(line)
+    return out or [text]
+
+
+def _labelled(gutter, label, text, style="", wrap=True, cols=None):
+    """A label column and a wrapped body. The label is printed once and the
+    continuation lines align under the body, so a long sentence stays one
+    visual block instead of becoming several rows.
+
+    `wrap="path"` breaks on separators instead of on spaces -- see _wrap_path.
+    """
+    width = _body_width(gutter, cols)
+    text = str(text)
+    if wrap == "path":
+        body = _wrap_path(text, width)
+    elif wrap:
+        body = textwrap.wrap(text, width) or [""]
+    else:
+        body = [text]
     for i, line in enumerate(body):
         shown = label if i == 0 else ""
-        print(f"{gutter}   {DIM}{shown:<18}{RESET}{style}{line}{RESET}")
+        print(f"{gutter}   {DIM}{shown:<{LABEL_W}}{RESET}{style}{line}{RESET}")
 
 
 def _names(records, limit=3):
@@ -4237,8 +4747,11 @@ def status_overview(groups):
                 print(f"      {DIM}{row['suggest']}{RESET}")
         print()
 
-    print(f"  {DIM}/check <name>{RESET}{DIM}  ·  /diagnose <name>  ·  /jobs <name>"
-          f"  ·  /scan [path]{RESET}")
+    # /check <name> IS offered here, unlike inside /check <name> itself: this
+    # is the all-runs view, and narrowing to one run is the natural next step
+    # rather than a re-run of what the reader just typed.
+    actions([[("/check", "<name>"), ("/diagnose", "<name>"), ("/jobs", "<name>")],
+             [("/scan", "<path>")]])
     print()
 
 
@@ -4501,8 +5014,11 @@ def scan_results(root, found, added=(), skipped=(), restored=()):
             print(f"  {DIM}▌{RESET}   {BOLD}{name}{RESET}  {DIM}— {why}{RESET}")
     for name, why in skipped or ():
         print(f"  {DIM}▌{RESET}   {DIM}{name} — {why}{RESET}")
-    print(f"  {DIM}▌{RESET}")
-    print(f"  {DIM}▌{RESET}   {DIM}/list  ·  /check <name>  ·  /check all{RESET}")
+    gut = f"  {DIM}▌{RESET}"
+    print(gut)
+    # /list first: what /scan just did is put runs INTO the listing, so seeing
+    # them there is the step that confirms it worked.
+    actions([("/list",), ("/check", "<name>")], gutter=gut)
     print()
 
 

@@ -55,6 +55,22 @@ def drawn(fn, *args, **kwargs):
     return re.sub(r"\033\[[0-9;]*[A-Za-z]", "", buf.getvalue())
 
 
+def _at_width(cols, fn, *args, **kwargs):
+    """Call a renderer as if the terminal were `cols` columns wide.
+
+    Both halves are needed: display asks _tty() whether there is a window at
+    all before it asks terminal_cols() how wide it is, and under redirected
+    stdout the first answer is False.
+    """
+    was_tty, was_cols = display._tty, display.terminal_cols
+    display._tty = lambda: True
+    display.terminal_cols = lambda: cols
+    try:
+        fn(*args, **kwargs)
+    finally:
+        display._tty, display.terminal_cols = was_tty, was_cols
+
+
 def loud(fn, *args, **kwargs):
     """drawn(), with the transcript unfolded.
 
@@ -85,6 +101,21 @@ def job(job_id, name, state, elapsed="00:14:22", maxrss=None):
     j = runs.Job(job_id=job_id, name=name, log=f"{name.split('.')[0]}/x.o")
     j.state, j.elapsed, j.maxrss = state, elapsed, maxrss
     return j
+
+
+def _offers(screen, verb, arg="", note=None):
+    """Is `verb` proposed on this screen, with `arg` and (optionally) `note`?
+
+    Column-padding-insensitive on purpose. display.actions() aligns the command
+    and argument columns across the whole block, so "/check r1" is rendered
+    "/check  r1" when a longer verb shares the block -- and an assertion on the
+    exact spacing would fail every time a sibling command was added or removed,
+    which is not what any of these tests are about.
+    """
+    want = [re.escape(verb)] + ([re.escape(arg)] if arg else [])
+    if note:
+        want.append(re.escape(note))
+    return re.search(r"\s+".join(want), strip(screen)) is not None
 
 
 def main():
@@ -234,8 +265,14 @@ def main():
     finished_status = runs.RunStatus(
         counts={"COMPLETED": 10}, total=10, resolved=10, unknown=0,
         finished=True, verdict="complete", doomed=0, source="sacct")
+    # jobs_seen 0 / expected_jobs 0 is what record_outcome() writes when
+    # reconcile() saw a script declaring `# TOTAL: 0`, a clean exit and no new
+    # job rows. It is the EVIDENCE that lets the listing say "already up to
+    # date" -- a record with no job list and no count at all is a different
+    # thing entirely, and gets its own fixture below.
     up_to_date = {"name": "nothing-to-do", "status": "submitted", "held_at": None,
-                  "submitted_at": "2026-07-25T11:00:00", "job_list": None}
+                  "submitted_at": "2026-07-25T11:00:00", "job_list": None,
+                  "jobs_seen": 0, "expected_jobs": 0}
     stopped_record = {"name": "i-stopped-it", "status": "submitted", "held_at": None,
                       "submitted_at": "2026-07-22T09:00:00",
                       "job_list": "/s/job_output/DnaSeq.job_list.T6"}
@@ -303,38 +340,50 @@ def main():
                 for n in ("waiting", "running-one", "half-broken", "all-done")))
 
     r.contains("a truly active run says it is running", row("running-one"), "running")
-    r.check("and carries its own mark", cells_of("running-one")[0] == "▶")
+    # ● AND NOT ▶. A play triangle is a control -- "press to start" everywhere
+    # else a person has seen one -- and this row describes a run that has
+    # already been launched, on a column that is not clickable. ● is the
+    # status-LED reading instead: a filled dot means live.
+    r.check("and carries the live indicator, not a play button",
+            cells_of("running-one")[0] == "●")
+    r.check("the play triangle is gone from the state column",
+            "▶" not in out, out)
     r.check("its progress is a fraction, so the number means something",
             "9/15" in cells_of("running-one"))
 
     r.check("a mixed active+failed run is marked broken, not live",
             cells_of("half-broken")[0] == "✗")
-    r.check("its row leads with the failure, not with what is still going",
-            row("half-broken").index("failed")
-            < row("half-broken").index("still running"))
-    r.contains("its still-running jobs are named, not just the failures",
-               row("half-broken"), "still running")
     r.contains("a fully dead run says it failed", row("fully-dead"), "failed")
-    # "nothing still running" is what usually follows a failure. Saying it on
-    # every broken row spent the widest column on screen restating the expected
-    # case; the surprise -- jobs still burning allocation after a failure -- is
-    # the half worth the width, and it is still said above.
-    r.check("and does not spend the column restating the ordinary case",
-            "nothing still running" not in row("fully-dead"))
+    # THE STATE, AND NOT A WORD MORE. /list answers "what state is this run
+    # in"; how many jobs are still burning allocation behind the failure is an
+    # operational fact, it is what /check exists to lay out, and putting it
+    # here only ever fitted as "failed · 3 jobs · 2 still runn…".
+    for row_name in ("half-broken", "fully-dead"):
+        r.equal(f"{row_name} says the state and stops there",
+                cells_of(row_name)[-1], "failed")
+        r.check("with no job tally trailing it",
+                "still running" not in row(row_name), row(row_name))
 
-    # One vocabulary, in the same place on every row, so the column reads down.
-    r.check("every row leads with its state in the same words",
-            all(any(w in row(n) for w in (
-                "waiting for approval", "running", "queued", "failed",
-                "completed", "stopped", "already up to date", "unknown",
-                "needs rebuilding", "submission"))
-                for n in ("waiting", "running-one", "half-broken",
-                          "fully-dead", "all-done", "i-stopped-it",
-                          "nothing-to-do", "cant-tell")))
+    # ONE CLOSED VOCABULARY. Every row's STATUS is one of display._STATE_WORDS
+    # exactly -- not "starts with", not "contains". That is the property that
+    # makes the column readable down rather than parsed row by row, and it is
+    # the property a reason-tail breaks the moment somebody adds one back.
+    said = {word for word, _ in display._STATE_WORDS}
+    for n in ("waiting", "running-one", "half-broken", "fully-dead",
+              "all-done", "i-stopped-it", "nothing-to-do", "cant-tell"):
+        tail = row(n).split("  ")[-1].strip()
+        r.check(f"{n}'s status is one of the states, whole", tail in said,
+                f"{tail!r} not in {sorted(said)}")
 
-    # resolve() already worked out which step broke and how. The old listing
-    # computed none of it and printed a count in a FAIL column instead, which
-    # is the same width and answers a strictly smaller question.
+    # ------------------------------------------------------------------ #
+    r.section("the diagnosis lives in /check, and /list does not paraphrase it")
+    # THE DEFECT THIS CLOSES. resolve() works out which step broke, how, and
+    # how many broke the same way, and /list used to print it: "failed · 2×
+    # timeout in gatk_sam_to_…". Too much for a listing and, once the column
+    # cut it, too little to act on -- the one word that would have told you
+    # which step is the word that got elided. /check <name> lays the same
+    # finding out in full, with the tally, the walltime limit and the
+    # downstream impact, which is what it is for.
     timeout_record = {"name": "timed-out", "status": "submitted", "held_at": None,
                       "submitted_at": "2026-07-24T09:00:00",
                       "job_list": "/s/job_output/DnaSeq.job_list.T7"}
@@ -345,27 +394,33 @@ def main():
                     "count": 2, "job": "gatk_haplotype_caller.S1"})
     cause_out = drawn(display.run_list, [(timeout_record, timeout_status)])
     cause_row = next(l for l in cause_out.splitlines() if "timed-out" in l)
-    r.contains("a broken run names the step that broke",
-               cause_row, "gatk_haplotype_caller")
-    r.contains("and says how it broke, in words rather than a Slurm constant",
-               cause_row, "timeout")
-    r.check("and how many broke the same way", "2×" in cause_row)
-    r.contains("its progress shows it died on takeoff, not at the finish line",
+    r.check("a broken run says failed, and only failed",
+            cause_row.split("  ")[-1].strip() == "failed", cause_row)
+    for detail in ("gatk_haplotype_caller", "timeout", "2×"):
+        r.check(f"and does not paraphrase {detail!r} from the diagnosis",
+                detail not in cause_row, cause_row)
+    r.contains("its progress still shows it died on takeoff",
                cause_row, "1/44")
-    # "failed · failed in stringtie" says it twice. The generic FAILED
-    # contributes no word of its own; every other state names something the
-    # leading "failed" does not.
-    plain = dict(timeout_record, name="plain-break")
-    plain_status = runs.RunStatus(
-        counts={"COMPLETED": 29, "FAILED": 1}, total=30, resolved=30,
-        unknown=0, finished=True, verdict="failed", doomed=0, source="sacct",
-        root_cause={"step": "stringtie", "state": "FAILED", "count": 1,
-                    "job": "stringtie.S1"})
-    plain_out = drawn(display.run_list, [(plain, plain_status)])
-    plain_row = next(l for l in plain_out.splitlines() if "plain-break" in l)
-    r.contains("a plain failure names its step", plain_row, "failed · stringtie")
-    r.check("and does not say 'failed' twice",
-            plain_row.count("failed") == 1)
+    # The evidence is not lost -- it moved to the screen that can hold it.
+    r.contains("while /check names the step that broke",
+               strip(drawn(display.run_status, "timed-out", timeout_status)),
+               "gatk_haplotype_caller")
+
+    # NOTHING IN THIS COLUMN IS EVER ELIDED. The old fix for a truncated
+    # explanation would have been a wider table; the actual fix was to stop
+    # putting explanations here, and the reserved width went DOWN as a result.
+    long_rows = [(dict(timeout_record, name=f"r-{i}"), timeout_status)
+                 for i in range(3)]
+    long_rows.append(({"name": "held-wide", "status": "held",
+                       "held_at": "2026-07-24T09:00:00", "submitted_at": None,
+                       "job_list": None}, None))
+    narrow = drawn(_at_width, 80, display.run_list, long_rows)
+    r.contains("the longest state prints whole, even at 80 columns",
+               narrow, "waiting for approval")
+    # The reserve is COMPUTED from _STATE_WORDS, not typed, so a phrase can
+    # never be added that the column has not grown to hold.
+    r.equal("and the column reserves exactly that much and no more",
+            max(len(w) for w, _ in display._STATE_WORDS), 20)
 
     # "complete" beside a ✓ and a 10/10 is the third time one row has said the
     # same thing. The tick and the full fraction carry it; the NEEDS column is
@@ -381,13 +436,32 @@ def main():
     # already on disk -- and both older wordings read as a failure to do
     # something. _finished_line has always said it this way; the listing now
     # agrees with it.
-    r.contains("a zero-job run says its outputs were already there",
-               row("nothing-to-do"), "already up to date")
+    def status_of(name):
+        """The STATUS column's whole phrase. cells_of() splits on whitespace,
+        which cuts a multi-word state into pieces; the columns are separated by
+        two spaces, so the last such field is the phrase, intact."""
+        return row(name).split("  ")[-1].strip()
+
+    r.equal("a zero-job run says its outputs are current",
+            status_of("nothing-to-do"), "up to date")
     for wrong in ("nothing to run", "no jobs", "failed"):
         r.check(f"and never {wrong!r}, which reads as a fault",
                 wrong not in row("nothing-to-do"), row("nothing-to-do"))
-    r.check("and is not given the tick that means jobs succeeded",
-            cells_of("nothing-to-do")[0] != "✓")
+    # "already up to date" was a report on an event that had just happened.
+    # This column describes a STATE, and what is true of this run is that its
+    # outputs are current.
+    r.check("and not as a report on something that just happened",
+            "already" not in row("nothing-to-do"), row("nothing-to-do"))
+    # THE TICK IS "THIS IS DONE AND THE OUTCOME IS GOOD", not "jobs succeeded".
+    # By that reading a run that found its work already done belongs with a run
+    # that did the work: both leave the user holding the outputs they asked
+    # for. The WORD is what keeps them apart -- a green tick reading
+    # "completed" over zero jobs would invite "I computed your results" when
+    # the truth is "your results were already there".
+    r.equal("it joins the successful-terminal glyph family",
+            cells_of("nothing-to-do")[0], "✓")
+    r.check("while still not claiming the work was computed",
+            "completed" not in row("nothing-to-do"), row("nothing-to-do"))
 
     r.contains("a run somebody stopped is stopped, never completed",
                row("i-stopped-it"), "stopped")
@@ -400,14 +474,20 @@ def main():
             cells_of("cant-tell")[0] == "?")
     r.check("it is not marked as having failed",
             cells_of("cant-tell")[0] != "✗")
-    r.contains("and offers the last known verdict instead of silence",
-               row("cant-tell"), "last known")
+    r.equal("and says exactly that, with no stale verdict dragged along",
+            cells_of("cant-tell")[-1], "unknown")
+    # The cached verdict is not gone -- it is dated, explicitly stale, and
+    # belongs where there is room to say so.
+    r.check("the last known verdict is not paraphrased into the listing",
+            "last known" not in out, out)
+    r.contains("it is what _unavailable_line is for",
+               display._unavailable_line(unreachable_record), "last known")
 
     # Every mark is distinct, which is the property that lets the column carry
     # the state on its own -- two states sharing a glyph would leave the
     # difference carried by colour, and there is no colour left to carry it.
-    marks = [display._HELD_MARK, display._LIVE_MARK, display._BROKE_MARK,
-             display._DONE_MARK, display._STOPPED_MARK, display._NOTHING_MARK,
+    marks = [display._HELD_MARK, display._REBUILD_MARK, display._LIVE_MARK,
+             display._BROKE_MARK, display._DONE_MARK, display._STOPPED_MARK,
              display._UNKNOWN_MARK]
     r.equal("every state has its own glyph", len(set(marks)), len(marks))
 
@@ -446,15 +526,13 @@ def main():
         r.check("and a failure is red rather than the amber of a decision",
                 display.AMBER not in painted_row("half-broken"))
 
-    # The reason travels with the word it explains. Splitting them would put
-    # "failed" in red and the one fact telling you what to do about it in
-    # whatever colour was left over.
+    # The state word is the ONLY thing on the row painted in the state's
+    # colour besides the glyph. There is no reason clause after it to leak a
+    # second highlight into the widest column on screen.
     broke = painted_row("half-broken")
     if colour:
-        r.check("a failure's reason carries the same colour as the word 'failed'",
-                broke.index(display.RED) < broke.index("failed")
-                and display.RESET not in broke[broke.index("failed"):
-                                               broke.index("still running")])
+        r.check("the word 'failed' is painted, and it is the end of the row",
+                broke.index(display.RED) < broke.index("failed"))
 
     # Everything between the two ends is weight, not hue: bold name, grey
     # pipeline, plain counts.
@@ -516,7 +594,8 @@ def main():
     r.check("the diagnosis prose stays off the summary",
             "picard_mark_duplicates" not in out)
     r.check("and a stale status is never called live", "live" not in out)
-    r.contains("it points at where the detail is", out, "/diagnose <name>")
+    r.check("it points at where the detail is, under an Actions heading",
+            "Actions" in out and _offers(out, "/diagnose", "<name>"), out)
 
     r.section("/history <name> is where the finding survives")
     out = drawn(display.history_detail, dict(archived))
@@ -606,6 +685,92 @@ def main():
     r.contains("the exit code", out, "0:125")
     r.contains("and the log it read", out, "x_3.o")
 
+    r.section("a job that never ran says so, rather than 'not found'")
+    # A CANCELLED job never started, so it never wrote a log. That is not the
+    # same as a file that should be there and is missing, and printing "not
+    # found" for both sent people hunting for the first. See runs.triage.
+    out = drawn(display.triage, "patient-42", {
+        "failed_total": 2, "broke_total": 0, "cancelled_total": 2,
+        "steps_affected": 1, "truncated": 0,
+        "findings": [{"step": "trim_fastp", "count": 2, "job": "trim_fastp.A",
+                      "job_id": "9", "state": "CANCELLED", "maxrss": None,
+                      "exit_code": None, "ran": False,
+                      "log": None, "log_tail": None, "script": None}]})
+    r.contains("the cancellation is still named", out, "trim_fastp")
+    r.contains("with its state", out, "cancelled")
+    r.contains("and the reason there is no log", out, "never ran")
+    r.check("without claiming a file is missing", "not found" not in out)
+
+    # ---------------------------------------------------------------- #
+    r.section("the diagnosis panel keeps every line right of its gutter")
+    # THE BUG. The body used to be wrapped against the constant WIDTH = 74 --
+    # the only reference to it in display.py, while every other block that has
+    # to fit the window asks terminal_cols(). Below 74 the line overflowed, and
+    # a terminal soft-wraps an overflow to COLUMN ZERO: left of and underneath
+    # the gutter it was supposed to sit beside. Log paths were worse, printed
+    # unwrapped on purpose at 130-odd columns.
+    long_path = ("/home/pbourque/genpipe-workflow-assistant/job_output/"
+                 "gatk_sam_to_fastq/"
+                 "gatk_sam_to_fastq.tumorPair_COLO829N_2026-07-30T16.17.43.o")
+    answer = {"shaped": True, "confidence": "unclear",
+              "manner": "gatk_sam_to_fastq hit its walltime.",
+              "cause": "The job was killed at 00:01:00 after running 00:01:01, "
+                       "while it was still streaming reads from the input BAM.",
+              "evidence": [f"the .o log ends mid-record with no error, at {long_path}"],
+              "fix": "raise cluster_walltime for the [gatk_sam_to_fastq] section",
+              "override": {"gatk_sam_to_fastq": {"cluster_walltime": "3:00:00"}},
+              "relaunch": "1-23"}
+
+    for cols in (60, 74, 100, 120):
+        text = drawn(_at_width, cols, display.diagnosis,
+                     "Test_walltimefail", answer, [long_path])
+        lines = [l for l in text.splitlines() if l.strip()]
+        widest = max(len(l) for l in lines)
+        r.check(f"nothing overflows a {cols}-column window",
+                widest <= cols, f"widest={widest}")
+        # Every line of the block carries the gutter, and the gutter is always
+        # at the same two columns -- which is the visible form of "no line
+        # restarted at column zero".
+        r.check(f"every line still starts at the gutter at {cols}",
+                all(l.startswith("  ▌") for l in lines),
+                [l for l in lines if not l.startswith("  ▌")][:2])
+        r.contains(f"and the path is still whole at {cols}",
+                   "".join(l[24:] for l in lines
+                           if l.startswith("  ▌") and "genpipe-workflow" in l
+                           or l.startswith("  ▌") and "16.17.43.o" in l),
+                   "16.17.43.o")
+
+    r.section("a wide window is actually used, not squandered")
+    narrow = drawn(_at_width, 74, display.diagnosis, "n", answer, [long_path])
+    wide = drawn(_at_width, 140, display.diagnosis, "n", answer, [long_path])
+    r.check("140 columns produces fewer lines than 74",
+            len(wide.splitlines()) < len(narrow.splitlines()),
+            f"wide={len(wide.splitlines())} narrow={len(narrow.splitlines())}")
+
+    r.section("paths break at separators, never mid-token by accident")
+    pieces = display._wrap_path("/aaa/bbb/ccc/ddd", 10)
+    r.equal("packed to the budget", pieces, ["/aaa/bbb/", "ccc/ddd"])
+    r.check("nothing longer than the budget",
+            all(len(p) <= 10 for p in pieces))
+    huge = display._wrap_path("/x/" + "z" * 40, 12)
+    r.check("a segment too long for any line is still cut to fit",
+            all(len(p) <= 12 for p in huge), huge)
+    r.equal("and rejoins to exactly the original", "".join(huge), "/x/" + "z" * 40)
+    r.equal("a path that fits is left alone",
+            display._wrap_path("/short/path", 40), ["/short/path"])
+
+    r.section("Python no longer captions the model's resubmit range")
+    # The renderer used to print "the whole range -- GenPipes skips steps that
+    # already have output" under WHATEVER range came back. True of GenPipes,
+    # not necessarily true of that answer: RELAUNCH_RULE asks for the full
+    # range but cannot make the model comply, so a narrowed range was captioned
+    # with a sentence asserting it was not narrowed.
+    narrowed = dict(answer, relaunch="7-9")
+    out = drawn(_at_width, 100, display.diagnosis, "n", narrowed, [])
+    r.contains("the range the model gave is printed", out, "7-9")
+    r.check("with no claim about what it covers",
+            "the whole range" not in out and "already have output" not in out)
+
     # ---------------------------------------------------------------- #
     r.section("the small messages always offer a way forward")
     out = drawn(display.problem, "No run named 'patient-4'.", "/list shows what there is.")
@@ -662,6 +827,33 @@ def main():
         r.contains(f"has {heading!r}", out, heading)
     r.contains("with a worked example to say out loud", out,
                "run dnaseq germline_snv on my readset, all steps")
+
+    # THE EXAMPLE IS HELPER TEXT, NOT A THIRD PIECE OF BRANDING. It was set in
+    # WHITE, which is BOLD (see the palette note in display.py) -- so a bold
+    # line sat directly under a bold heading, a few rows below a bold wordmark,
+    # on the one screen whose job is to say what this product is called. Three
+    # things competing on the loudest weight the terminal has is the same as
+    # none of them being emphasised. It reads exactly like "type / to browse
+    # commands" does: an illustration of the heading above it. So it is set the
+    # same way -- GREY, the readable quiet -- and the emphasis is left to the
+    # headings and the mark.
+    right = display._right_column(60, "Anthropic", "claude-sonnet-5", "/tmp/p")
+    example = next(l for l in right if "germline_snv on my readset" in l)
+    browse = next(l for l in right if "to browse commands" in l)
+    if colour:
+        r.check("the example is not emphasised", display.BOLD not in example,
+                repr(example))
+        r.check("it is set in the same quiet as the other helper line",
+                display.GREY in example and display.GREY in browse,
+                repr(example))
+        # ...while what it is an example OF still is.
+        heading = next(l for l in right if l.endswith("Ask naturally" + display.RESET))
+        r.check("its heading keeps the emphasis", display.BOLD in heading,
+                repr(heading))
+        r.check("and the example is still not painted like a command",
+                display.GREEN not in example, repr(example))
+    r.contains("and it is still fully legible on the screen", out,
+               "run dnaseq germline_snv")
     r.contains("the two commands worth knowing", out, "/list")
     r.contains("and what they do", out, "see your runs")
     r.contains("plus how to find the rest", out, "to browse commands")
@@ -1031,10 +1223,30 @@ def main():
     r.check("nor rejected", "/reject" not in sent)
     r.contains("it can be checked", sent, "/check")
     r.contains("and modified", sent, "/modify")
-    # The one line that stops /modify reading as a rewrite of something live.
-    r.contains("which says plainly that it copies", sent,
-               "copies it into a new run")
-    r.contains("leaving the original alone", sent, "this one is untouched")
+    # NOR IS IT OFFERED AN EXPLANATION FOR SOMETHING NOTHING SAYS WENT WRONG.
+    # /view asks the scheduler nothing, so it cannot know whether this run is
+    # queued, running, finished cleanly or broken -- and /diagnose means
+    # "explain what went wrong". It used to be offered under every submitted
+    # run regardless. The ladder still reaches it one rung later and on
+    # evidence: /view offers /check, and /check offers /diagnose exactly when
+    # something actually broke.
+    r.check("but not diagnosed on a screen that has asked nobody anything",
+            "/diagnose" not in sent, sent)
+    r.check("the command that would find out is what it offers instead",
+            _offers(sent, "/check", "pouletrun",
+                    display._ACTION_TEXT["/check"]), sent)
+    # ONE DESCRIPTION PER COMMAND. This block used to carry its own wording
+    # ("copies it into a new run; this one is untouched") which was a fourth
+    # phrasing of a verb three other screens already described differently.
+    # What /modify does to a submitted run -- fork it -- is a property of the
+    # run's state, and the screen says the state on its own header line.
+    r.check("and it is described the way every other screen describes it",
+            _offers(sent, "/modify", "pouletrun",
+                    display._ACTION_TEXT["/modify"]), sent)
+    for stale in ("copies it into a new run", "this one is untouched",
+                  "how it is doing on the scheduler",
+                  "read the logs and explain a failure"):
+        r.check(f"and no longer says {stale!r}", stale not in sent, sent)
 
     dropped = drawn(display.run_view, viewed, "pouletrun", "abandoned")
     r.contains("an abandoned run can still be copied", dropped, "/modify")
@@ -1196,7 +1408,7 @@ def main():
     r.contains("and naming the step that broke", text, "gatk_sam_to_fastq")
     r.check("no paths or job-list filenames leak in", "job_list" not in text)
     r.check("the footer offers /check, not a second listing command",
-            "/check <name>" in text and "/status" not in text)
+            _offers(text, "/check", "<name>") and "/status" not in text, text)
 
     # ---------------------------------------------------------------- #
     r.section("the plan is drawn, and drawn once")
@@ -1259,7 +1471,9 @@ def main():
                  record(runs.SUBMITTED, jobs_seen=46, expected_jobs=46))
     r.contains("a real submission says so", done, "submitted")
     r.contains("with the job count", done, "46 job")
-    r.contains("and offers monitoring", done, "/check r1")
+    r.check("and offers monitoring, under an Actions heading",
+            "Actions" in done and _offers(done, "/check", "r1",
+                                          display._ACTION_TEXT["/check"]), done)
 
     # Zero jobs is a success, not a failure, and must not read as one.
     nothing = drawn(display.post_approve, "r2",
@@ -1369,6 +1583,7 @@ def main():
 
     # The mirror's pending state: bold+underline, never red.
     from genpipe import mirror as _mirror
+    from genpipe import modify
     m = _mirror.from_slots(proposal, name="patient-42")
     rows = "\n".join(display.mirror_lines(m, pending=["protocol"]))
     if colour:
@@ -1392,7 +1607,7 @@ def main():
     # all reduce to.
     stripped = drawn(display.run_list, listing_rows)
     for name, glyph, word in (("waiting", "\u25c7", "waiting for approval"),
-                              ("running-one", "\u25b6", "running"),
+                              ("running-one", "\u25cf", "running"),
                               ("half-broken", "\u2717", "failed"),
                               ("all-done", "\u2713", "completed"),
                               ("i-stopped-it", "\u2298", "stopped")):
@@ -1449,16 +1664,400 @@ def main():
             mark_of("manifest-lost"), "?")
     r.equal("and so is a scheduler that could not be reached",
             mark_of("cant-tell"), "?")
+    # "submitted · 46 jobs · no job list on disk" was the old row, under a ?.
+    # The glyph was right and the word was not: `submitted` is a past EVENT,
+    # and this column answers what state the run is in NOW -- which, with no
+    # manifest to ask about, is precisely that we cannot establish it.
+    lost_row = next(l for l in glyphs.splitlines() if "manifest-lost" in l)
+    r.equal("and it says so, rather than naming the event that got it there",
+            lost_row.split("  ")[-1].strip(), "unknown")
+    r.check("with the job count left to /check", "46 jobs" not in lost_row,
+            lost_row)
     r.check("those two are the only rows ? is spent on",
             [l for l in glyphs.splitlines() if l.strip()[:1] == "?"].__len__() == 2,
             glyphs)
     # Not "no jobs" and not "nothing to run". GenPipes generating no work means
     # every output asked for was already on disk, which is a run that succeeded
     # without spending an allocation.
-    r.equal("a run with nothing to do is marked terminal-but-empty",
-            mark_of("nothing-to-do"), "\u00b7")
-    r.contains("and is worded as the success it is",
-               glyphs, "already up to date")
+    r.equal("a run with nothing to do is marked as the success it is",
+            mark_of("nothing-to-do"), "\u2713")
+    r.contains("and worded so the tick cannot be read as 'I computed this'",
+               glyphs, "up to date")
+
+    # ------------------------------------------------------------------ #
+    r.section("'already up to date' is a claim, and it needs the evidence for it")
+    # WHAT THAT ROW ACTUALLY MEANT. record_outcome() writes jobs_seen 0 and
+    # expected_jobs 0 when reconcile() saw three facts agree: a script
+    # declaring `# TOTAL: 0`, a clean exit, and no new rows in the job list.
+    # That is a real, successful, terminal outcome -- GenPipes generated no
+    # work because every output was already on disk -- and any run reaches it
+    # by being re-run after it has finished. So the state stays.
+    #
+    # What does NOT stay is inferring it from an absence. `submitted` with no
+    # job list ALSO describes a record from before begin_submission() existed,
+    # where jobs_seen is None -- unmeasured, not zero. runs.ran_already is
+    # explicit that "absence of a manifest is not evidence of absence of a
+    # submission", and the listing was reading exactly that absence as a
+    # confirmed success on every legacy row.
+    never_counted = {"name": "legacy-blank", "status": "submitted",
+                     "held_at": None, "submitted_at": "2026-07-20T09:00:00",
+                     "job_list": None,
+                     "proposal": {"command": "genpipes rnaseq"}}
+    r.check("a counted zero is positive evidence",
+            runs.submitted_nothing(up_to_date))
+    r.check("an uncounted absence is not",
+            not runs.submitted_nothing(never_counted))
+    r.check("and neither is an unfinished submission",
+            not runs.submitted_nothing(dict(never_counted,
+                                            status="submit_unknown",
+                                            jobs_seen=0)))
+    legacy = drawn(display.run_list, [(never_counted, None), (up_to_date, None)])
+    legacy_row = next(l for l in legacy.splitlines() if "legacy-blank" in l)
+    r.equal("so a record nobody ever counted reads as unknown",
+            legacy_row.split("  ")[-1].strip(), "unknown")
+    r.equal("and is marked as uncertain rather than as a success",
+            legacy_row.strip()[0], "?")
+    r.check("it is never told it finished with nothing to do",
+            "up to date" not in legacy_row, legacy_row)
+    # And the evidenced one is unaffected -- historical records that DO carry
+    # the count keep their outcome.
+    r.equal("while a counted zero still says what it is",
+            next(l for l in legacy.splitlines()
+                 if "nothing-to-do" in l).split("  ")[-1].strip(),
+            "up to date")
+
+    # ------------------------------------------------------------------ #
+    r.section("jobs the scheduler will not account for are unknown, not failed")
+    # status.unknown is the count of jobs in the manifest that sacct did not
+    # recognise -- which is what an accounting database aging ids out looks
+    # like. runs.list_bucket is right to raise it to ATTENTION (it wants a
+    # person) but the word for it is not "failed": nothing broke, and nothing
+    # is known to have broken. The old row said "failed · 12 unaccounted for".
+    aged_out = {"name": "aged-out", "status": "submitted", "held_at": None,
+                "submitted_at": "2026-07-20T09:00:00",
+                "job_list": "/s/job_output/RnaSeq.job_list.T9"}
+    aged_status = runs.RunStatus(
+        counts={}, total=12, resolved=0, unknown=12, finished=False,
+        verdict="12 unaccounted for", doomed=0, source="sacct")
+    aged = drawn(display.run_list, [(aged_out, aged_status)])
+    aged_row = next(l for l in aged.splitlines() if "aged-out" in l)
+    r.equal("an unaccounted-for run is uncertain", aged_row.strip()[0], "?")
+    r.equal("and says so", aged_row.split("  ")[-1].strip(), "unknown")
+    r.check("it is not reported as a failure", "failed" not in aged_row, aged_row)
+    # A run with something genuinely broken in it is still a failure, and a
+    # doomed one -- queued behind something that already broke -- still is too.
+    for label, st in (
+            ("something broke", runs.RunStatus(
+                counts={"FAILED": 1, "COMPLETED": 4}, total=12, resolved=5,
+                unknown=7, finished=False, verdict="1 failed", doomed=0,
+                source="sacct")),
+            ("dependencies that will never come", runs.RunStatus(
+                counts={"PENDING": 7, "COMPLETED": 5}, total=12, resolved=12,
+                unknown=0, finished=True, verdict="dead", doomed=7,
+                source="sacct + squeue"))):
+        broke_row = next(l for l in drawn(
+            display.run_list, [(dict(aged_out, name="real-break"), st)]
+        ).splitlines() if "real-break" in l)
+        r.equal(f"but {label} is still a failure",
+                broke_row.split("  ")[-1].strip(), "failed")
+        r.equal("marked with the cross", broke_row.strip()[0], "\u2717")
+
+    # ------------------------------------------------------------------ #
+    r.section("the glyph is the state, and the state column is its legend")
+    # No legend block is printed, and that is a design commitment rather than
+    # an omission: every glyph appears beside its own word on every row it is
+    # used on, which is a legend that cannot go stale. The property that makes
+    # it work is that a glyph never means two different things.
+    seen = {}
+    for word, glyph in display._STATE_WORDS:
+        seen.setdefault(glyph, []).append(word)
+    # Each WORD has exactly one glyph -- that is what stops the same state
+    # being drawn two ways on two rows.
+    r.equal("no state is drawn two different ways",
+            len({w for w, _ in display._STATE_WORDS}),
+            len(display._STATE_WORDS))
+    # A glyph may cover several words, but only words that are the same IDEA.
+    # This is the mapping, written out, so a state cannot be filed under a
+    # glyph that means something else.
+    r.equal("the live glyph covers the two halves of being live",
+            sorted(seen[display._LIVE_MARK]), ["queued", "running"])
+    r.equal("the cross is spent only on confirmed failure",
+            sorted(seen[display._BROKE_MARK]), ["failed", "submission failed"])
+    r.equal("the tick covers the two ways a run ends well",
+            sorted(seen[display._DONE_MARK]), ["completed", "up to date"])
+    # ONE WORD FOR ALL OF IT. Six internal conditions reach this glyph and they
+    # say one thing, because they mean one thing to a reader -- the dashboard
+    # cannot establish the state -- and lead to one next action, /check.
+    r.equal("and ? says one word, however many ways it was reached",
+            sorted(seen[display._UNKNOWN_MARK]), ["unknown"])
+    for glyph in (display._HELD_MARK, display._REBUILD_MARK,
+                  display._STOPPED_MARK):
+        r.equal(f"{glyph} means exactly one state", len(seen[glyph]), 1)
+    # Every state fits, whole, in the width the table reserves for it -- which
+    # is how the reserve is computed, so this is really the assertion that no
+    # phrase can be added without the column growing to hold it.
+    r.check("no state is longer than the column that prints it",
+            max(len(w) for w, _ in display._STATE_WORDS) <= 22,
+            [w for w, _ in display._STATE_WORDS])
+    r.check("and none of them carries a reason clause",
+            not any("\u00b7" in w for w, _ in display._STATE_WORDS))
+    r.check("no legend block is printed",
+            "legend" not in glyphs.lower(), glyphs)
+
+    # ------------------------------------------------------------------ #
+    r.section("/list's actions are ordered by what you do after reading it")
+    acted = drawn(display.run_list, listing_rows)
+    tail = acted.split("Actions")[1]
+    order = [w for w in ("/check", "/diagnose", "/jobs", "/modify", "/approve",
+                         "/reject", "/scan")]
+    positions = [tail.index(cmd) for cmd in order]
+    r.check("understanding first, then preparing, then adopting",
+            positions == sorted(positions), tail)
+    # /jobs AFTER /diagnose, deliberately. Half the point of the tool is that
+    # nobody should have to read a job list by hand; offering the manual path
+    # before the interpretation says the opposite.
+    r.check("the agent's reading comes before the raw jobs",
+            tail.index("/diagnose") < tail.index("/jobs"), tail)
+    for cmd, note in (("/check", "see a run's current status"),
+                      ("/diagnose", "explain what went wrong"),
+                      ("/jobs", "inspect individual jobs"),
+                      ("/modify", "change a run before launch"),
+                      ("/approve", "launch a run"),
+                      ("/reject", "discard a run"),
+                      ("/scan", "bring an existing run into the assistant")):
+        r.contains(f"{cmd} says why you would use it", tail, note)
+    # Implementation words, replaced by the user's goal. "refresh" described a
+    # scheduler call to somebody who wanted to know how their run was doing,
+    # and "adopt" is this project's own noun for a thing a newcomer would call
+    # "bring it in".
+    for jargon in ("refresh a launched run", "adopt runs already on disk",
+                   "awaiting approval"):
+        r.check(f"and never {jargon!r}", jargon not in tail, tail)
+    r.equal("three groups, separated by blank lines",
+            len([b for b in tail.split("\n\n") if b.strip()]), 3)
+
+    # ------------------------------------------------------------------ #
+    r.section("one vocabulary for proposed commands, across every screen")
+    # THE DEFECT. Six renderers each wrote their own description for the same
+    # seven verbs, and they had drifted: /jobs was "inspect its jobs" on /list,
+    # "every job and its state" in /check and /diagnose, and "for its jobs" in
+    # /history. Somebody reading four screens in one session had no way to know
+    # they were being offered the same command.
+    r.check("every canonical verb has exactly one description",
+            len(set(display._ACTION_TEXT.values()))
+            == len(display._ACTION_TEXT), display._ACTION_TEXT)
+    for verb, note in (("/check", "see a run's current status"),
+                       ("/diagnose", "explain what went wrong"),
+                       ("/jobs", "inspect individual jobs"),
+                       ("/modify", "change a run before launch"),
+                       ("/approve", "launch a run"),
+                       ("/reject", "discard a run"),
+                       ("/scan", "bring an existing run into the assistant")):
+        r.equal(f"{verb} is described once, canonically",
+                display._ACTION_TEXT[verb], note)
+
+    # The wordings that were retired, hunted across every screen that could
+    # still be printing one rather than only the screens that were fixed.
+    surfaces = "\n".join((
+        acted,
+        strip(drawn(display.run_status, "walltimefail", runs.RunStatus(
+            counts={"COMPLETED": 1, "TIMEOUT": 2}, total=3, resolved=3,
+            unknown=0, finished=True, doomed=0, source="sacct", at="09:38",
+            reasons={}, verdict="failed",
+            root_cause={"step": "gatk_sam_to_fastq", "state": "TIMEOUT",
+                        "count": 2, "jobs": []}))),
+        drawn(display.diagnosis, "walltimefail",
+              {"shaped": True, "manner": "timed out", "cause": "walltime",
+               "override": {"gatk_sam_to_fastq":
+                            {"cluster_walltime": "24:00:00"}},
+               "relaunch": "1-46"}),
+        drawn(display.history, [{"name": "old", "status": "submitted",
+                                 "source": "agent",
+                                 "submitted_at": "2026-07-01T09:00:00"}]),
+        drawn(display.status_overview,
+              {"NEEDS ATTENTION": [{"name": "a", "line": "3 failed"}]}),
+        drawn(display.scan_results, "/s", ["x"], added=["run-a"]),
+        drawn(display.run_view, {"command": "genpipes rnaseq"}, "r", "submitted"),
+    ))
+    for retired in ("read what the logs say", "every job and its state",
+                    "how it is doing on the scheduler",
+                    "read the logs and explain a failure",
+                    "copies it into a new run",
+                    "writes this into the run's override ini",
+                    "for its jobs", "for what went wrong",
+                    "adopts a job list by hand"):
+        r.check(f"no screen still says {retired!r}",
+                retired not in surfaces, retired)
+
+    # ------------------------------------------------------------------ #
+    r.section("a proposed command looks like a proposed command")
+    # The heading is the shape. Before it, a suggestion was two loose lines
+    # here, a middle-dot run-on there, and a padded block somewhere else --
+    # so the one thing all of them were saying had nothing to be recognised by.
+    broke_status = runs.RunStatus(
+        counts={"COMPLETED": 1, "TIMEOUT": 2}, total=3, resolved=3, unknown=0,
+        finished=True, doomed=0, source="sacct", at="09:38", reasons={},
+        verdict="failed", root_cause={"step": "gatk_sam_to_fastq",
+                                      "state": "TIMEOUT", "count": 2,
+                                      "jobs": []})
+    chk_broke = strip(drawn(display.run_status, "walltimefail", broke_status))
+    r.contains("/check heads its suggestions", chk_broke, "Actions")
+    r.check("inside its own panel, not beside it",
+            all(l.lstrip().startswith("\u258c")
+                for l in chk_broke.splitlines()
+                if "Actions" in l or "/diagnose" in l or "/jobs" in l),
+            chk_broke)
+    # CONCRETE NAMES SURVIVE. Consistency is about presentation, not about
+    # replacing something useful with a placeholder: inside /check <name> the
+    # reader wants a line they can copy.
+    r.check("with the run's real name, not a placeholder",
+            _offers(chk_broke, "/diagnose", "walltimefail")
+            and "<name>" not in chk_broke, chk_broke)
+    # ...while a screen about no particular run keeps the placeholder.
+    r.check("while an all-runs screen keeps the placeholder",
+            _offers(drawn(display.status_overview,
+                          {"NEEDS ATTENTION": [{"name": "a", "line": "x"}]}),
+                    "/check", "<name>"))
+
+    r.section("/check proposes what the evidence supports, and never itself")
+    # FAILED: there are logs, because a job that broke ran far enough to write
+    # one. So the interpretation first, then the raw jobs.
+    r.check("a failure offers /diagnose then /jobs",
+            chk_broke.index("/diagnose") < chk_broke.index("/jobs"), chk_broke)
+    r.check("and never offers /check to somebody already inside /check",
+            "/check" not in chk_broke, chk_broke)
+
+    # JOBS UNACCOUNTED FOR -- status.unknown, which is jobs in THIS MANIFEST
+    # that sacct would not account for. There is no log for /diagnose to read,
+    # so offering it sends somebody to a screen that can only report finding
+    # nothing. Not-knowing is not a failure.
+    #
+    # THIS IS NOT /list's `? unknown`, which is a wider display state with six
+    # sources. Five of them never reach run_status with a manifest, and the
+    # next action for a `? unknown` LISTING ROW is /check -- which is what
+    # /list offers. The two are asserted together below so the distinction
+    # cannot quietly collapse.
+    unsure = strip(drawn(display.run_status, "aged-out", runs.RunStatus(
+        counts={}, total=12, resolved=0, unknown=12, finished=False,
+        doomed=0, source="sacct", at="09:38", reasons={},
+        verdict="12 unaccounted for")))
+    r.check("a run with unaccounted-for jobs is not sent to /diagnose",
+            "/diagnose" not in unsure, unsure)
+    r.check("it is offered the manifest instead",
+            _offers(unsure, "/jobs", "aged-out"), unsure)
+    # The listing's own answer for the same run, and for every other row that
+    # reads `? unknown`: ask the scheduler.
+    r.check("while a `? unknown` listing row is pointed at /check",
+            _offers(acted, "/check", "<name>")
+            and acted.index("/check") < acted.index("/diagnose"), acted)
+
+    # NOTHING WORTH SAYING: an Actions block printed for symmetry teaches
+    # people to stop reading the heading.
+    for label, st in (
+            ("a healthy running run", runs.RunStatus(
+                counts={"RUNNING": 6, "COMPLETED": 9}, total=15, resolved=15,
+                unknown=0, finished=False, doomed=0, source="sacct", at="09:38",
+                reasons={}, verdict="running")),
+            ("a cleanly finished run", runs.RunStatus(
+                counts={"COMPLETED": 10}, total=10, resolved=10, unknown=0,
+                finished=True, doomed=0, source="sacct", at="09:38",
+                reasons={}, verdict="complete")),
+            ("a scheduler that could not be reached", runs.RunStatus(
+                counts={}, total=15, resolved=0, unknown=15, finished=False,
+                doomed=0, source="unavailable", at="09:38", reasons={},
+                verdict="scheduler unreachable"))):
+        screen = strip(drawn(display.run_status, "r", st))
+        r.check(f"{label} gets no empty Actions block",
+                "Actions" not in screen, screen)
+
+    r.section("what follows a submission depends on what the submission did")
+    def rec(status, **kw):
+        base = {"status": status, "jobs_seen": None, "expected_jobs": None,
+                "retry_safe": False, "outcome_detail": ""}
+        base.update(kw)
+        return base
+
+    # A FAILED SUBMISSION IS NOT A FAILED RUN. What broke is the launch, so
+    # there are no pipeline logs and /diagnose has nothing to read. The
+    # question that decides what to do next is whether anything reached the
+    # scheduler -- and answering it wrong runs a pipeline twice.
+    unsafe = strip(drawn(display.post_approve, "amp-aug",
+                         rec(runs.SUBMIT_FAILED)))
+    r.contains("a failed submission heads its actions", unsafe, "Actions")
+    r.check("and asks the scheduler first", _offers(unsafe, "/check", "amp-aug"),
+            unsafe)
+    r.check("before offering to rebuild",
+            unsafe.index("/check") < unsafe.index("/modify"), unsafe)
+    r.check("it is never sent to /diagnose — there are no job logs",
+            "/diagnose" not in unsafe, unsafe)
+
+    # ...unless the scheduler itself was asked and came back empty, which is
+    # the one condition under which nothing is out there.
+    safe = strip(drawn(display.post_approve, "amp-0813",
+                       rec(runs.SUBMIT_UNKNOWN, retry_safe=True)))
+    r.check("a provably quiet retry goes straight to /modify",
+            _offers(safe, "/modify", "amp-0813")
+            and "/check" not in safe, safe)
+    r.check("with /reject beside it", _offers(safe, "/reject", "amp-0813"), safe)
+    r.check("and /modify before /reject, as everywhere else",
+            safe.index("/modify") < safe.index("/reject"), safe)
+
+    # An interrupted launch is the same question as an unconfirmed one.
+    mid = strip(drawn(display.post_approve, "amp-x", rec(runs.SUBMITTING)))
+    r.check("a launch that never came back asks the scheduler too",
+            _offers(mid, "/check", "amp-x"), mid)
+
+    r.section("pre-launch screens keep their three verbs, in their order")
+    held_view = strip(drawn(display.run_view,
+                            {"command": "genpipes rnaseq"}, "rnaseq-0901",
+                            "held"))
+    for verb in ("/modify", "/approve", "/reject"):
+        r.check(f"a held run is offered {verb}",
+                _offers(held_view, verb, "rnaseq-0901",
+                        display._ACTION_TEXT[verb]), held_view)
+    r.check("preparing before launching before discarding",
+            held_view.index("/modify") < held_view.index("/approve")
+            < held_view.index("/reject"), held_view)
+    # A lapsed proposal cannot be approved -- that is the whole reason the
+    # status exists -- so the verb it would refuse is not offered.
+    lapsed_view = strip(drawn(display.run_view,
+                              {"command": "genpipes rnaseq"}, "gate-gone",
+                              "lapsed"))
+    r.check("a lapsed proposal is offered the rebuild",
+            _offers(lapsed_view, "/modify", "gate-gone"), lapsed_view)
+    r.check("and never an approval that would be refused",
+            "/approve" not in lapsed_view, lapsed_view)
+
+    r.section("the gate keeps its own words, and that is deliberate")
+    # THE ONE PLACE A DESCRIPTION IS NOT USED. gate_box is where an allocation
+    # is actually spent, and "submits to Slurm — cannot be undone" is a
+    # consequence rather than a description of what the verb means. Replacing
+    # it with "launch a run" for the sake of a table would take the warning off
+    # the only screen whose keystroke is irreversible.
+    gate = strip(drawn(display.gate,
+                       {"command": "genpipes rnaseq", "generated": None},
+                       "rnaseq-0901"))
+    r.contains("the gate still states the consequence", gate,
+               "cannot be undone")
+    r.check("and does not borrow the listing's gentler wording",
+            display._ACTION_TEXT["/approve"] not in gate, gate)
+
+    r.section("an Actions block fits the window it is drawn in")
+    # _hint() used to do this for /diagnose's two lines and nothing else did it
+    # for anybody: at sixty columns a long run name plus a description
+    # overflowed, and the terminal restarted the overflow at column ZERO --
+    # left of and underneath the panel edge it was supposed to sit beside.
+    long_name = "dnaseq-somatic-fastpass-0805-rerun"
+    for cols in (60, 80, 100, 120):
+        narrow = strip(drawn(_at_width, cols, display.actions,
+                             [("/diagnose", long_name), ("/jobs", long_name)],
+                             f"  {display.DIM}\u258c{display.RESET}"))
+        widest = max(display.cells(l) for l in narrow.splitlines())
+        r.check(f"nothing overflows at {cols} columns", widest <= cols, narrow)
+        # And the description is never the half that gets dropped.
+        r.contains(f"the description survives at {cols}", narrow,
+                   display._ACTION_TEXT["/diagnose"])
+        r.contains(f"so does the run name at {cols}", narrow, long_name)
 
     r.section("a submission that did not finish says so, rather than counting to zero")
     # "failed · 0 jobs" was the old rendering, and the number in it is about the
@@ -1466,32 +2065,116 @@ def main():
     # listing with no RunStatus at all, and what is known about them is what
     # happened to the SUBMISSION.
     trouble = []
-    for status_word, expect in (("submit_failed", "submission failed"),
-                                ("submit_unknown", "submission unconfirmed"),
-                                ("submitting", "submission interrupted")):
+    for status_word in ("submit_failed", "submit_unknown", "submitting"):
         trouble.append(({"name": f"run-{status_word}", "status": status_word,
                          "held_at": None, "submitted_at": "2026-07-24T09:00:00",
                          "job_list": None,
                          "proposal": {"command": "genpipes ampliconseq"}}, None))
     out_t = drawn(display.run_list, trouble)
+
+    def trouble_row(status_word):
+        return next(l for l in out_t.splitlines() if f"run-{status_word}" in l)
+
     for status_word, expect in (("submit_failed", "submission failed"),
-                                ("submit_unknown", "submission unconfirmed"),
-                                ("submitting", "submission interrupted")):
-        row_t = next(l for l in out_t.splitlines() if f"run-{status_word}" in l)
-        r.contains(f"{status_word} is named as an event", row_t, expect)
+                                ("submit_unknown", "unknown"),
+                                ("submitting", "unknown")):
+        row_t = trouble_row(status_word)
+        r.equal(f"{status_word} is said in one whole phrase",
+                row_t.split("  ")[-1].strip(), expect)
         r.check("and never as a job count", "0 jobs" not in row_t, row_t)
-    r.contains("with nothing on the scheduler said explicitly",
-               out_t, "nothing on the scheduler")
+        r.check("nor as a scheduler observation the listing cannot fit",
+                "nothing on the scheduler" not in row_t, row_t)
+
+    # ------------------------------------------------------------------ #
+    r.section("the dashboard says 'unknown' once, however it got there")
+    # THREE PHRASES FOR ONE FACT. "submission unconfirmed", "submission
+    # interrupted" and "unknown" were three vocabulary items meaning the same
+    # thing to a reader -- this screen cannot establish the state -- with the
+    # same next action, /check. Two of the three differed from each other only
+    # in WHERE THIS TOOL'S OWN PROCESS DIED, which is not a fact about anybody's
+    # run. So the column says one word.
+    r.equal("an unestablished outcome and an interrupted launch read alike",
+            trouble_row("submit_unknown").split("  ")[-1].strip(),
+            trouble_row("submitting").split("  ")[-1].strip())
+    for gone in ("submission unconfirmed", "submission interrupted"):
+        r.check(f"{gone!r} is no longer a state of its own",
+                gone not in out_t and gone not in
+                {w for w, _ in display._STATE_WORDS}, out_t)
+
+    # AND NOTHING UNDERNEATH MERGED. This is one column choosing one word; the
+    # registry still keeps the two statuses apart, and everything that reasons
+    # about them still sees the difference.
+    r.check("the registry still distinguishes them",
+            runs.SUBMITTING != runs.SUBMIT_UNKNOWN)
+    for status_word in ("submitting", "submit_unknown", "submit_failed"):
+        rec = {"name": f"run-{status_word}", "status": status_word,
+               "job_list": None}
+        r.equal(f"{status_word} is still its own registry status",
+                rec["status"], status_word)
+        r.check("and is still filed where it always was",
+                runs.list_bucket(rec, None) == runs.ATTENTION_BUCKET)
+    # The evidence each one carries is what the screens with room for it read
+    # to tell them apart -- the outcome detail, the count that went out first,
+    # and whether a retry is safe. None of that moved.
+    unsure_detail = drawn(display.post_approve, "run-submit_unknown",
+                          {"name": "run-submit_unknown",
+                           "status": "submit_unknown", "jobs_seen": 12,
+                           "outcome_detail": "the outcome of the submission "
+                                             "was never established"})
+    r.contains("an unconfirmed submission is still explained in full",
+               unsure_detail, "never established")
+    r.contains("with the jobs that did go out still counted",
+               unsure_detail, "12 jobs")
+    r.check("and is still not called a failure there either",
+            "the submission failed" not in unsure_detail, unsure_detail)
+    broke_detail = drawn(display.post_approve, "run-submit_failed",
+                         {"name": "run-submit_failed", "status": "submit_failed",
+                          "outcome_detail": "the submission command reported "
+                                            "a failure"})
+    r.contains("while a failed one still says so", broke_detail,
+               "the submission failed")
+
+    # ------------------------------------------------------------------ #
+    r.section("an unconfirmed submission is not a confirmed failure")
+    # THE CONCEPTUAL DEFECT THIS CLOSES. All three statuses above are filed
+    # under ATTENTION by runs.list_bucket, and the listing took its glyph from
+    # the bucket -- so `submit_unknown` was drawn with the same red ✗ as a
+    # submission that demonstrably failed. runs.py is explicit that
+    # SUBMIT_UNKNOWN "is the honest state, and the one that must never be
+    # quietly upgraded to either neighbour", and a red cross IS that upgrade:
+    # it tells the reader nothing reached the cluster, when what is actually
+    # known is that nobody could establish whether a full pipeline did. Those
+    # two ask for opposite next actions.
+    r.equal("a submission the command itself reported failing keeps the cross",
+            trouble_row("submit_failed").strip()[0], "✗")
+    r.equal("an unestablished outcome is uncertainty, not failure",
+            trouble_row("submit_unknown").strip()[0], "?")
+    r.equal("and so is a submission that never came back",
+            trouble_row("submitting").strip()[0], "?")
+    if colour:
+        painted_t = io.StringIO()
+        with redirect_stdout(painted_t):
+            display.run_list(trouble)
+        painted_t = painted_t.getvalue()
+        unsure = next(l for l in painted_t.splitlines()
+                      if "run-submit_unknown" in l)
+        r.check("and it is not painted like a failure either",
+                display.RED not in unsure, unsure)
+
     # SUBMIT_FAILED "says nothing about what it managed to submit first" (see
-    # runs.py's status table), and a failed submission with jobs already out is
-    # a different problem from one with none -- it decides whether retrying is
-    # safe.
+    # runs.py's status table). That matters enormously -- it decides whether a
+    # retry is safe -- and it is exactly the kind of thing a dashboard cannot
+    # carry and /check can. What /list owes is the state.
     partial = drawn(display.run_list,
                     [({"name": "half-out", "status": "submit_failed",
                        "held_at": None, "submitted_at": "2026-07-24T09:00:00",
                        "job_list": None, "jobs_seen": 12,
                        "proposal": {"command": "genpipes dnaseq"}}, None)])
-    r.contains("and jobs that did go out are counted", partial, "12 jobs went out first")
+    half_row = next(l for l in partial.splitlines() if "half-out" in l)
+    r.equal("a partly-out submission still reads as one state",
+            half_row.split("  ")[-1].strip(), "submission failed")
+    r.check("with the job count left to the screen that can hold it",
+            "12 jobs" not in half_row, half_row)
 
     # ------------------------------------------------------------------ #
     r.section("/check separates the failure from what followed from it")
@@ -1536,8 +2219,8 @@ def main():
     # that reads those.
     r.check("nothing on this screen claims to be a root cause",
             "root cause" not in chk, chk)
-    r.contains("and the log-level question is handed to /diagnose",
-               chk, "/diagnose walltimefail")
+    r.check("and the log-level question is handed to /diagnose",
+            _offers(chk, "/diagnose", "walltimefail"), chk)
 
     no_limit = runs.RunStatus(
         counts={"OUT_OF_MEMORY": 1}, total=1, resolved=1, unknown=0,
@@ -1565,7 +2248,7 @@ def main():
             display.HELIX_W == 13)
     r.check("it is shorter than the panel beside it", len(art) <= 12)
     r.check("no glyph outside the depth ramp and the rungs",
-            set("".join(art)) <= set(" \u2593\u2592\u2591\u00b7"), set("".join(art)))
+            set("".join(art)) <= set(" \u2593\u2592\u2591\u2500"), set("".join(art)))
     r.check("two strands on every row, never one and never three",
             all(sum(row.count(g) for g in "\u2593\u2592\u2591") == 2 for row in art),
             [sum(row.count(g) for g in "\u2593\u2592\u2591") for row in art])
@@ -1598,7 +2281,7 @@ def main():
         lo, hi = strands(row)
         gap = hi - lo - 1
         r.check(f"rungs span exactly the gap on {row!r}",
-                row.count("\u00b7") == (gap if gap >= 2 else 0), row)
+                row.count("\u2500") == (gap if gap >= 2 else 0), row)
 
     r.section("and it survives the colour being taken away")
     plain_logo = strip("\n".join(display._helix()))
@@ -1641,6 +2324,101 @@ def main():
         display.retheme()
     r.check("and the palette is put back for whatever runs next",
             display.THEME == theme.resolve())
+
+    # ------------------------------------------------------------------ #
+    r.section("the reorder hint sits on the row the keys would act on")
+    # `[` and `]` move the ini UNDER THE CURSOR, so the hint belongs where the
+    # cursor is. It began as `· [ ] reorders` in every included option's
+    # description, which is the same sentence repeated down the list -- and it
+    # said which keys without saying which way, which is the half somebody
+    # needs at the moment of pressing one.
+    from genpipe import mirror as _mirror
+    _prop = {"slots": {"pipeline": "dnaseq", "protocol": "somatic_fastpass",
+                       "inis": ["dnaseq.base.ini", "rorqual.ini",
+                                "dnaseq.cancer.ini", "override_walltime.ini"]}}
+    _m = _mirror.from_slots(_prop, name="poulet")
+    _changes = {"config": ["dnaseq.base.ini", "rorqual.ini",
+                           "dnaseq.cancer.ini"]}
+    _opts = modify.options_for("config", _prop, {"config": ["spare.ini"]},
+                               pending=_changes,
+                               removed=["override_walltime.ini"])
+    _entries = modify.panel_entries(_m, [l.row for l in _m.lines if l.row],
+                                    open_row="config", choices=_opts,
+                                    changes=_changes)
+    _draw = display.modify_panel(
+        lambda: _entries, changes=lambda: _changes, required=lambda: {},
+        notes=lambda: {}, typed=lambda: "", open_of=lambda: "config",
+        details=lambda: True)
+
+    def _rows(cursor):
+        return [strip(line).rstrip() for line in _draw(cursor, set())]
+
+    def _row_with(cursor, name):
+        return next((x for x in _rows(cursor) if name in x), "")
+
+    # Cursor on the second included ini.
+    r.contains("the highlighted included row says what enter does",
+               _row_with(1, "rorqual.ini"), "enter removes")
+    r.contains("and which way each bracket moves it",
+               _row_with(1, "rorqual.ini"), "[ up · ] down")
+    r.check("the hint names both directions rather than just the keys",
+            "reorders" not in "\n".join(_rows(1)), _rows(1))
+
+    for other in ("dnaseq.base.ini", "dnaseq.cancer.ini"):
+        row = _row_with(1, other)
+        r.contains(f"{other} still says what it is", row, "on the stack")
+        r.check(f"and {other} carries no reorder hint", "up ·" not in row, row)
+    r.equal("exactly one row carries it",
+            sum("up ·" in x for x in _rows(1)), 1)
+
+    # It follows the cursor rather than belonging to a position.
+    r.contains("moving the cursor moves the hint",
+               _row_with(2, "dnaseq.cancer.ini"), "[ up · ] down")
+    r.check("and it leaves the row it came from",
+            "up ·" not in _row_with(2, "rorqual.ini"),
+            _row_with(2, "rorqual.ini"))
+
+    # The two states the keys do nothing to.
+    r.contains("a removed ini says how to bring it back",
+               _row_with(3, "override_walltime.ini"), "removed · enter restores")
+    r.equal("and highlighted, it still offers no reordering",
+            sum("up ·" in x for x in _rows(3)), 0)
+    r.equal("nor does a merely available ini",
+            sum("up ·" in x for x in _rows(4)), 0)
+    r.contains("which still says what enter would do to it",
+               _row_with(4, "spare.ini"), "enter adds it")
+
+    # ------------------------------------------------------------------ #
+    r.section("an interruption does not look like a crash")
+    # Ctrl-C used to print "Stopped." over an unconditional claim that nothing
+    # had been submitted, with biomni's stack trace arriving underneath it a
+    # moment later. Stopping a reply is an ordinary thing to do and has to read
+    # that way: no red, no traceback, and no reassurance nobody checked.
+    text = drawn(display.interrupted, "Nothing reached the scheduler.")
+    r.contains("it says it was interrupted", text, "Interrupted")
+    r.contains("and asks what to do instead", text, "instead")
+    r.contains("carrying whatever the caller established", text,
+               "Nothing reached the scheduler.")
+    r.check("it is not worded as a failure",
+            "Stopped" not in text and "Error" not in text, text)
+    r.check("and it is not painted like one",
+            display.RED not in painted(display.interrupted, "x"),
+            painted(display.interrupted, "x"))
+
+    # The claim is the CALLER'S, so a caller that cannot make it does not.
+    unsure = drawn(display.interrupted,
+                   "'poulet' had already been approved — /check it.")
+    r.check("a caller with no reassurance to give prints none",
+            "Nothing reached the scheduler" not in unsure, unsure)
+    r.contains("and says what it does know instead", unsure, "already been approved")
+
+    quiet = drawn(display.interrupted)
+    r.contains("with no claim at all it still says it was interrupted",
+               quiet, "Interrupted")
+
+    left = drawn(display.interrupted, "x", note="a tool is still finishing")
+    r.contains("a straggler is named rather than hidden", left,
+               "a tool is still finishing")
 
     return r.finish()
 
