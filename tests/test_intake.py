@@ -675,4 +675,140 @@ else:
                   or _name in slots._DESIGN_OPTIONAL)
         r.equal(f"{_name}: design use matches the install", _known, _reads)
 
+# ---------------------------------------------------------------------------
+# GenPipes' own config traces: records, not inputs.
+#
+# WHAT A TRACE IS. GenPipes writes the fully resolved configuration of every run
+# it generates beside that run, as
+# <Pipeline>.<protocol>.<TIMESTAMP>.config.trace.ini. It is an OUTPUT -- a
+# record of a run that already happened -- and stacking one on -c asks for
+# another run's entire resolved config.
+#
+# WHY A BUDGET AND NOT A FILTER. They are still offered, because the config
+# row's panel takes no free text and a list that omitted them would make them
+# unreachable rather than merely discouraged. What they may not do is CONSUME
+# the list: in the directory this was reported from, six traces held six of the
+# eight candidate slots, and the one hand-written ini shared the panel with a
+# wall of timestamps.
+# ---------------------------------------------------------------------------
+r.section("config traces are records of past runs, not candidate inputs")
+# THEY ARE NOT CANDIDATES AT ALL ANY MORE. They were candidates like any other
+# ini and filled the panel; then they were capped at the two newest, which fixed
+# the length by making the rest unreachable. Neither is the right shape for a
+# list that gains an entry every time a command is generated, so they live
+# behind one row instead -- see traces(), scanned on demand and never kept.
+_trace_work = tempfile.mkdtemp(prefix="genpipe-traces-")
+try:
+    def _write(where, pipeline, protocol, stamp, script, body="[DEFAULT]\nx=1\n"):
+        name = f"{pipeline}.{protocol}.{stamp}.config.trace.ini"
+        path = os.path.join(where, name)
+        open(path, "w").write(
+            f"# {pipeline} Config Trace\n"
+            f"# Command: /soft/genpipes/bin/genpipes {pipeline.lower()} "
+            f"-t {protocol} -c /inis/base.ini -r r.tsv -g {script}\n"
+            f"# Created on: {stamp}\n"
+            f"# DO NOT EDIT\n\n{body}")
+        return path
+
+    _write(_trace_work, "DnaSeq", "somatic_fastpass", "2026-08-05T11.02.13",
+           "cit_rerun.sh")
+    _write(_trace_work, "DnaSeq", "germline_sv", "2026-08-04T07.15.58",
+           "germline.sh")
+    _write(_trace_work, "RnaSeq", "stringtie", "2026-07-11T09.00.00", "rna.sh")
+    open(os.path.join(_trace_work, "override_walltime.ini"), "w").write("[x]\n")
+    open(os.path.join(_trace_work, "mine.override.ini"), "w").write("[x]\n")
+
+    _found = intake.candidates(_trace_work)["config"]
+    _base = [os.path.basename(x) for x in _found]
+    r.equal("no trace is offered as a candidate ini",
+            [x for x in _base if x.endswith(".config.trace.ini")], [])
+    r.check("while every real ini still is",
+            {"override_walltime.ini", "mine.override.ini"} <= set(_base), _base)
+    r.check("is_trace names the ones that were dropped",
+            intake.is_trace("DnaSeq.x.2026-01-01T00.00.00.config.trace.ini")
+            and not intake.is_trace("override_walltime.ini"))
+
+    r.section("and are read on demand, from their own header")
+    _traces = intake.traces(_trace_work)
+    r.equal("all of them, none capped", len(_traces), 3)
+    r.equal("newest first by TIMESTAMP, not by filename",
+            [t["stamp"] for t in _traces],
+            ["2026-08-05T11.02.13", "2026-08-04T07.15.58",
+             "2026-07-11T09.00.00"])
+    # The filename begins with the pipeline, so sorting on it would put RnaSeq
+    # above both DnaSeq traces however old it was.
+    r.equal("which is a different order from the filenames",
+            _traces[0]["pipeline"], "dnaseq")
+
+    _one = _traces[0]
+    r.equal("the pipeline is read", _one["pipeline"], "dnaseq")
+    r.equal("the protocol is read", _one["protocol"], "somatic_fastpass")
+    r.equal("the timestamp is read", _one["stamp"], "2026-08-05T11.02.13")
+    r.equal("and the script it generated", _one["script"], "cit_rerun.sh")
+    r.contains("along with the command that produced it", _one["command"],
+               "genpipes dnaseq -t somatic_fastpass")
+
+    # THE HEADER WINS OVER THE NAME. A trace copied out of another directory
+    # keeps the name it was given; the header is the invocation GenPipes ran.
+    _odd = _write(_trace_work, "DnaSeq", "germline_snv", "2026-01-01T00.00.00",
+                  "moved.sh")
+    _renamed = os.path.join(_trace_work,
+                            "RnaSeq.stringtie.2026-01-01T00.00.00.config.trace.ini")
+    os.rename(_odd, _renamed)
+    _read = intake.read_trace(_renamed)
+    r.equal("the pipeline comes from the command, not the filename",
+            _read["pipeline"], "dnaseq")
+    r.equal("and so does the protocol", _read["protocol"], "germline_snv")
+    os.remove(_renamed)
+
+    # NEVER A GUESS. A trace with no readable header still yields what its name
+    # says and nothing more.
+    _bare = os.path.join(_trace_work,
+                         "CovSeq.default.2026-02-02T02.02.02.config.trace.ini")
+    open(_bare, "w").write("[DEFAULT]\nnothing = here\n")
+    _read = intake.read_trace(_bare)
+    r.equal("the name still answers what it can", _read["pipeline"], "covseq")
+    r.equal("and what it cannot is left empty, not invented",
+            (_read["script"], _read["command"]), ("", ""))
+    os.remove(_bare)
+
+    r.check("a file that is not a trace is not read as one",
+            intake.read_trace(os.path.join(_trace_work,
+                                           "override_walltime.ini")) is None)
+    r.equal("and a directory with none has none", intake.traces(HERE), [])
+    r.equal("as does no directory at all", intake.traces(None), [])
+finally:
+    shutil.rmtree(_trace_work, ignore_errors=True)
+
+r.section("a directory full of traces leaves the candidates alone")
+_work = tempfile.mkdtemp(prefix="genpipe-trace-")
+try:
+    _names = ["override_walltime.ini", "my_overlay.ini", "somebody.override.ini",
+              "override_walltime.ini.bak"] + [
+        f"DnaSeq.somatic_fastpass.2026-0{_n}-01T10.00.00.config.trace.ini"
+        for _n in range(1, 7)]
+    for _name in _names:
+        open(os.path.join(_work, _name), "w").write("[x]\n")
+    _found = intake.candidates(_work)["config"]
+    _base = [os.path.basename(x) for x in _found]
+    _traces = [x for x in _base if x.endswith(".config.trace.ini")]
+
+    r.equal("six traces, and not one of them is a candidate", _traces, [])
+    r.check("every hand-written ini survives them",
+            {"override_walltime.ini", "my_overlay.ini"} <= set(_base), _base)
+    r.check("a hand-written ini still ranks above a private override",
+            _base.index("my_overlay.ini")
+            < _base.index("somebody.override.ini"), _base)
+    r.check("nothing is hidden that is not a trace",
+            _base.count("my_overlay.ini") == 1, _base)
+    r.check("and a .ini.bak was never an ini",
+            not any(x.endswith(".bak") for x in _base), _base)
+
+    # The candidate paths are anchored to the directory they were found in, so
+    # the panel can tell two same-named inis apart and execution stays exact.
+    r.check("candidates carry the directory they came from",
+            all(os.path.dirname(x) == _work for x in _found), _found)
+finally:
+    shutil.rmtree(_work, ignore_errors=True)
+
 sys.exit(r.finish())

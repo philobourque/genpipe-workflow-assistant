@@ -72,6 +72,17 @@ jobs:
         # never started or one that was killed.
         run: python tests/test_resolve.py
 
+      - name: The -c stack — identity, order, picker states, past run configs
+        # The flag that is plural and whose ORDER is its semantics. Covers the
+        # parse that dropped a bare relative ini from the record, the basename
+        # identity that merged two different files, and reordering.
+        run: python tests/test_config_stack.py
+
+      - name: The meter in front of the model
+        # Cache breakpoint, provider usage, and the one narrow repair for a
+        # reply that is an execution payload with no tag around it.
+        run: python tests/test_metering.py
+
       - name: The three gate verbs
         # Includes the one property here that is a safety property rather than
         # behaviour: prose at the gate never approves.

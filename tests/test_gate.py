@@ -111,9 +111,14 @@ def main():
     r.equal("steps parsed", p["slots"]["steps"], "1-5")
     r.equal("readset parsed", p["slots"]["readset"], "readset.tsv")
     r.equal("script recorded", p["script"], "cmd.sh")
-    r.check("both inis found", set(p["slots"]["inis"]) ==
-            {"rnaseq.base.ini", "rorqual.ini"},
-            f"got={p['slots']['inis']}")
+    # AS WRITTEN, AND IN ORDER. This used to assert the basenames, which is
+    # what the old regex produced -- and a stack recorded as basenames cannot
+    # say which `rorqual.ini` was read, while a stack recorded as a SET cannot
+    # say which ini wins. `-c` is applied left to right, so both the paths and
+    # their order are part of what the person is approving.
+    r.equal("both inis found, exactly as written and in order",
+            p["slots"]["inis"],
+            ["$MUGQIC/rnaseq.base.ini", "common_ini/rorqual.ini"])
 
     r.section("the box reads long-form flags too")
     # GenPipes accepts both, and a model writing the readable one is writing a

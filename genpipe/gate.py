@@ -29,8 +29,11 @@ reasons.
 The functions take plain data -- strings, and lists of objects with a .content
 attribute -- rather than LangGraph state, so nothing here needs a graph to run.
 """
+import ast
 import hashlib
 import re
+import shlex
+import textwrap
 
 from . import slots
 
@@ -678,6 +681,99 @@ def flag_value(cmd, flag):
     return None
 
 
+# A token that opens a flag rather than being one flag's value. `-1` and a bare
+# `-` are values; `-t` and `--config` are flags. The same rule mirror.py applies
+# for the same reason, written twice because the dependency only runs one way
+# (mirror imports this module).
+_FLAG_TOKEN = re.compile(r"^--?[A-Za-z]")
+
+# Shell redirection trailing the command -- `2>&1`, `>`, `>>`. It starts with a
+# digit rather than a dash, so _FLAG_TOKEN does not catch it and without this it
+# would be read as one more value on whatever flag preceded it.
+_REDIRECT_TOKEN = re.compile(r"^\d*>>?&?\d*$|^\d*<$")
+
+# Where the genpipes call stops and the surrounding shell begins. The values of
+# a repeatable flag run to the end of the command, so without this `-c a.ini &&
+# bash cmd.sh` reads `&&`, `bash` and `cmd.sh` as three more inis. Mostly masked
+# in build_proposal, which cuts with _SEPARATOR before calling here -- but only
+# when there IS a genpipes call to cut to, and the documented fallback for a
+# proposal whose generation was never captured passes the whole block.
+_SEPARATOR_TOKEN = frozenset(("&&", "||", ";", "|", "&"))
+
+
+def flag_values(cmd, flag):
+    r"""EVERY argument given to a repeatable flag, in order, as a list.
+
+    `-c` is the only flag GenPipes takes plural, and it is the one flag whose
+    ORDER is its semantics -- inis are applied left to right and later ones
+    overrule earlier ones. So this returns a list and preserves both the order
+    and the exact strings.
+
+    WHY NOT A REGEX OVER THE WHOLE COMMAND, which is what this replaces. The
+    old line was
+
+        re.findall(r"\S+/([^/\s]+\.ini)", src) or re.findall(r"\S+\.ini", src)
+
+    and it had two defects that compounded into a silent, expensive one. The
+    first pattern captures only the BASENAME of any path-qualified ini, so
+    `$GENPIPES_INIS/dnaseq/cit.ini` was recorded as `cit.ini` and the proposal
+    no longer described the file that would be read. The second, worse: the
+    `or` means the fallback runs only when the first pattern found NOTHING, so
+    on the ordinary command -- four inis under $GENPIPES_INIS and one written
+    plainly beside the run -- the bare one matched neither branch and was
+    dropped from the proposal entirely.
+
+    What that looked like: `-c ... cit.ini override_walltime.ini` reached the
+    gate as a four-ini stack. mirror.read() tokenises the command properly and
+    showed all five, so the screen was right and the record was not -- and
+    modify.compare(), which diffs SLOTS, could not see that ini removed or
+    retained. A request to drop it was neither applied nor reported as ignored,
+    because the row it belonged to was invisible to the only check there is.
+
+    Values stop at the next flag, at a shell separator, or at the end of the
+    line, which is the same boundary flag_value() draws and for the same reason:
+    `generated` is a whole shell block, and a flag at the end of one line must
+    not swallow the first word of the next.
+    """
+    long = LONG_FORM.get(flag)
+    names = ([long] if long else []) + [flag]
+    out = []
+    for line in (cmd or "").splitlines():
+        try:
+            tokens = shlex.split(line, comments=False, posix=True)
+        except ValueError:
+            # An unbalanced quote. A rough split beats refusing to read the
+            # command at all -- the caller is building an approval box, and an
+            # empty -c row on a command that has one is the failure above by
+            # another route.
+            tokens = line.split()
+        at = 0
+        while at < len(tokens):
+            token = tokens[at]
+            name, _, inline = token.partition("=")
+            if name not in names:
+                at += 1
+                continue
+            if inline:
+                # `--config=a.ini`. argparse accepts it for the long form, and
+                # it carries exactly one value.
+                out.append(inline)
+                at += 1
+                continue
+            at += 1
+            while at < len(tokens):
+                value = tokens[at]
+                if (_FLAG_TOKEN.match(value) or _REDIRECT_TOKEN.match(value)
+                        or value in _SEPARATOR_TOKEN):
+                    break
+                out.append(value)
+                at += 1
+    # Order preserved, duplicates dropped. `-c a.ini -c a.ini` is one layer
+    # written twice, and dict.fromkeys keeps the FIRST position -- which is
+    # where the layer actually takes effect.
+    return list(dict.fromkeys(out))
+
+
 def submission_line(code):
     """Pull the real submission command out of a noisy code block, even if
     the model buried it in a Python script or a string literal.
@@ -766,7 +862,10 @@ def build_proposal(messages, code):
     src = invocation(block) or block
     protocol = flag_value(src, "-t")
     steps = flag_value(src, "-s")
-    inis = re.findall(r"\S+/([^/\s]+\.ini)", src) or re.findall(r"\S+\.ini", src)
+    # Read off the `-c` flag itself, exactly as written and in order. See
+    # flag_values() for what the regex that used to be here got wrong, and why
+    # a stack that is nearly right is worse than no stack at all.
+    inis = flag_values(src, "-c")
     design = flag_value(src, "-d")
     pairs = flag_value(src, "-p")
     readset = flag_value(src, "-r")

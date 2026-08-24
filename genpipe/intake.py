@@ -231,6 +231,11 @@ def _ini_tier(path):
     return 0              # a hand-written ini, which is what this list is for
 
 
+def is_trace(path):
+    """Is this GenPipes' own record of a past run, rather than an input?"""
+    return bool(_TRACE_INI.search(os.path.basename(str(path or ""))))
+
+
 def rank_inis(paths, limit=8):
     """Candidate `-c` inis, most plausible first, capped.
 
@@ -241,11 +246,164 @@ def rank_inis(paths, limit=8):
     end of the list entirely. The numbered options were all the useless ones
     and the useful one was unreachable except by typing its path.
 
+    TRACES ARE NOT HERE AT ALL ANY MORE. Sorting by tier fixed which inis were
+    REACHABLE and not how many there were, so the useful one came first and then
+    six records of past runs followed it down the panel; a budget of two fixed
+    the length and made four of the six unreachable instead. Both were the wrong
+    shape for a list that grows by one every time somebody generates a command.
+
+    They are reached through their own view now -- see traces(), and the
+    `Past run configs…` row modify.options_for adds -- which scans on demand and
+    shows ALL of them with what each one is. So nothing is hidden and nothing is
+    capped; the candidate list simply stops being where a growing pile of
+    generated artifacts lives.
+
     Ties keep the order they arrived in, which is the alphabetical listing, so
     the result is stable from one call to the next.
     """
-    ordered = sorted(paths, key=_ini_tier)
+    ordered = sorted((p for p in paths if not is_trace(p)), key=_ini_tier)
     return ordered[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Past run configs: reading GenPipes' own record of a run that already happened.
+#
+# A trace is written beside every generated command and its header carries the
+# whole invocation that produced it:
+#
+#     # DnaSeq Config Trace
+#     # Command: .../genpipes dnaseq -t somatic_fastpass -c ... -g cmd.sh
+#     # Created on: 2026-08-05T11.02.13
+#
+# DISCOVERED ON DEMAND, NEVER KEPT. There is no index, no cache and no registry
+# of these anywhere: the view that shows them lists a directory at the moment it
+# opens and reads three lines from each file it finds. That is the whole design
+# constraint -- a project directory accumulates one trace per generation for
+# ever, so anything that remembered them would be a structure that only grows.
+#
+# THE HEADER IS THE SOURCE, not the filename, wherever both could answer. The
+# filename gives pipeline, protocol and timestamp; the header gives those plus
+# the `-c` stack, the readset, the steps and the `-g` script -- and it is the
+# command GenPipes actually ran rather than a name that could have been copied.
+# The filename is kept as the fallback for a trace whose header is unreadable.
+# ---------------------------------------------------------------------------
+
+# `<Pipeline>.<protocol>.<TIMESTAMP>.config.trace.ini`. The protocol is optional
+# because a pipeline that takes no `-t` writes `<Pipeline>.default.<stamp>`.
+_TRACE_NAME = re.compile(
+    r"^(?P<pipeline>[A-Za-z0-9]+)\.(?P<protocol>[A-Za-z0-9_]+)\."
+    r"(?P<stamp>[0-9T.\-]+)\.config\.trace\.ini$", re.I)
+
+# `# Created on: 2026-08-05T11.02.13`
+_TRACE_STAMP = re.compile(r"^#\s*Created on:\s*(\S+)", re.I)
+
+# `# Command: /path/to/genpipes dnaseq -t ... -g cmd.sh`
+_TRACE_COMMAND = re.compile(r"^#\s*Command:\s*(.+)$", re.I)
+
+# How many lines of a trace are read. The header is three; a couple more costs
+# nothing and survives GenPipes adding a line to it. The body is thousands of
+# lines of resolved configuration and is never read -- this identifies the file,
+# it does not interpret it.
+_TRACE_HEADER_LINES = 8
+
+
+def read_trace(path):
+    """What one trace says about the run that produced it, or None.
+
+    Returns {path, pipeline, protocol, stamp, script, command} with '' for
+    anything that could not be established. NEVER a guess: a field this cannot
+    read stays empty and the caller shows less rather than something invented.
+
+    None only when the file cannot be read at all or is not a trace by name --
+    the caller is listing a directory and a file that disappeared between the
+    listing and the read is an ordinary thing, not an error.
+    """
+    name = os.path.basename(str(path or ""))
+    if not _TRACE_INI.search(name):
+        return None
+    from . import gate                # for one command parser, not two
+
+    found = {"path": str(path), "pipeline": "", "protocol": "", "stamp": "",
+             "script": "", "command": ""}
+    named = _TRACE_NAME.match(name)
+    if named:
+        # runs.py owns the CamelCase -> flag-value mapping; this is the same
+        # filename convention read from the same direction.
+        from . import runs as runs_store
+        key = named.group("pipeline").lower()
+        found["pipeline"] = runs_store._PIPELINE_FROM_FILE.get(key, key)
+        found["protocol"] = named.group("protocol")
+        found["stamp"] = named.group("stamp")
+
+    try:
+        with open(path, "r", errors="replace") as fh:
+            head = [next(fh, "") for _ in range(_TRACE_HEADER_LINES)]
+    except OSError:
+        return found if named else None
+
+    for line in head:
+        stamped = _TRACE_STAMP.match(line)
+        if stamped:
+            found["stamp"] = stamped.group(1)
+            continue
+        said = _TRACE_COMMAND.match(line)
+        if not said:
+            continue
+        command = gate.invocation(said.group(1)) or said.group(1).strip()
+        found["command"] = command
+        # The header wins over the filename wherever it can answer: it is the
+        # invocation GenPipes ran, while the name is a label that could have
+        # been copied from another directory.
+        spoke = re.search(r"\bgenpipes\s+([a-z_]+)\b", command)
+        if spoke:
+            found["pipeline"] = spoke.group(1)
+        found["protocol"] = gate.flag_value(command, "-t") or found["protocol"]
+        found["script"] = gate.flag_value(command, "-g") or ""
+    return found
+
+
+def traces(directory):
+    """Every past-run config in ONE directory, newest first, read on demand.
+
+    Non-recursive and uncached, exactly like candidates(): one listdir and a few
+    lines from each file it finds. Called when the `Past run configs…` view is
+    opened and never otherwise, so a directory with two hundred traces in it
+    costs nothing until somebody asks to see them.
+
+    Newest first by the TIMESTAMP, not by the filename and not by mtime. The
+    filename begins with the pipeline, so sorting on it groups by pipeline and
+    only then by time -- which reads as "sorted by nothing" in a directory that
+    holds two pipelines. An mtime would be right until somebody copied a file.
+    The stamp is when GenPipes generated the command, which is the thing being
+    listed, and it is in the file as well as in the name.
+    """
+    if not directory:
+        return []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    out = []
+    for name in sorted(names):
+        if not _TRACE_INI.search(name):
+            continue
+        found = read_trace(os.path.join(directory, name))
+        if found:
+            out.append(found)
+    return sorted(out, key=trace_order, reverse=True)
+
+
+def trace_order(trace):
+    """The sort key that puts the most recently generated config first.
+
+    The stamp is an ISO-ish string and sorts lexically as it sorts
+    chronologically, which is the whole reason GenPipes writes it that way. A
+    trace whose stamp could not be read sorts last rather than first: an unknown
+    date must not be able to claim the top of a list ordered by date. The path
+    breaks ties, so the order is stable from one scan to the next.
+    """
+    stamp = str((trace or {}).get("stamp") or "")
+    return (bool(stamp), stamp, str((trace or {}).get("path") or ""))
 
 
 def spoken(text):

@@ -52,6 +52,12 @@ _ESCAPES = {
     "[H": "home", "[F": "end", "OH": "home", "OF": "end",
     "[1~": "home", "[4~": "end", "[7~": "home", "[8~": "end",
     "[3~": "delete", "[Z": "shift-tab",
+    # Shift+arrows, for the terminals that send them. xterm, gnome-terminal and
+    # tmux do; Terminal.app sends a bare [A and this entry simply never fires
+    # there. Accepted as a convenience and never advertised, because a key hint
+    # naming a key that works on some terminals and not others is worse than no
+    # hint -- the reorder keys the panel DOES advertise are plain ASCII.
+    "[1;2A": "shift-up", "[1;2B": "shift-down",
 }
 
 def span_for(cols):
@@ -1084,7 +1090,7 @@ def _text(value):
 def choose(question, options, note="", free_text=True, free_label="Something else",
            multi=False, draw=None, cursor=0, field=None,
            on_enter=None, on_escape=None, on_text=None, typing=None,
-           hotkeys=None):
+           hotkeys=None, on_key=None):
     """A numbered choice panel. Returns the chosen value, or None if cancelled.
 
     `options` are slots.Option-shaped: anything with .value, .label and
@@ -1185,6 +1191,30 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                   digits are: `d` is a character somebody may be entering into
                   a free-text row, and a panel that acted on it mid-word would
                   be unusable for exactly the rows that need typing.
+
+        on_key(key, value)  a key nothing else has claimed, together with the
+                  value of the row THE CURSOR IS ON. Returns the same verdict
+                  as on_enter -- falsy means "not mine", and the key carries on
+                  down the chain to `?`, the digits and on_text as though this
+                  hook did not exist.
+
+                  It is separate from `hotkeys` because the two answer different
+                  questions. A hotkey stands for a ROW -- `d` is Enter on the
+                  apply row, wherever the cursor happens to be -- so it maps a
+                  key to a fixed value and never needs to know where you are.
+                  Reordering a stack is the opposite: the key means "move THIS
+                  one", and the only thing that knows which one is the cursor,
+                  which lives in here. /modify uses it for `[` and `]`, which
+                  move an ini up and down the -c stack.
+
+                  Consulted BEFORE on_text, so a key that reorders is not
+                  also typed into the narrowing filter, and after Enter and
+                  Escape, which are handled and broken out of above -- so a
+                  hook cannot capture either. ↑↓ ARE reachable here, which is
+                  what lets shift+arrows be claimed; a hook that wants ordinary
+                  navigation left alone returns False for "up" and "down" and
+                  they fall through to the branches below, which is exactly
+                  what modify.reorder_key does.
 
     Both are called between repaints, so a hook may change whatever `options`
     reads and the next paint will show it.
@@ -1360,6 +1390,14 @@ def choose(question, options, note="", free_text=True, free_label="Something els
                     paint()
                     continue
                 break
+            if (on_key is not None and not on_field
+                    and 0 <= cursor < len(rows)):
+                verdict = on_key(key, rows[cursor].value)
+                if verdict is not False and verdict is not None:
+                    refresh(verdict if isinstance(verdict, int)
+                            and not isinstance(verdict, bool) else None)
+                    paint()
+                    continue
             if key == "?" and not on_field:
                 # Not while a field is live: `?` is a character somebody might
                 # be typing, and a panel that reflowed underneath a half-typed

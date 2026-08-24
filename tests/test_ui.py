@@ -321,6 +321,65 @@ def main():
     r.equal("nor does the wide one",
             " ".join(text[a:b] for a, b, _ in wide), text)
 
+    # ------------------------------------------------------------------ #
+    r.section("the keys that reorder a -c stack")
+    # `[` and `]` are the advertised pair because they are plain ASCII and no
+    # terminal fails to send them. Shift+arrows are accepted where a terminal
+    # does send them and are deliberately NOT advertised -- see
+    # modify.REORDER_KEYS.
+    from genpipe import modify as _modify
+    r.equal("[ moves an ini earlier", _modify.reorder_key("["), -1)
+    r.equal("] moves it later", _modify.reorder_key("]"), 1)
+    r.equal("shift+up is accepted too", _modify.reorder_key("shift-up"), -1)
+    r.equal("and shift+down", _modify.reorder_key("shift-down"), 1)
+    r.equal("an ordinary character moves nothing",
+            _modify.reorder_key("a"), None)
+    r.equal("and neither does a bare arrow, which still navigates",
+            _modify.reorder_key("up"), None)
+
+    # The reader has to actually produce those names, or the alias is a key
+    # binding to nothing. Driven through a pipe, since _Reader wants only an fd.
+    import os as _os
+    for seq, name in ((b"\x1b[1;2A", "shift-up"), (b"\x1b[1;2B", "shift-down"),
+                      (b"\x1b[A", "up"), (b"[", "["), (b"]", "]")):
+        read_fd, write_fd = _os.pipe()
+        _os.write(write_fd, seq)
+        _os.close(write_fd)
+        try:
+            r.equal(f"{seq!r} decodes to {name!r}",
+                    ui._Reader(read_fd).key(), name)
+        finally:
+            _os.close(read_fd)
+
+    r.section("a reorder key never becomes typed text")
+    # ui.choose hands an unclaimed key on to on_text, which appends it to the
+    # narrowing filter. So a hook that recognises `[` as a reorder key and then
+    # returns False -- which /modify's did whenever the move was a no-op, i.e.
+    # on the ini already at the top of the stack -- puts a `[` in the filter,
+    # matches no ini, and empties the row.
+    #
+    # Asserted against the source because the hook is a closure over panel
+    # state with no terminal-free way in. What it has to be true of is simple:
+    # once the key IS a reorder key, no path may return False.
+    import os as _os
+    _cli = open(_os.path.join(_os.path.dirname(_os.path.dirname(
+        _os.path.abspath(__file__))), "genpipe", "cli.py")).read()
+    body = _cli[_cli.index("    def on_reorder(key, value):"):]
+    body = body[:body.index("\n    def ")]
+    guard, rest = body.split("return False", 1)
+    r.check("the key is recognised, and the row checked, before anything else",
+            "modify.reorder_key(key)" in guard and "modify.CONFIG" in guard,
+            guard)
+    r.check("and past that one guard, no path hands the key back unclaimed",
+            "return False" not in rest, rest)
+
+    r.section("choose() takes the hook the panel reorders through")
+    import inspect as _inspect
+    params = _inspect.signature(ui.choose).parameters
+    r.check("on_key is a parameter", "on_key" in params)
+    r.check("and it defaults to off, so every other panel is unaffected",
+            params["on_key"].default is None)
+
     return r.finish()
 
 

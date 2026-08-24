@@ -107,6 +107,88 @@ _SETTING = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
 
 _CONFIDENCE = ("certain", "likely", "unclear")
 
+# How many distinct headings make a response a DIAGNOSIS rather than prose that
+# happens to open with one of these words. Three, because two is reachable by
+# accident -- a paragraph beginning "CAUSE: ..." and later "FIX: ..." is a
+# person writing in shorthand -- and requiring all seven would refuse the
+# contract's own permission to omit a heading with nothing true under it.
+MIN_HEADINGS = 3
+
+# A fenced block. Biomni treats one as an execution payload when no <execute>
+# tag is present (a1.py:1341), so a response containing one is a response that
+# may be asking to run something. complete() refuses those outright rather than
+# deciding which of the two it is.
+_FENCE = re.compile(r"^\s*```", re.MULTILINE)
+
+_ANY_TAG = re.compile(r"</?\s*(execute|solution|think)\b", re.IGNORECASE)
+
+
+def complete(text):
+    """Is `text` a whole answer in SHAPE, with nothing else in it?
+
+    A STRUCTURAL question, and only a structural one. Nothing here reads what
+    the sections SAY -- a diagnosis that is wrong, hedged, self-contradictory or
+    about the wrong step passes exactly as readily as a correct one, because
+    judging that is not this function's business and never becomes it.
+
+    What it exists for: a measured /diagnose turn spent 66 seconds producing a
+    complete, correctly-shaped answer with no <solution> around it, which biomni
+    discarded and asked for again. The second attempt returned the same text
+    with the tag on. The whole cost was a missing wrapper.
+
+    Every condition below is there to make "already a complete answer"
+    unmistakable, so that the caller is restoring a wrapper rather than
+    choosing one:
+
+      no tag anywhere            a response carrying <execute> has asked for an
+                                 action, and one carrying <solution> needs
+                                 nothing. Either way the model already said
+                                 which it meant.
+      no fenced block            biomni reads a bare fence as an execution
+                                 payload. A response containing one is
+                                 ambiguous between answer and action, and
+                                 ambiguity is the case this refuses.
+      it OPENS with a heading    not "contains". Prose with headings somewhere
+                                 inside it would need somebody to decide where
+                                 the answer starts, and that decision is
+                                 exactly what must not be made here.
+      MIN_HEADINGS distinct      enough structure that the shape was intended.
+      in the order SHAPE gives   the contract asks for that order; text that
+                                 wanders through the headings, or repeats one,
+                                 is not a document following it.
+
+    True means: wrap the WHOLE text, unchanged. It never means: extract part of
+    it.
+    """
+    if not text or not isinstance(text, str):
+        return False
+    if _ANY_TAG.search(text) or _FENCE.search(text):
+        return False
+
+    body = text.strip()
+    if not body:
+        return False
+
+    order = []
+    first = True
+    for line in body.splitlines():
+        if first:
+            if not line.strip():
+                continue
+            if not _HEAD.match(line):
+                return False
+            first = False
+        found = _HEAD.match(line)
+        if found:
+            order.append(_HEADINGS.index(found.group(1).upper()))
+
+    if len(order) < MIN_HEADINGS:
+        return False
+    # Strictly increasing: each heading appears once, and in the order SHAPE
+    # states. A repeat is two documents or one confused one; either way it is
+    # not a thing to wrap silently.
+    return all(b > a for a, b in zip(order, order[1:]))
+
 
 def strip_tags(text):
     """The body of a <solution> block, or the whole text if there is none."""

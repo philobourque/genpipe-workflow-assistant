@@ -609,8 +609,19 @@ def main():
     offered = modify.options_for("config", STACKED, {"config": ["mine.override.ini"]})
     r.equal("the current stack comes first",
             [o.value for o in offered][:3], STACKED["slots"]["inis"])
-    r.check("each says which way enter moves it",
-            all("enter" in o.description for o in offered))
+    # WHAT THE ROW IS, in the description; what the KEYS do, on the highlighted
+    # row alone -- see display.modify_panel, which appends the verbs there.
+    # Every option used to carry "enter takes it off · [ ] reorders", which is
+    # the same sentence down the whole list and advertised the reorder keys
+    # beside inis they cannot move.
+    on_stack = [o for o in offered if o.label.startswith(modify.ON_MARK)]
+    r.check("an ini on the stack says so", 
+            all(o.description == "on the stack" for o in on_stack), 
+            [o.description for o in on_stack])
+    r.check("and the rows enter would ADD say that instead",
+            all("enter adds it" in o.description for o in offered
+                if o.label.startswith(modify.FREE_MARK)),
+            [o.description for o in offered])
     r.check("a local ini is offered to add",
             "mine.override.ini" in [o.value for o in offered])
     r.equal("and nothing is offered twice",
@@ -629,7 +640,8 @@ def main():
     after = modify.options_for("config", STACKED, {}, pending={"config": dropped})
     gone = [o for o in after if o.value.endswith("cit.ini")]
     r.equal("an ini taken off is still listed", len(gone), 1)
-    r.contains("and says enter puts it back", gone[0].description, "puts it back")
+    r.contains("and says enter brings it back", gone[0].description,
+               "enter restores")
 
     # And putting it back is an UNDO, not an addition. Restoring it to the end
     # of the stack would change which ini wins while claiming to restore.

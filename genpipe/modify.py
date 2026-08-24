@@ -140,6 +140,242 @@ _CONSEQUENCE = {
 
 CONFIG = "config"
 
+# The three states a `-c` row can be in, as the marker each is drawn with.
+#
+# PUBLIC, AND IN THE LABEL RATHER THAN ONLY IN THE DESCRIPTION, for the reason
+# the panel states about its own rows: a description is the first thing a narrow
+# terminal drops (details_on) and the first thing a screenshot loses. Whether an
+# ini is on the stack decides what every key does to it, so it cannot live only
+# in the column that disappears.
+#
+# display.modify_panel reads ON_MARK back off the label to decide which rows may
+# be reordered. That is the marker doing its job -- it IS the state -- rather
+# than a second copy of the state travelling alongside it.
+ON_MARK = "✓"        # on the resulting stack
+OFF_MARK = "✗"       # taken off during this change set
+FREE_MARK = " "      # merely available, never chosen
+
+# What the highlighted ini on the stack may have done to it. Appended by the
+# renderer to that ONE row rather than carried on every option, because it
+# describes keys that act on wherever the cursor is: printed on all of them it
+# is four identical sentences saying something true of one, and printed on a
+# removed or merely-available ini it advertises a key that does nothing there.
+#
+# The directions are spelled out. `[ ] reorders` was the first wording and says
+# which keys without saying which way, which is the half somebody actually
+# needs at the moment of pressing one.
+REORDER_HINT = "· enter removes · [ up · ] down"
+
+# The two rows in the -c vocabulary that are not inis. Sentinels rather than
+# paths, and deliberately unspellable as one -- a NUL cannot appear in a
+# filename on any filesystem this runs on, so no ini anybody has can collide
+# with either.
+#
+# PAST_CONFIGS opens the second view; SEARCH_TRACKED widens that view to the
+# other directories tracked runs live in. Both are handled by the panel, which
+# is where "this is a door rather than a value" belongs -- config_stack,
+# toggle_config and everything downstream of them never see one.
+PAST_CONFIGS = "\x00past-configs"
+SEARCH_TRACKED = "\x00search-tracked"
+
+
+# ---------------------------------------------------------------------------
+# WHICH INI IS WHICH.
+#
+# One ini is written several ways in this application and some of those spellings
+# mean the same file:
+#
+#   $GENPIPES_INIS/dnaseq/cit.ini   as the model wrote it on the command line
+#   cit.ini                         as slots.expected_inis() knows it
+#   override_walltime.ini           as somebody typed it beside their run
+#   /home/p/proj/override_walltime.ini
+#                                   as intake.candidates() found it on disk
+#
+# Comparing the raw strings makes the last two different inis, so the picker
+# offers to add a second copy of a file already on the stack, GenPipes reads it
+# twice, and -- the reported defect -- toggling one off leaves the panel unable
+# to say it was ever there.
+#
+# THE FIX IS NOT "COMPARE BASENAMES", which is what this module used to do
+# everywhere and what a first pass at this reinstated. Basename identity gets
+# the cases above right and then merges these two, which are not the same file
+# and are not the same run:
+#
+#   $GENPIPES_INIS/dnaseq/cit.ini        the install's
+#   /some/custom/location/cit.ini        one somebody copied out and edited
+#
+# Neither resolves on a laptop with no GenPipes install, so a basename fallback
+# silently answers "same" for a question it has no evidence about -- and the
+# answer decides which file a run reads.
+#
+# SO IDENTITY IS RESOLVED AGAINST A SET, NOT PAIRWISE. That is the shape the
+# question actually has: "is this ini on that stack" has three answers, not two,
+# and the third one is what makes it safe.
+#
+#   absent      nothing on the stack matches
+#   unique      exactly one entry matches -- act on it
+#   ambiguous   several match. NEVER collapsed, never guessed between: the
+#               caller refuses and says which entries it cannot tell apart, and
+#               the panel grows enough parent directory onto each label to make
+#               them distinguishable (see labels_for).
+#
+# The only spelling that may bind to a location is a BARE NAME -- one with no
+# directory component at all. That is not a fallback, it is what a bare name
+# IS: an under-specified reference, a name rather than a place, which is what
+# slots.expected_inis() emits and what a person types. Two QUALIFIED paths match
+# only if their resolved locations match, so the two cit.ini above stay two
+# files whether or not either exists on this machine.
+# ---------------------------------------------------------------------------
+
+ABSENT = ()
+
+
+def ini_location(ref, workdir=None):
+    """A trustworthy location for `ref`, or None when there is not one.
+
+    Trustworthy means one of two things and nothing else:
+
+      the disk answered   the path exists, so realpath is the file's identity.
+                          A relative path is resolved against `workdir` -- the
+                          RUN's directory, not this process's cwd, because a
+                          panel opened on a run somewhere else must not resolve
+                          its inis against wherever the app happens to be.
+                          Symlinks collapse, which is right: a link and its
+                          target are one file to GenPipes.
+      the path is a path  it has a directory component, so normalising it says
+                          something even when nothing exists there. `./a/b.ini`
+                          and `a/b.ini` are the same reference; `x/cit.ini` and
+                          `y/cit.ini` are not.
+
+    None for a bare name, which has no location by construction, and None for
+    anything containing an unexpanded $VARIABLE, which has no location we may
+    claim to know. Expanding $GENPIPES_INIS from OUR environment would answer a
+    question about this shell rather than about the run, and on a login node
+    with the variable set it would start quietly resolving inis the run may
+    never have used. The original string is never rewritten -- this is only ever
+    consulted for comparison, and every stack, option and command keeps the
+    exact text that will reach `-c`.
+    """
+    text = str(ref or "").strip()
+    if not text:
+        return None
+    if "$" in text:
+        return None
+    expanded = os.path.expanduser(text)
+    resolved = expanded
+    if not os.path.isabs(resolved) and workdir:
+        resolved = os.path.join(str(workdir), resolved)
+    try:
+        if os.path.exists(resolved):
+            return os.path.realpath(resolved)
+    except (OSError, ValueError):
+        pass
+    if os.sep in expanded or "/" in expanded:
+        return os.path.normpath(
+            resolved if os.path.isabs(resolved) or workdir else expanded)
+    return None
+
+
+def _bare(ref):
+    """Is this a NAME rather than a place? See ini_location."""
+    text = str(ref or "").strip()
+    return bool(text) and "/" not in text and os.sep not in text
+
+
+def locate(ref, stack, workdir=None):
+    """Indices in `stack` that `ref` refers to. () absent, (i,) unique, more
+    than one AMBIGUOUS.
+
+    A tuple rather than a bool so the third answer cannot be lost by a caller
+    that only asked "is it there". Everything that acts on an ini goes through
+    this, so there is one account of what matching means.
+    """
+    ref_at = ini_location(ref, workdir)
+    ref_bare = _bare(ref)
+    ref_name = os.path.basename(str(ref or "").strip())
+    hits = []
+    for i, entry in enumerate(stack or ()):
+        entry_at = ini_location(entry, workdir)
+        if ref_at and entry_at:
+            # Both are placed. Only the places decide, and they decide both
+            # ways -- this is what keeps the install's cit.ini and a local copy
+            # of it apart.
+            if os.path.normpath(ref_at) == os.path.normpath(entry_at):
+                hits.append(i)
+            continue
+        # At least one side is a bare name or an unexpanded path, so neither
+        # can be placed against the other. A bare name matches on the name,
+        # which is all a bare name says; two unplaceable QUALIFIED paths fall
+        # back to their exact text, so `$A/cit.ini` and `$B/cit.ini` differ.
+        entry_bare = _bare(entry)
+        if ref_bare or entry_bare:
+            if ref_name == os.path.basename(str(entry).strip()):
+                hits.append(i)
+        elif str(ref).strip() == str(entry).strip():
+            hits.append(i)
+    return tuple(hits)
+
+
+def on_stack(ref, stack, workdir=None):
+    """Is `ref` on this stack at all? Ambiguity counts as present.
+
+    Used where the question is presence rather than which one -- realized(),
+    checking a declared removal. Failing CLOSED is deliberate there: if two
+    entries might be the ini that was supposed to come off, it did not come off.
+    """
+    return bool(locate(ref, stack, workdir))
+
+
+def labels_for(paths):
+    """{path: label} -- the shortest tail of each path that is still unique.
+
+    THE PICKER IS NOT THE COMMAND. Internally every ini stays the exact string
+    that will be handed to `-c`, because that is what executes; but a list where
+    four rows read `dnaseq.base.ini` and the fifth reads
+    `/home/pbourque/genpipe-workflow-assistant/override_walltime.ini` is a list
+    whose most important column is mostly a directory nobody chose. The eye
+    reads the left edge, and on that screen the left edge is noise.
+
+    So the label is the basename -- until two paths would collide on it, and
+    then both grow a parent directory, and another, until they differ. Only the
+    colliding ones grow: adding `dnaseq/` to every row to disambiguate one pair
+    would spend the whole column on the pair.
+
+    THIS IS ALSO WHERE AMBIGUITY BECOMES VISIBLE. locate() refuses to choose
+    between two inis that share a basename; what makes that refusal actionable
+    rather than a dead end is that the two rows on screen no longer look
+    identical. The two halves are one mechanism -- internal identity stays
+    conservative precisely because the display can afford to be explicit.
+
+    NO WORKDIR ARGUMENT, deliberately. This measures the literal strings that
+    are going to be drawn, and it is called on a list options_for has ALREADY
+    deduplicated through locate() -- so two spellings of one file never both
+    reach it, and there is nothing here for a workdir to resolve. It took one
+    for a while and read at the call site as though the run's directory
+    participated in disambiguation, which it never did.
+    """
+    paths = list(dict.fromkeys(str(p) for p in paths or ()))
+    labels = {}
+    for path in paths:
+        parts = [p for p in str(path).replace(os.sep, "/").split("/") if p]
+        labels[path] = parts[-1] if parts else str(path)
+    for depth in range(2, 8):
+        counts = {}
+        for label in labels.values():
+            counts[label] = counts.get(label, 0) + 1
+        clashing = {label for label, n in counts.items() if n > 1}
+        if not clashing:
+            break
+        for path, label in list(labels.items()):
+            if label not in clashing:
+                continue
+            parts = [p for p in str(path).replace(os.sep, "/").split("/") if p]
+            if len(parts) >= depth:
+                labels[path] = "/".join(parts[-depth:])
+    # A label longer than the path it shortens is not a shortening.
+    return {path: (label if len(label) <= len(path) else path)
+            for path, label in labels.items()}
+
 
 def config_stack(proposal, changes=None):
     """The `-c` stack as it stands right now: the run's inis, plus whatever
@@ -157,7 +393,7 @@ def config_stack(proposal, changes=None):
     return list(dict.fromkeys(str(ini) for ini in inis))
 
 
-def toggle_config(proposal, changes, ini):
+def toggle_config(proposal, changes, ini, workdir=None):
     """The stack with `ini` taken off it if it was on, or put on if it was not.
 
     This is why `config` opens differently from every other row. The other nine
@@ -168,11 +404,19 @@ def toggle_config(proposal, changes, ini):
     whole list, which is both tedious and the easiest possible way to silently
     drop the base ini.
 
-    An ini is matched by BASENAME, not by the path written. The stack routinely
+    An ini is matched by locate(), not by the path written. The stack routinely
     holds `$GENPIPES_INIS/dnaseq/dnaseq.cancer.ini` while the options list --
     built from slots.expected_inis() -- knows it only as `dnaseq.cancer.ini`.
     Comparing the strings would show it as absent and offer to add a second
     copy under a different spelling, which GenPipes would then read twice.
+
+    AMBIGUITY IS REFUSED, not resolved. If the reference matches two entries --
+    two inis with the same basename and different homes -- this returns the
+    stack untouched rather than picking one. Toggling the wrong ini off a -c
+    line is a silent change to what the run reads, and there is no reading of a
+    single keystroke that says which of the two was meant. The panel's labels
+    grow enough parent directory to tell them apart (see labels_for), so the
+    next keystroke can be unambiguous.
 
     Where a NEW ini belongs in the layering is a question this module
     deliberately does not answer -- see _deltas(), which hands it to the model
@@ -186,41 +430,211 @@ def toggle_config(proposal, changes, ini):
     to restore. Those go back among the originals, in their original order.
     """
     stack = config_stack(proposal, changes)
-    base = os.path.basename(str(ini))
-    kept = [x for x in stack if os.path.basename(x) != base]
-    if len(kept) != len(stack):
-        return kept
+    here = locate(ini, stack, workdir)
+    if len(here) > 1:
+        return stack                       # ambiguous: change nothing
+    if here:
+        return [x for i, x in enumerate(stack) if i != here[0]]
 
     was = config_stack(proposal)
-    rank = {os.path.basename(x): i for i, x in enumerate(was)}
-    if base not in rank:
+    back = locate(ini, was, workdir)
+    if len(back) != 1:
+        # Never on this run's stack, or ambiguous on it. Either way there is no
+        # original position to restore it to, so it goes on the end and the
+        # model places it -- see the note above about the layering rule.
         return stack + [str(ini)]
+    origin = back[0]
     # Before the first ini that outranked it originally -- or, failing that,
     # before the first ini that was never in the original stack at all. The
     # second half is what puts back the LAST original: nothing outranks it, so
     # without that clause it lands after an override ini added since, and an
     # override that is no longer last is an override that is silently overruled.
     for at, x in enumerate(stack):
-        other = rank.get(os.path.basename(x))
-        if other is None or other > rank[base]:
+        found = locate(x, was, workdir)
+        other = found[0] if len(found) == 1 else None
+        if other is None or other > origin:
             return stack[:at] + [str(ini)] + stack[at:]
     return stack + [str(ini)]
 
 
-def config_delta(proposal, changes):
+# Which keys move an ini along the -c stack, and which way.
+#
+# `[` AND `]` ARE THE ADVERTISED PAIR because they are plain ASCII and every
+# terminal sends them. Shift+arrows are the prettier choice and are accepted
+# below, but they cannot be the advertised one: xterm, gnome-terminal and tmux
+# send \x1b[1;2A for shift+up and macOS Terminal.app sends a bare \x1b[A, so a
+# footer naming them would name a key that silently does nothing on somebody
+# else's machine -- which is the defect the `d` hotkey had before it was bound.
+#
+# Claiming two printable characters costs nothing on this row: the open config
+# row uses typing to NARROW its list, and no ini filename contains a bracket.
+REORDER_KEYS = {"[": -1, "]": 1, "shift-up": -1, "shift-down": 1}
+
+
+def reorder_key(key):
+    """Which way this keystroke moves an ini, or None if it moves nothing.
+
+    A table rather than a conditional in the panel, so the keys the footer
+    advertises and the keys that work are read from one place.
+    """
+    return REORDER_KEYS.get(key)
+
+
+def pretty_stamp(stamp):
+    """`2026-08-05T11.02.13` as `2026-08-05 11:02`, or the input unchanged.
+
+    GenPipes writes its timestamps with dots where a clock has colons, because
+    the string is part of a filename. Left exactly as found when it is not that
+    shape: a timestamp this cannot read is still the only one there is, and
+    showing it raw beats showing nothing or showing a reformatted guess.
+    """
+    text = str(stamp or "").strip()
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2})[.:](\d{2})", text)
+    return f"{m.group(1)} {m.group(2)}:{m.group(3)}" if m else text
+
+
+def trace_row(trace, owner=None):
+    """One past-run config as (label, description).
+
+    The label is what the file SAYS IT IS -- pipeline, protocol and when it was
+    written -- rather than its filename, which is the same three facts with the
+    punctuation of a filename and forty characters of suffix.
+
+    The description is where it came from, and it has two forms because the
+    evidence has two states. runs.trace_owner answers only when exactly one
+    tracked run matches on script and directory; given that, this names the run
+    and its status. Given None -- no match, or several -- it falls back to the
+    script the trace itself names, which is a fact read out of the file rather
+    than a link inferred from it.
+
+    METADATA, NOT A VERDICT. Nothing here or anywhere downstream uses the
+    pipeline, the protocol or the status to decide which traces may be chosen. A
+    failed run's config and another pipeline's config are listed exactly like
+    any other, described accurately, and picking one is the user's call.
+    """
+    parts = [p for p in ((trace or {}).get("pipeline"),
+                         (trace or {}).get("protocol")) if p]
+    when = pretty_stamp((trace or {}).get("stamp"))
+    if when:
+        parts.append(when)
+    label = " · ".join(parts) or os.path.basename(str((trace or {}).get("path")
+                                                      or "a config trace"))
+    if owner:
+        status = str((owner or {}).get("status") or "").replace("_", " ")
+        note = f"from {owner.get('name')}" + (f" · {status}" if status else "")
+    elif (trace or {}).get("script"):
+        note = f"generated {trace['script']}"
+    else:
+        note = "written by GenPipes"
+    return label, note
+
+
+def use_config(proposal, changes, path):
+    """The stack REPLACED by this one config. Returns the new list.
+
+    The other half of what selecting a past run's config can mean, and it is a
+    genuinely different intent from adding one: a resolved trace already
+    contains everything the run it came from was given, so laying it on top of
+    a stack means every earlier ini is either redundant or silently overruled by
+    it. Starting from it instead says "this configuration, and then whatever I
+    add next", which is the reading the layering rule can actually honour.
+
+    WHICH OF THE TWO IS RIGHT IS NOT DECIDED HERE, and there is no default
+    hiding in this function: the panel asks, both options are offered plainly,
+    and neither is marked as recommended. This is the mechanical half of one of
+    the answers.
+
+    Anything added afterwards layers on top in the usual way -- the result is an
+    ordinary stack of one, not a special mode.
+    """
+    return [str(path)]
+
+
+def move_config(proposal, changes, ini, by, workdir=None):
+    """The stack with `ini` moved `by` places along it. Returns the new list.
+
+    WHY THIS EXISTS AT ALL. `-c` is applied left to right and later inis
+    overrule earlier ones, which the panel has said on its own header since it
+    was written -- "applied in order, later wins" -- while offering no way to
+    change that order. Membership was editable and precedence was not, so a
+    stack whose inis were all correct and whose ORDER was wrong could only be
+    fixed by taking inis off and putting them back in the right sequence, which
+    toggle_config() deliberately refuses to do (it restores an ini to where it
+    came from, which is the right behaviour for an undo and the wrong one for a
+    reorder).
+
+    IT DOES NOT KNOW WHAT THE ORDER SHOULD BE, and must not learn. There is no
+    rule here that rorqual.ini precedes dnaseq.cancer.ini, or that a private
+    override belongs last; the layering rule lives in genpipes.md, which the
+    model reads, and the one place this module states a preference about it --
+    _deltas' note on a newly ADDED ini -- points at that document rather than
+    restating it. This moves element i to element i±1. That is all it does.
+
+    Out of range is a no-op rather than a wrap. An ini already at the top of the
+    stack, moved up, should sit still; wrapping it to the bottom would change
+    which ini wins on a keystroke somebody pressed expecting nothing to happen.
+    """
+    stack = config_stack(proposal, changes)
+    here = locate(ini, stack, workdir)
+    if len(here) != 1:
+        return stack          # not on the stack, or ambiguous on it
+    at = here[0]
+    to = at + int(by)
+    if not 0 <= to < len(stack):
+        return stack
+    moved = list(stack)
+    moved.insert(to, moved.pop(at))
+    return moved
+
+
+def config_delta(proposal, changes, workdir=None):
     """What toggling actually did, as (added, dropped) lists of inis.
 
     Compared against the PROPOSAL rather than reported as the whole new stack,
     because the model is being told to edit a `-c` line it can already see. A
     full stack would read as "replace -c with this", and replacing is how the
     order of the inis nobody touched gets rewritten.
+
+    MEMBERSHIP ONLY. This answers "what joined and what left", and a pure
+    reorder correctly produces ([], []) -- the same inis are on the stack. That
+    is not the whole change, and reading it as though it were is what made
+    reordering a no-op end to end: _deltas() found no parts, sentence() returned
+    "", and the keystroke reached nothing. reordered() is the other half of the
+    question and _deltas asks both.
     """
     was = config_stack(proposal)
     now = config_stack(proposal, changes)
-    before = {os.path.basename(x) for x in was}
-    after = {os.path.basename(x) for x in now}
-    return ([x for x in now if os.path.basename(x) not in before],
-            [x for x in was if os.path.basename(x) not in after])
+    return ([x for x in now if not locate(x, was, workdir)],
+            [x for x in was if not locate(x, now, workdir)])
+
+
+def reordered(proposal, changes, workdir=None):
+    """Did the inis that survived this change set come out in a new order?
+
+    Asked of the SURVIVORS, not of the whole stack, which is what makes it
+    compose with adding and removing. Dropping the second of five inis shifts
+    the last three along by one; that is not a reorder and reporting it as one
+    would put an ordering instruction in front of the model on every removal.
+    What counts is whether two inis that were both on the stack before and are
+    both on it after have swapped which of them wins.
+    """
+    was = config_stack(proposal)
+    now = config_stack(proposal, changes)
+    # Each survivor named by its POSITION in the original stack, which is a
+    # stable identity for this comparison and needs no canonical form of its
+    # own. Read off both lists and compared as sequences: if the survivors come
+    # out of `now` in a different order than they went into `was`, two inis have
+    # swapped which of them wins.
+    #
+    # An entry matching the other list ambiguously is left out of both lists
+    # rather than guessed at. Its position cannot be established, so it cannot
+    # be said to have moved -- and a reorder reported on a guess would send the
+    # model an ordering instruction nobody asked for.
+    kept_now = [found[0] for found in
+                (locate(x, was, workdir) for x in now) if len(found) == 1]
+    kept_was = [i for i, x in enumerate(was)
+                if len(locate(x, now, workdir)) == 1]
+    return kept_was != kept_now
 
 
 def current(proposal, row):
@@ -308,7 +722,8 @@ def rows_for(proposal, name="", resources=""):
     return out
 
 
-def options_for(row, proposal, candidates=None, pending=None):
+def options_for(row, proposal, candidates=None, pending=None, removed=(),
+                workdir=None):
     """The vocabulary for a row, as slots.Option rows, or [] if it has none.
 
     Empty is a real answer and the caller must honour it by degrading to a plain
@@ -339,46 +754,101 @@ def options_for(row, proposal, candidates=None, pending=None):
         # with suggestions would bury the four inis the run actually has under
         # the one it might want.
         stack = config_stack(proposal, pending)
-        on = {os.path.basename(x) for x in stack}
+        listed = list(stack)          # everything already given a row
+
+        # THREE STATES, THREE MARKERS, and they have to be three because the
+        # middle one used to be indistinguishable from the last:
+        #
+        #   ✓  on the resulting stack
+        #   ✗  explicitly taken off during this change set
+        #   ·  merely available, and never chosen
+        #
+        # `removed` is passed in by the panel, which is the only thing that
+        # knows what was pressed. It used to be INFERRED here, as "in the
+        # original stack and not in the pending one", and that inference is
+        # wrong for every ini added and then removed in the same pass: it was
+        # never in the original, so taking it off dropped it silently back into
+        # the candidate list with a blank marker, while cit.ini in the same
+        # situation showed ✗. One keystroke, two renderings, depending on
+        # something invisible. The inference is kept as a fallback for callers
+        # with no panel state to offer, so an unaware caller still gets marks.
+        gone = [x for x in (removed or ()) if not locate(x, stack, workdir)]
+        gone += [x for x in config_stack(proposal)
+                 if not locate(x, stack, workdir)
+                 and not locate(x, gone, workdir)]
+
+        # The rows, as (value, mark, description), BEFORE they are labelled.
+        # Gathering first is what lets the labels be measured against what is
+        # actually on the screen -- see below.
+        #
         # The tick is in the LABEL, not only in the description, for the reason
         # the panel states about its own rows: a description is the first thing
         # a narrow terminal drops (details_on) and the first thing a screenshot
         # loses. Whether an ini is on the stack decides which way Enter moves
         # it, so it cannot live only in the column that disappears.
-        out = [slots.Option(ini, f"✓ {ini}", "on the stack — enter takes it off")
-               for ini in stack]
-        # Inis this run HAD and toggling has taken off. Listed straight after
-        # the survivors, because a removal nobody can undo is a trap: cit.ini
-        # is neither a feature ini for any protocol nor a file in the project
+        # The description is what the row IS, not what the keys do to it: the
+        # verbs belong on the highlighted row alone and the renderer appends
+        # them there (see REORDER_HINT).
+        rows = [(ini, ON_MARK, "on the stack") for ini in stack]
+        # Inis taken off during this change set. Listed straight after the
+        # survivors, because a removal nobody can undo is a trap: cit.ini is
+        # neither a feature ini for any protocol nor a file in the project
         # directory, so once it left the stack nothing else here would ever
         # offer it again and the only way back would be to abandon the whole
         # change set.
-        for ini in config_stack(proposal):
-            if os.path.basename(ini) not in on:
-                on.add(os.path.basename(ini))
-                out.append(slots.Option(ini, f"✗ {ini}",
-                                        "taken off — enter puts it back"))
+        for ini in gone:
+            if not locate(ini, listed, workdir):
+                listed.append(ini)
+                rows.append((ini, OFF_MARK, "removed · enter restores"))
         protocol = (pending or {}).get("protocol") or values.get("protocol")
         if pipeline:
             protocol = protocol or slots.DEFAULTS.get(pipeline)
             for ini in slots.expected_inis(pipeline, protocol) or ():
-                if os.path.basename(ini) not in on:
-                    on.add(os.path.basename(ini))
-                    out.append(slots.Option(
-                        ini, f"  {ini}",
-                        f"feature ini {protocol} wants — enter adds it"))
+                if not locate(ini, listed, workdir):
+                    listed.append(ini)
+                    rows.append((ini, FREE_MARK,
+                                 f"feature ini {protocol} wants — enter adds it"))
         # Ordered by intake.rank_inis before it got here: hand-written inis
         # first, then private overrides, then GenPipes' own config traces. The
         # description says WHICH of those each one is, because the ordering is
         # invisible once the rows are on screen and "found here" was the same
         # sentence for a config somebody wrote and a record of a run that
-        # already happened. Nothing is hidden and nothing is chosen -- a trace
-        # ini is still one Enter away for anybody who means it.
+        # already happened.
         for ini in candidates.get("config") or ():
-            if os.path.basename(ini) not in on:
-                on.add(os.path.basename(ini))
-                out.append(slots.Option(ini, f"  {ini}",
-                                        _ini_blurb(ini)))
+            if not locate(ini, listed, workdir):
+                listed.append(ini)
+                rows.append((ini, FREE_MARK, _ini_blurb(ini)))
+
+        # LABELS ARE SHORT; VALUES ARE EXACT. The value is what reaches `-c`
+        # and stays byte-for-byte what it was; the label is the shortest tail of
+        # the path that is still unique AMONG THE ROWS BEING SHOWN.
+        #
+        # Measured over `rows` rather than over every path considered, and that
+        # is not a detail. The vocabulary tables know `dnaseq.cancer.ini` by
+        # its bare name while the command carries `$GENPIPES_INIS/dnaseq/
+        # dnaseq.cancer.ini`; both went into the pool, collided on the basename,
+        # and grew a parent directory each -- so one row on the stack showed a
+        # path while its neighbours showed names, to disambiguate it from a row
+        # that had been dropped as a duplicate and was not on screen at all.
+        # Only what is drawn can collide.
+        label_of = labels_for([ini for ini, _, _ in rows])
+        out = [slots.Option(ini, f"{mark} {label_of.get(str(ini), ini)}", note)
+               for ini, mark, note in rows]
+        # LAST, AND ONE ROW WHATEVER THE DIRECTORY HOLDS.
+        #
+        # GenPipes writes a resolved config beside every command it generates,
+        # so a working directory accumulates one per generation for ever. They
+        # used to be candidates like any other ini and filled the panel; then
+        # they were capped at the two newest, which fixed the length by making
+        # the rest unreachable. Neither is right for a list that only grows.
+        #
+        # A door instead. It costs one row, it is the same one row after two
+        # hundred generations, and behind it is ALL of them with what each one
+        # is -- see intake.traces, which scans when the door is opened and
+        # remembers nothing afterwards.
+        out.append(slots.Option(
+            PAST_CONFIGS, "› Past run configs…",
+            "resolved configs GenPipes wrote about runs that already happened"))
         return out
     # name, steps and output are free text. A step range is a range, not a list,
     # and a path is a path -- inventing options for either would be inventing.
@@ -1194,6 +1664,21 @@ def _deltas(proposal, substantive):
             # -c line is one whose surviving inis can come back in a different
             # order. Order is the entire semantics of this flag.
             added, dropped = config_delta(proposal, {CONFIG: new})
+            # UNLESS THE ORDER IS THE CHANGE, and then the diff cannot say it.
+            # A reorder adds nothing and drops nothing, so the add/drop form
+            # produces no parts at all -- which is how moving an ini up the
+            # stack used to reach the model as silence, and from there reached
+            # the command as nothing. When the survivors have been resequenced
+            # the whole ordered stack IS the request, and stating it in full is
+            # the only unambiguous way to ask for it.
+            if reordered(proposal, {CONFIG: new}):
+                out.append(
+                    "set -c to exactly this, in this order: "
+                    + " ".join(str(x) for x in new)
+                    + " (the order is deliberate — -c is applied left to right "
+                      "and later inis overrule earlier ones, so this is a "
+                      "change to what the run does, not a tidy-up)")
+                continue
             parts = ([f"add {', '.join(added)} to the -c stack"] if added else [])
             parts += ([f"drop {', '.join(dropped)} from the -c stack"]
                       if dropped else [])
