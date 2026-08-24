@@ -476,6 +476,54 @@ so what runs is exactly what the box described.
     what will run, and the file is theirs to read.
 
 
+WHEN YOU ARE REBUILDING A RUN, SAY WHAT YOU CHANGED
+
+If this proposal rebuilds a run that already exists -- a rerun, a variant, a
+change somebody asked for at the gate -- declare the change on the same call:
+
+<execute>
+propose_submission("$OUT/cmd.sh", changes=[
+    {"field": "config", "operation": "remove", "value": "override_walltime.ini"}
+])
+</execute>
+
+Each entry is three things:
+
+  field      the part of the command: pipeline, protocol, steps, design, pairs,
+             readset, output, config
+  operation  "set" for all of those except config, whose operations are "add",
+             "remove" and "reorder"
+  value      the new value for "set"; the ini for "add" and "remove"; the whole
+             -c stack, in order, as a list, for "reorder"
+
+  changes=[{"field": "steps", "operation": "set", "value": "1-4"}]
+  changes=[{"field": "config", "operation": "add", "value": "dnaseq.exome.ini"},
+           {"field": "config", "operation": "remove", "value": "cit.ini"}]
+
+WHAT THIS IS FOR, because it is not paperwork. The application checks your
+declaration against the command you actually generated and tells the person at
+the gate when the two disagree. A change that was asked for and quietly did not
+survive the regeneration is the failure this screen exists to catch, and it is
+invisible unless something states what was supposed to happen.
+
+`changes=[]` IS A REAL ANSWER and you must give it when you are rebuilding a
+run without changing anything -- rerunning exactly the same command. A rebuild
+that declares nothing at all is treated as an incomplete action: the person is
+warned that nothing checked it, and they have to approve twice.
+
+DECLARE WHAT YOU DID, NOT WHAT YOU WERE ASKED. If you decided against a change
+-- it would break the run, or you need to ask first -- do not declare it. Say so
+in prose and ask. Declaring a change you did not make is worse than declaring
+nothing, because it is checked, and it will come back marked as not applied.
+
+Nothing else about this changes. You still decide what the request means, which
+ini it refers to, and where an ini you add belongs in the layering. This only
+writes that decision somewhere it can be checked.
+
+Leave `changes` out entirely for a genuinely new run. A first proposal is not a
+modification of anything.
+
+
 AT THE GATE
 
 While a run waits for approval, anything they type reaches you rather than the
@@ -722,6 +770,11 @@ class GenpipeA1(A1):
     # -- _drive() clears it at the top of every turn, and the answer before any
     # turn has started is "no". See submission_gate.
     _submitted_this_turn = False
+
+    # Runs the model examined this turn, declared on the class so the gate can
+    # read it on a graph that has never been driven. See _drive, which clears
+    # it at the top of every turn.
+    _runs_examined = frozenset()
 
     # Whether the model may call the read-only capabilities. See
     # _capability_names() for what "off" means -- the router branch is never
@@ -1458,6 +1511,32 @@ something you can do, do it rather than telling them what to type.
         if handler is None:                      # pragma: no cover - table drift
             return f"{spec.name} is not wired up here."
         wanted = {k: v for k, v in (args or {}).items() if k in spec.args}
+        # WHICH EXISTING RUNS THE MODEL HAS LOOKED AT THIS TURN.
+        #
+        # Read at the gate to decide whether a proposal is a DERIVED run and so
+        # owes a declaration of what it changes. "rerun Test_walltimefail
+        # without override_walltime.ini" cannot be answered without looking that
+        # run up, so the lookup is the reliable, prose-free signal that this
+        # proposal is a rebuild of something rather than a fresh run.
+        #
+        # It records the model's OWN ACTION -- a capability call it chose to
+        # write -- and never anything the user typed. Cleared at the top of
+        # every turn by _drive, so it describes this turn only.
+        # Only a name the registry actually knows. `check_run(name="all")` is a
+        # documented call and names no run, so recording it would mark a turn
+        # as a rebuild on the strength of somebody asking how their runs were
+        # doing -- and the fresh run proposed afterwards would arrive at the
+        # gate carrying a warning about a rebuild that never happened.
+        asked = str(wanted.get("name") or "")
+        if asked and asked != "all":
+            try:
+                known = self.registry.get(asked) is not None
+            except Exception:                  # noqa: BLE001
+                known = False
+            if known:
+                examined = set(getattr(self, "_runs_examined", None) or ())
+                examined.add(asked)
+                self._runs_examined = examined
         try:
             result = handler(**wanted)
         except Exception as e:                   # noqa: BLE001
@@ -1847,6 +1926,11 @@ something you can do, do it rather than telling them what to type.
         self._submitted_this_turn = False
         self._gate_returns = 0
         self._capability_calls = 0
+        # Which existing runs this turn has looked at. See _run_capability: a
+        # proposal that follows a lookup is a rebuild of something, and owes a
+        # declaration of what it changed. Cleared per turn so a run inspected an
+        # hour ago does not make every later proposal look derived.
+        self._runs_examined = set()
         self.telemetry.start_turn()
         try:
             for _ in range(self.MAX_QUESTIONS_PER_TURN):
@@ -2157,6 +2241,80 @@ something you can do, do it rather than telling them what to type.
                 status = self._gate_status(config)
                 status["missing"] = incomplete
                 return status
+            # A CHANGE THAT WAS ASKED FOR AND DID NOT LAND.
+            #
+            # The run this exists for: "rerun it, without override_walltime.ini",
+            # a regenerated command that still carried the ini, and a submission
+            # that went through because nothing between the sentence and the
+            # scheduler had been given the means to notice. The gate now draws
+            # that row red -- see modify.realized -- and drawing it is not
+            # enough on its own, because the box may have been read quickly and
+            # the whole point is that the person believes the change was made.
+            #
+            # REFUSED ONCE, NOT FOREVER. Submitting the command as it stands is
+            # a legitimate thing to want: the model may have been right to
+            # decline the change, or the person may have changed their mind. So
+            # this states what did not happen and stops, and a second /approve
+            # goes through -- approval is still typed, and now typed by somebody
+            # who has been told the thing they would otherwise have missed. The
+            # acknowledgement is written to the record rather than held in
+            # memory, so closing the session does not silently clear it.
+            #
+            # Cleared by anything that produces a new proposal: _settle writes
+            # `changed` fresh on every pass through the gate, and the
+            # acknowledgement is stamped with the revision it was given for.
+            # `changed` is a MAPPING when _settle wrote it and a LIST of row
+            # names when cli._redraw did -- a change that cost no model call
+            # (re-tuning a step already on -c) redraws the gate without
+            # re-deriving verdicts. A list carries no verdicts, so there is
+            # nothing in it to refuse; .items() on one was an AttributeError
+            # raised before every other check in this function, including the
+            # script-exists one.
+            marks = (record or {}).get("changed")
+            ignored = ([row for row, verdict in marks.items()
+                        if verdict == modify.IGNORED]
+                       if isinstance(marks, dict) else [])
+            undeclared = (record or {}).get("undeclared")
+            # ACKNOWLEDGED PER GATE PASS, not per revision.
+            #
+            # This was keyed on the proposal's revision and had two holes, both
+            # of which disarmed the refusal in exactly the situation it exists
+            # for. A revision is None for a proposal with no generated command,
+            # and `None != None` is false, so the check never fired on one at
+            # all. Worse, a revision is a hash of the command -- and the failure
+            # being caught is "the model regenerated and the command did not
+            # change", which produces the SAME hash. So after one acknowledged
+            # refusal, asking for the change again and having it ignored again
+            # reused the revision, matched the acknowledgement, and submitted
+            # silently.
+            #
+            # A flag cleared by _settle on every pass through the gate has
+            # neither problem: it is set only by a refusal, and any new
+            # proposal -- identical command or not -- clears it, so each pass
+            # gets its own refusal and its own deliberate second /approve.
+            if (ignored or undeclared) and not (record or {}).get(
+                    "acknowledged_ignored"):
+                self.registry.update(name, acknowledged_ignored=True)
+                if ignored:
+                    headline = (f"Not approved -- {', '.join(sorted(ignored))} "
+                                f"{'was' if len(ignored) == 1 else 'were'} "
+                                f"asked for and the regenerated command does "
+                                f"not reflect "
+                                f"{'it' if len(ignored) == 1 else 'them'}.")
+                else:
+                    headline = f"Not approved -- {undeclared}."
+                display.problem(
+                    headline,
+                    f"/view {name} to read what it actually says, or "
+                    f"/modify {name} to change it. Nothing has reached the "
+                    f"scheduler. If you meant to submit it as it stands, "
+                    f"/approve {name} again.")
+                status = self._gate_status(config)
+                status["submitted"] = False
+                status["ignored"] = ignored
+                status["undeclared"] = undeclared
+                return status
+
             # THE SCRIPT THE BOX SAYS IT WILL RUN HAS TO BE THERE.
             #
             # `bash <script>` on a path that does not exist cannot do anything
@@ -2602,6 +2760,85 @@ something you can do, do it rather than telling them what to type.
             # checked. A change the model dropped came back green.
             requested = note.get("changed") or ()
             verdicts = modify.compare(previous, proposal, requested)
+            # AND THEN WHAT THE COMMAND ITSELF SAYS.
+            #
+            # compare() diffs two proposals, which is the right question only
+            # when there are two: a rerun or a fork lands under a new name and
+            # has no earlier proposal to differ from, so it can say nothing --
+            # and "nothing" is how a change somebody asked for in conversation
+            # used to reach this box with no mark on it at all.
+            #
+            # A declaration is checkable without a baseline, because it is a
+            # claim about the command that came back rather than about the
+            # distance between two. Two sources, both structured, neither
+            # parsed from anybody's prose:
+            #
+            #   note["declared"]        the /modify panel's own change set,
+            #                           restated by modify.declaration
+            #   proposal["declared"]    what the MODEL said it was changing,
+            #                           from the changing() call in its
+            #                           proposal block
+            #
+            # The panel's is applied second and wins where both speak, because
+            # a row somebody selected by hand outranks a model's account of a
+            # sentence about the same row.
+            #
+            # These OVERRIDE compare()'s answer for the rows they cover, and
+            # that direction is the point: realized() read the resulting
+            # command, compare() read a diff, and when they disagree the
+            # command is the thing that will run.
+            workdir = (self.registry.get(name) or {}).get("workdir")
+            declared = proposal.get("declared")
+            for source in (declared, note.get("declared")):
+                if source:
+                    verdicts.update(modify.realized(source, proposal, workdir))
+            # A DERIVED RUN THAT NEVER SAID WHAT IT WAS CHANGING.
+            #
+            # The declaration is what makes realisation checkable, so a
+            # modification that omits it is back in exactly the position this
+            # whole mechanism exists to leave: a regenerated command with
+            # nothing on screen to check it against. Enforced as SCHEMA
+            # COMPLETENESS -- the model chose an action and the action is
+            # incomplete -- and never by asking whether the user's sentence
+            # sounded like a modification.
+            #
+            # `changes=[]` satisfies it. A deliberate rerun of exactly the same
+            # command is a real thing to want, and saying so costs the model two
+            # characters and leaves nothing ambiguous.
+            #
+            # Which proposals are DERIVED is decided from state and from the
+            # model's own actions, never from prose:
+            #
+            #   previous is not None    this run name already had a proposal
+            #   requested               a /modify or /fork panel produced it
+            #   _runs_examined          the model looked an existing run up
+            #                           through a capability this turn, which is
+            #                           what "rerun Test_walltimefail" requires
+            #                           it to do before it can rebuild anything
+            # Recorded as a fact about the PROPOSAL rather than as a verdict on
+            # a row, because it is not about any one row -- there is no row it
+            # could be attached to without implying that row is the one at
+            # risk. It becomes a warning in the box and a refusal at /approve.
+            derived = bool(previous) or bool(requested) or bool(
+                getattr(self, "_runs_examined", None))
+            undeclared = ""
+            if declared is gate.MALFORMED:
+                undeclared = ("the change this run declares could not be read, "
+                              "so nothing checked whether it was applied")
+            elif derived and declared is None:
+                undeclared = ("this rebuilds an existing run and did not "
+                              "declare what it was changing, so nothing "
+                              "checked whether your change was applied")
+            if undeclared:
+                risks = list(risks) + [undeclared]
+                self.registry.update(name, warnings=risks)
+                status["warnings"] = risks
+            status["undeclared"] = undeclared
+            # Cleared here, where a fresh proposal is recorded, so an
+            # acknowledgement never outlives the box it was given for. See the
+            # refusal in resume().
+            self.registry.update(name, undeclared=undeclared,
+                                 acknowledged_ignored=False)
             self.registry.update(name, changed=verdicts,
                                  requested=dict(requested)
                                  if isinstance(requested, dict) else
@@ -2614,9 +2851,20 @@ something you can do, do it rather than telling them what to type.
             # produces. See cli._ask_ending for why it stopped being offered:
             # the batch case it was aimed at wants a flow of its own, not a
             # menu row whose only effect is skipping a repaint.
+            # What was asked for, for the line under a row that did not move.
+            # The declarations are the better source and are used where they
+            # exist: `requested` is a list of row NAMES on every path that
+            # writes it, so the isinstance test below has always been a
+            # fallback for a shape nothing produces, and a red row with no
+            # "you asked for ..." beneath it is the one this screen exists to
+            # make legible.
+            asked = dict(modify.wording(proposal.get("declared") or {}))
+            asked.update(modify.wording(note.get("declared") or {}))
+            if isinstance(requested, dict):
+                asked.update(requested)
             display.gate(proposal, name, blockers=blockers, warnings=risks,
                          changed=verdicts,
-                         wanted=requested if isinstance(requested, dict) else None,
+                         wanted=asked or None,
                          resources=self._resource_summary(name))
         return status
 

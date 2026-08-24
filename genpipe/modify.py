@@ -1130,6 +1130,17 @@ def compare(before, after, requested=()):
     `before` may be None -- a run reaching the gate for the first time has
     nothing to differ from, and every row is then simply unremarkable rather
     than drifted.
+
+    NO BASELINE MEANS NO VERDICT, INCLUDING FOR A REQUESTED ROW. This used to
+    report a requested row as IGNORED when `before` was None, on the reasoning
+    that a row which did not move was not applied -- but a row cannot be said
+    not to have moved when there is nothing to have moved FROM. The case that
+    makes it concrete is /fork, which opens a new thread under a new name so
+    the original survives: there is no previous proposal for that name, so
+    every change somebody had just picked in the panel came back red, marked
+    "not applied", on a command that had applied all of them. A claim about
+    realisation needs the resulting command, not a diff of two -- realized()
+    is the function for that, and the gate runs it alongside this one.
     """
     requested = set(requested or ())
     if not after:
@@ -1150,7 +1161,9 @@ def compare(before, after, requested=()):
     for row in ROWS:
         if row not in SLOT_OF:
             continue                       # name, resources: not in the command
-        moved = before is not None and value(old, row) != value(new, row)
+        if before is None:
+            continue                       # nothing to compare against
+        moved = value(old, row) != value(new, row)
         if row in requested:
             out[row] = APPLIED if moved else IGNORED
         elif moved:
@@ -1160,9 +1173,184 @@ def compare(before, after, requested=()):
     # comparison above cannot see it. Reported as applied, because the file was
     # written before the model was ever asked -- whether it reached the -c
     # stack is a separate question the mirror answers on its own line.
-    for row in requested - set(out):
+    #
+    # Restricted to rows with no slot, which was implicit until compare() stopped
+    # answering with no baseline: a row that HAS a slot and got no verdict above
+    # got one here instead, so a fork's flag rows came back green on exactly the
+    # evidence that had just been ruled insufficient to call them red. Silence
+    # is the honest answer for those, and realized() is what breaks it.
+    for row in requested - set(out) - set(SLOT_OF):
         out[row] = APPLIED
     return out
+
+
+# ---------------------------------------------------------------------------
+# VERIFYING A DELTA THE MODEL DECLARED.
+#
+# compare() answers "did this row move between two proposals", which is the
+# right question for a /modify that rewrites a run in place and the wrong one
+# for everything else. A rerun gets a fresh name, so there is no previous
+# proposal to diff against, `moved` is False for every row, and a declared
+# change would be reported as ignored whether or not it was honoured.
+#
+# So this asks a different question, and it is the question the gate actually
+# wants answered: does the RESULTING COMMAND have the property the model said
+# it was giving it? That is a fact about one command. It needs no baseline, it
+# works identically for a rerun, a fork and an in-place rewrite, and it cannot
+# be fooled by a name change.
+#
+# WHAT IT IS NOT. It never reads the user's sentence, and there is no path by
+# which it could: its input is gate.declared_changes(), which parses the model's
+# own <execute> block, and the proposal's parsed slots. Deciding that somebody
+# wants an ini removed, which ini they meant, and where a new one belongs is the
+# model's work and stays there. This checks realisation, not intent -- set
+# membership over canonical paths and string equality over flag values, and
+# nothing that resembles understanding.
+# ---------------------------------------------------------------------------
+
+def realized(declared, proposal, workdir=None):
+    """{row: APPLIED | IGNORED} for a delta the model declared.
+
+    `declared` is gate.declared_changes()' list of
+    {"field", "operation", "value"} entries -- already schema-checked there, so
+    nothing here has to cope with an unknown field or verb.
+
+    A field this cannot check is left out of the answer entirely rather than
+    guessed at: an absent verdict means "no opinion", and the gate draws such a
+    row unremarkably, which is what it did before any of this existed.
+
+    ONE FIELD MAY CARRY SEVERAL ENTRIES and they are ANDed. "remove cit.ini" and
+    "add dnaseq.exome.ini" are two claims about `-c` and the row is applied only
+    if the command honours both; one honoured and one dropped is not a change
+    that landed. IGNORED wins, and it wins on the first entry that fails.
+    """
+    out = {}
+    values = (proposal or {}).get("slots") or {}
+    stack = list(values.get("inis") or ())
+    # A declaration that could not be read is gate.MALFORMED -- a string, and a
+    # truthy one. Refused here rather than left to every caller to remember,
+    # because iterating it yields characters and the failure would be an
+    # AttributeError raised from inside the gate. Nothing was verified, so the
+    # answer is no verdicts; the caller reports the malformation separately.
+    if not isinstance(declared, (list, tuple)):
+        return out
+    for entry in declared:
+        if not isinstance(entry, dict):
+            continue
+        field = entry.get("field")
+        operation = entry.get("operation")
+        value = entry.get("value")
+        # The same closed table gate.declared_changes validates against. It
+        # cannot produce an entry this rejects -- it refuses the whole
+        # declaration instead -- so this is the floor under a caller that built
+        # one by hand, and its job is to answer nothing rather than to answer
+        # APPLIED about a claim it did not understand.
+        if operation not in gate.DECLARABLE.get(field, ()):
+            continue
+        if field == CONFIG:
+            if operation == "reorder":
+                # The whole sequence, position by position. Each declared entry
+                # must resolve to exactly one place on the resulting stack and
+                # to the place the declaration puts it -- an ambiguous entry
+                # fails, because a stack that cannot be read positionally
+                # cannot be said to be in the requested order.
+                got = APPLIED
+                if len(value) != len(stack):
+                    got = IGNORED
+                else:
+                    for at, ref in enumerate(value):
+                        found = locate(ref, stack, workdir)
+                        if found != (at,):
+                            got = IGNORED
+                            break
+                verdict = got
+            else:
+                present = on_stack(value, stack, workdir)
+                # Presence fails CLOSED on ambiguity: on_stack counts two
+                # possible matches as present, so a removal that left something
+                # matching behind is reported as not applied.
+                verdict = (APPLIED if present == (operation == "add")
+                           else IGNORED)
+        else:
+            now = " ".join(current(proposal, field).split())
+            verdict = (APPLIED if now == " ".join(str(value).split())
+                       else IGNORED)
+        if out.get(field) != IGNORED:
+            out[field] = verdict
+    return out
+
+
+def declaration(proposal, changes, workdir=None):
+    """A panel change set, restated in the schema realized() checks.
+
+    THE PANEL IS A DECLARATION TOO, and a better-founded one than the model's:
+    the model says what it understood a sentence to mean, while this says what
+    somebody selected row by row. Both end up checked the same way and by the
+    same function, because the question at the gate is identical either way --
+    does the command that came back have the property that was asked for?
+
+    Only fields gate.DECLARABLE covers. `name` changes no flag, and `resources`
+    changes a FILE whose arrival on the -c line the mirror already reports on
+    its own line; neither is checkable against a command, and declaring them
+    would put a verdict on the screen that nothing had verified.
+
+    This is NOT deterministic code inferring an intent. Nobody's prose is read
+    here: the input is a change set somebody built by pressing keys on named
+    rows, and this only rewrites it into the shape the verifier takes.
+    """
+    out = []
+    for row, new in (changes or {}).items():
+        if row not in gate.DECLARABLE:
+            continue
+        if row == CONFIG and isinstance(new, (list, tuple)):
+            added, dropped = config_delta(proposal, {CONFIG: new}, workdir)
+            for ini in dropped:
+                out.append({"field": CONFIG, "operation": "remove",
+                            "value": str(ini)})
+            for ini in added:
+                out.append({"field": CONFIG, "operation": "add",
+                            "value": str(ini)})
+            if reordered(proposal, {CONFIG: new}, workdir):
+                # The order was chosen element by element, so the order is the
+                # claim. Emitted alongside any add/remove rather than instead
+                # of them: the sequence covers membership too, but saying both
+                # keeps the "you asked for" line able to name what left.
+                out.append({"field": CONFIG, "operation": "reorder",
+                            "value": [str(x) for x in new]})
+            continue
+        if new not in (None, "", [], ()):
+            out.append({"field": row, "operation": "set", "value": str(new)})
+    return out
+
+
+def wording(declared):
+    """A declared change said in English, as {row: phrase}, for the line under
+    a red row.
+
+    The gate prints "not applied" beside a row whose declared change did not
+    land; without this it can only add "the regenerated command still has the
+    old value", which is true and does not say WHAT was wanted -- and the person
+    is reading that line precisely because they cannot hold both the old and the
+    new in their head.
+    """
+    said = {}
+    if not isinstance(declared, (list, tuple)):
+        return said        # see realized(): MALFORMED is a string, and truthy
+    for entry in declared:
+        if not isinstance(entry, dict):
+            continue
+        field, operation = entry.get("field"), entry.get("operation")
+        value = entry.get("value")
+        if operation == "remove":
+            phrase = f"{value} off the -c stack"
+        elif operation == "add":
+            phrase = f"{value} on the -c stack"
+        elif operation == "reorder":
+            phrase = "this order — " + " , ".join(str(v) for v in value)
+        else:
+            phrase = str(value)
+        said[field] = f"{said[field]}, and {phrase}" if field in said else phrase
+    return said
 
 
 def required_after(proposal, changes):

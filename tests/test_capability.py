@@ -280,6 +280,63 @@ def main():
     r.equal("and nothing at all when they are off",
             bare._capability_prompt(), "")
 
+    # ------------------------------------------------------------------ #
+    r.section("a lookup marks the proposal that follows it as a rebuild")
+    # WHY THIS IS RECORDED AT ALL. "rerun Test_walltimefail without
+    # override_walltime.ini" cannot be answered without looking that run up, so
+    # the lookup is a reliable, prose-free signal that the proposal which
+    # follows rebuilds something rather than being a fresh run -- and a rebuild
+    # owes a declaration of what it changed (see agent._settle).
+    #
+    # It is the MODEL'S OWN ACTION, a capability call it chose to write. Nothing
+    # here reads what the user typed, which is the whole reason it is usable as
+    # a trigger.
+    from genpipe import capabilities as _cap
+    watcher = object.__new__(agent_module.GenpipeA1)
+    watcher.capabilities_enabled = True
+    watcher._runs_examined = set()
+
+    # A registry that knows exactly one run. Only a name it knows counts as a
+    # lookup of an existing run -- see below for why "all" and an invented name
+    # must not, and note that the HANDLER still fails here (this stub has none
+    # of the rest of a registry). That is deliberate: _run_capability turns a
+    # failure into a note for the model, and the run was still asked about,
+    # which is the fact being recorded.
+    class _OneRun:
+        def get(self, name):
+            return {"name": name} if name == "poulet-0813" else None
+    # `_registry`, not `registry`: the latter is a property (a data descriptor),
+    # so an instance attribute of that name would never be consulted.
+    watcher._registry = _OneRun()
+
+    watcher._run_capability(_cap.get("show_run"), {"name": "poulet-0813"})
+    r.check("the run the model asked about is remembered",
+            "poulet-0813" in (watcher._runs_examined or ()),
+            watcher._runs_examined)
+
+    watcher._runs_examined = set()
+    watcher._run_capability(_cap.get("list_runs"), {})
+    r.equal("a lookup that names no run marks nothing",
+            set(watcher._runs_examined or ()), set())
+
+    # "all" IS A DOCUMENTED ARGUMENT to check_run and names no run. Recording it
+    # marked the turn as a rebuild on the strength of somebody asking how their
+    # runs were doing -- so "how is everything? then start a fresh dnaseq run"
+    # put an undeclared-change warning on a first-ever proposal and refused its
+    # first /approve, about a rebuild that never happened.
+    r.contains("the capability really does document it",
+               _cap.get("check_run").summary, '"all"')
+    watcher._runs_examined = set()
+    watcher._run_capability(_cap.get("check_run"), {"name": "all"})
+    r.equal("so 'all' marks nothing", set(watcher._runs_examined or ()), set())
+
+    # And a name no registry knows is not a run either -- a model that invented
+    # one, or asked about a run that has been dropped.
+    watcher._runs_examined = set()
+    watcher._run_capability(_cap.get("check_run"), {"name": "no-such-run"})
+    r.equal("nor does a name nothing knows",
+            set(watcher._runs_examined or ()), set())
+
     return r.finish()
 
 

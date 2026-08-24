@@ -447,6 +447,198 @@ def capability_request(code, names=()):
     return None
 
 
+# ---------------------------------------------------------------------------
+# THE CHANGE A PROPOSAL DECLARES.
+#
+# THE PROBLEM. A person says "rerun that, but without override_walltime.ini".
+# The model reads it, regenerates, and the new command still carries the ini --
+# and nothing anywhere noticed. modify.compare() can report a requested row as
+# IGNORED, but only when something told it the row was requested, and the only
+# thing that ever did was cli.py's /modify panel writing agent._gate_note. A
+# change asked for in conversation reached the gate with an empty request set,
+# so IGNORED was unreachable, the box carried no mark, and the person approved
+# the command they had asked to have changed.
+#
+# THE BOUNDARY. The model decides what the request means -- that is its work and
+# nothing here touches it. What it now also does is SAY what it decided, as
+# structured data, in the call that creates the proposal:
+#
+#     propose_submission("$OUT/cmd.sh", changes=[
+#         {"field": "config", "operation": "remove",
+#          "value": "override_walltime.ini"}])
+#
+# and deterministic code checks the command it generated against that
+# declaration (modify.realized). The model produces the intended delta; the
+# application verifies its realisation. Neither half does the other's job, and
+# nothing between them reads the user's sentence.
+#
+# WHY AN ARGUMENT AND NOT A CALL OF ITS OWN. A separate `changing(...)` line in
+# the same block was the first shape of this and it is a second representation
+# of one thing: it can be omitted while the proposal is emitted, duplicated,
+# left behind from an abandoned attempt, or attached to the wrong
+# propose_submission in a block with two. As an argument it is structurally
+# bound -- one call, one proposal, one delta, emitted together or not at all --
+# and it cannot survive into a later turn describing a command that has since
+# been regenerated. _PROPOSE_CALL captures the script path and stops, so adding
+# it changed nothing about how a submission is recognised.
+#
+# FIELD, OPERATION AND VALUE STAY SEPARATE. An earlier draft encoded the verb
+# into the string -- "-override_walltime.ini" for a removal -- which makes the
+# schema unvalidatable (every string is well-formed), gives a leading dash in a
+# filename a second meaning, and leaves the renderer to un-parse a sigil before
+# it can say "override_walltime.ini was to come off the stack". Three fields
+# are checkable, and a malformed entry can be REFUSED rather than misread.
+#
+# Parsed, never evaluated, from the MODEL'S OWN CODE BLOCK -- same rule as
+# capability_request(). ast.literal_eval accepts literals and nothing else, so
+# there is no expression here that could run.
+# ---------------------------------------------------------------------------
+
+# What may be declared about each field. A closed table, because an operation
+# this cannot check is one the gate would report a verdict on without having
+# verified anything.
+#
+#   set       the flag should now have this value. Every scalar row.
+#   add       this ini should be ON the resulting -c stack
+#   remove    this ini should be OFF it
+#   reorder   the -c stack should be exactly this sequence. `value` is a list.
+#
+# `name` and `resources` take no operation: one changes no flag, and the other
+# changes a FILE whose arrival on -c the mirror already reports on its own line.
+# Neither is checkable against a command, and a verdict nothing verified is
+# worse than no verdict.
+DECLARABLE = {
+    "pipeline": ("set",),
+    "protocol": ("set",),
+    "steps": ("set",),
+    "design": ("set",),
+    "pairs": ("set",),
+    "readset": ("set",),
+    "output": ("set",),
+    "config": ("add", "remove", "reorder"),
+}
+
+# Returned in place of the list when the declaration was present but unusable.
+# Distinct from None (nothing was declared) and from [] (nothing was changed),
+# because the three call for three different things to be said to a person.
+MALFORMED = "malformed"
+
+
+def _propose_keyword(code, keyword):
+    """The value of one keyword argument to propose_submission(), as a Python
+    literal, or None if the call does not carry it.
+
+    Two readings, because the block is not reliably parseable Python. A
+    submission block usually is -- it is one call -- but the model writes shell
+    beside it often enough that ast.parse fails, and a declaration must not be
+    lost to a stray `module load` on the line above. So: parse the block if it
+    parses, and otherwise cut the argument out textually by matching brackets.
+    Both end at literal_eval, which is the only thing that reads the value.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(code))
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", "") == "propose_submission"):
+                for kw in node.keywords:
+                    if kw.arg == keyword:
+                        try:
+                            return ast.literal_eval(kw.value)
+                        except (ValueError, SyntaxError):
+                            return MALFORMED
+        return None
+
+    at = code.find("propose_submission")
+    if at < 0:
+        return None
+    m = re.search(rf"\b{re.escape(keyword)}\s*=\s*", code[at:])
+    if not m:
+        return None
+    start = at + m.end()
+    if start >= len(code) or code[start] not in "[({":
+        return MALFORMED
+    opens = {"[": "]", "(": ")", "{": "}"}
+    depth, quote, end = 0, "", None
+    for i in range(start, len(code)):
+        ch = code[i]
+        if quote:
+            if ch == quote and code[i - 1] != "\\":
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch in opens:
+            depth += 1
+        elif ch in opens.values():
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        return MALFORMED
+    try:
+        return ast.literal_eval(code[start:end])
+    except (ValueError, SyntaxError):
+        return MALFORMED
+
+
+def declared_changes(code):
+    """The delta the model declared on its propose_submission call.
+
+    Three distinct answers, and the distinction is the whole point:
+
+        None        no `changes` argument at all. The action is INCOMPLETE --
+                    see agent's derived-run check, which refuses to let a
+                    modification through on a proposal that did not say what it
+                    was modifying. It is not the same as "nothing changed".
+        []          declared, and deliberately empty: a rerun of exactly the
+                    same command. There is nothing to verify and that is an
+                    answer, not a silence.
+        [entry, …]  each entry normalised to {"field", "operation", "value"}.
+        MALFORMED   a `changes` argument that could not be read as that.
+
+    Entries that are individually unusable make the whole declaration MALFORMED
+    rather than being dropped. Dropping one would leave a shorter list that
+    looks complete, and the row it described would be reported as unremarkable
+    on the screen somebody is reading to find out whether their change landed.
+    """
+    if not code:
+        return None
+    runnable = executable_lines(code)
+    if not runnable or "propose_submission" not in runnable:
+        return None
+    raw = _propose_keyword(runnable, "changes")
+    if raw is None:
+        return None
+    if raw is MALFORMED or not isinstance(raw, (list, tuple)):
+        return MALFORMED
+
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return MALFORMED
+        field = str(entry.get("field") or "").strip()
+        operation = str(entry.get("operation") or "").strip().lower()
+        value = entry.get("value")
+        if operation not in DECLARABLE.get(field, ()):
+            return MALFORMED
+        if operation == "reorder":
+            if isinstance(value, str):
+                value = value.split()
+            if not isinstance(value, (list, tuple)) or not value:
+                return MALFORMED
+            value = [str(v) for v in value]
+        else:
+            if not isinstance(value, (str, int, float)) or not str(value).strip():
+                return MALFORMED
+            value = str(value).strip()
+        out.append({"field": field, "operation": operation, "value": value})
+    return out
+
+
 def needs_bash_marker(code):
     """Should this block be run as shell even though it is not marked as such?
 
@@ -961,6 +1153,27 @@ def build_proposal(messages, code):
                   "inis": inis, "design": design, "pairs": pairs,
                   "readset": readset, "output_dir": output_dir},
     }
+    # WHAT THE MODEL SAYS IT CHANGED, kept beside what it actually wrote.
+    #
+    # Read off the submission block rather than the generation, because that is
+    # the block the model writes when it is handing something over to be
+    # approved -- a generation may be one of several attempts, and a claim
+    # attached to an abandoned attempt would be checked against a command it
+    # was never about.
+    #
+    # A CLAIM, NOT A FACT, and stored under a name that says so. Nothing
+    # downstream may treat this as describing the command: modify.realized()
+    # exists precisely to find out whether it does, and the gate reports the
+    # answer rather than the claim. Absent for every turn that declares
+    # nothing, which is most of them.
+    #
+    # Deliberately NOT part of revision(). What executes is the generation, the
+    # command and the script; a declaration about them changes none of the
+    # three, and letting it move the revision would invalidate an outstanding
+    # approval over a comment.
+    declared = declared_changes(code or "")
+    if declared is not None:
+        proposal["declared"] = declared
     # Stamped here, where the proposal is finished, and never recomputed
     # downstream. with_usage() adds flag metadata afterwards and deliberately
     # does not touch this: what argparse accepts is not part of what executes,

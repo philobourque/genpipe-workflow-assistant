@@ -78,6 +78,11 @@ jobs:
         # identity that merged two different files, and reordering.
         run: python tests/test_config_stack.py
 
+      - name: A declared change, and whether the command actually makes it
+        # The boundary: the model says what it decided, deterministic code
+        # checks the command against it. Nothing here reads anybody's prose.
+        run: python tests/test_declared.py
+
       - name: The meter in front of the model
         # Cache breakpoint, provider usage, and the one narrow repair for a
         # reply that is an execution payload with no tag around it.
@@ -222,6 +227,14 @@ jobs:
 
       - name: Re-gating after a rework
         run: python tests/test_regate.py
+
+      - name: A rerun is verified like a /modify
+        # The reported failure: "rerun it, without override_walltime.ini" came
+        # back with the ini still on -c and reached `submitted`. Drives the real
+        # graph, with the model's SEMANTIC decision stubbed -- what is checked
+        # is that the decision cannot silently disappear between the block the
+        # model wrote and the box somebody approves.
+        run: GENPIPE_FAKE=1 python tests/test_rerun_gate.py
 
       - name: Preparation carried across turns
         run: python tests/test_run_prep.py
