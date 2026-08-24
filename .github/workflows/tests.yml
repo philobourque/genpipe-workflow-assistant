@@ -83,6 +83,18 @@ jobs:
         # checks the command against it. Nothing here reads anybody's prose.
         run: python tests/test_declared.py
 
+      - name: Which files belong to the run being diagnosed
+        # A working directory accumulates runs, and the same step re-run a week
+        # later writes the same job name into the same folder. The suite for
+        # the defect where a July failure was diagnosed from August's logs.
+        run: python tests/test_evidence.py
+
+      - name: Where a run's config values came from
+        # Evidence, not a verdict: the -c stack from the run's own trace, what
+        # each ini says now, and the fact that those two can disagree without
+        # this layer saying why.
+        run: python tests/test_provenance.py
+
       - name: The meter in front of the model
         # Cache breakpoint, provider usage, and the one narrow repair for a
         # reply that is an execution payload with no tag around it.

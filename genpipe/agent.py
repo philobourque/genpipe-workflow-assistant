@@ -87,6 +87,7 @@ import uuid
 import json
 import datetime
 from . import diagnosis
+from . import provenance
 from . import display
 from . import capabilities as capability_table
 from . import gate
@@ -3850,11 +3851,66 @@ something you can do, do it rather than telling them what to type.
                 lines.append(f"    peak memory: {f['maxrss']}")
             if f["exit_code"]:
                 lines.append(f"    exit code: {f['exit_code']}")
+            # A cancelled job never started, so there is no log and no search
+            # for one -- see runs.triage. Said plainly, because "not found on
+            # disk" reads as a missing file and invites a hunt for it.
+            if not f.get("ran"):
+                lines.append("    no log: cancelled in the queue, never ran")
+                lines.append("")
+                continue
             lines.append(f"    log: {f['log'] or 'not found on disk'}")
+            if f.get("script"):
+                lines.append(f"    the script it was given: {f['script']}")
             if f["log_tail"]:
                 lines.append("    tail of that log:")
                 lines += [f"      {l}" for l in f["log_tail"].splitlines()]
             lines.append("")
+        # ARTIFACTS NAMED, NOT PASTED.
+        #
+        # genpipes.md calls the .sh decisive and requires cross-checking the
+        # config trace, and neither was reaching the model at all. Pasting both
+        # for every finding would answer that by putting tens of kilobytes into
+        # every prompt regardless of whether the question needs them. So the
+        # paths are established deterministically -- that is evidence identity,
+        # the same job resolve_log() does -- and whether opening one is worth a
+        # round trip stays a decision for whoever is reasoning about the cause.
+        # WHAT EACH FILE IS, mechanically. The type is stated because the last
+        # time these were offered as bare paths the .sh was searched with an
+        # ini-section pattern -- `^\[step\]` against a bash script -- which
+        # returned nothing and cost a round trip. Naming the format is a fact
+        # about the file; it prescribes nothing about what to look for in it.
+        available = [f"    {f['script']}\n      a generated Bash submission "
+                     f"script: the exact command line {f['step']} was run with, "
+                     f"every flag and input path"
+                     for f in report["findings"] if f.get("script")]
+        if report.get("trace"):
+            available.append(
+                f"    {report['trace']}\n      a resolved GenPipes "
+                f"configuration snapshot in ini format: every section after the "
+                f"-c stack was merged, as of when this run was generated")
+        if available:
+            lines += ["Also on disk for this run, not quoted above:"]
+            lines += available
+            lines += ["",
+                      "Read any of them with <execute> if your reasoning needs "
+                      "it. Several files can go in ONE <execute> block -- a "
+                      "batched read costs one round trip where separate ones "
+                      "cost several.",
+                      ""]
+        # WHERE THE CONFIG VALUES CAME FROM.
+        #
+        # Only for the step the scheduler says broke first, which is a fact
+        # runs._root_cause established from start times rather than a choice
+        # made here. Without this the model was told a stack parsed at gate
+        # time -- which for any run predating the flag_values fix is missing
+        # entries, and was missing the one that mattered -- and had no way to
+        # see what any of those files actually say. See genpipe/provenance.py
+        # for why this stops at presenting the three observations.
+        cause = status.root_cause if status is not None else None
+        if cause and cause.get("step"):
+            lines += provenance.lines(provenance.report(
+                record, cause["step"], trace_path=report.get("trace"),
+                workdir=record.get("workdir")))
         if question:
             lines += [f"The user specifically asks: {question}", ""]
         if slots.get("steps"):

@@ -76,7 +76,9 @@ MANNER: how it died, in one line, from sacct alone. The state and the numbers.
 CAUSE: why it died, in one short paragraph, from the logs. A different claim \
 from MANNER; do not restate it.
 EVIDENCE:
-- one observation per line, each naming the file it came from
+- one observation per line, each naming the file it came from. At most four, \
+and only the ones the CAUSE actually rests on -- this is the support for a \
+claim, not a restatement of everything you were shown.
 FIX: what to change, naming the config section and key.
 OVERRIDE:
 [section_name]
@@ -90,6 +92,11 @@ Include it ONLY when the fix really is a config change; leave it out otherwise.
 - Never propose a resource value you cannot compute from something observed \
 above. If the logs do not support a number, say so under FIX and omit OVERRIDE.
 - "The logs do not show why" is a correct CAUSE. Do not invent a plausible one.
+- A value that is merely LARGER than one that failed is not thereby a value \
+that will succeed. If the evidence shows a limit was too small but does not \
+show what would be enough, say both: what is now known to be insufficient, and \
+what this run does not establish. Do not describe any value as sufficient, \
+safe or adequate unless something you observed shows it is.
 """
 
 _HEADINGS = ("MANNER", "CAUSE", "EVIDENCE", "FIX", "OVERRIDE", "RELAUNCH",
@@ -106,6 +113,24 @@ _SECTION = re.compile(r"^\s*\[([A-Za-z_][A-Za-z0-9_.]*)\]\s*$")
 _SETTING = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
 
 _CONFIDENCE = ("certain", "likely", "unclear")
+
+# Words that mean the model is hedging. Read as `unclear`, never as `certain`.
+# `uncertain` is the one that mattered: it CONTAINS "certain", so a substring
+# scan -- which is what this used to be -- turned the most hedged answer the
+# contract allows into the most confident one it allows, rendered in white. That
+# inverts genpipes.md's own rule that uncertainty must survive to the surface.
+_HEDGES = frozenset(("uncertain", "unsure", "unknown", "inconclusive"))
+
+# A negation shortly before one of the three words. "not certain" is a hedge,
+# and reading the word without the "not" in front of it is the same failure as
+# reading "certain" out of "uncertain". The window is three words because the
+# negation is not always adjacent: "far from certain", "not at all certain".
+_NEGATIONS = frozenset(("not", "never", "no", "hardly", "isn", "aren", "wasn",
+                        "cannot", "can", "less", "far", "without"))
+_NEGATION_REACH = 3
+
+_WORD = re.compile(r"[a-z]+")
+
 
 # How many distinct headings make a response a DIAGNOSIS rather than prose that
 # happens to open with one of these words. Three, because two is reachable by
@@ -241,9 +266,46 @@ def parse(text):
     out["override"] = _ini(buckets.get("override"))
     out["relaunch"] = _join(buckets.get("relaunch"))[:80]
 
-    said = _join(buckets.get("confidence")).lower()
-    out["confidence"] = next((c for c in _CONFIDENCE if c in said), "")
+    out["confidence"] = confidence(_join(buckets.get("confidence")))
     return out
+
+
+def confidence(said):
+    """Which of certain / likely / unclear the model claimed, or "".
+
+    Whole words, in the order they were written, never substrings. Two rules,
+    and both only ever move the answer toward less confidence:
+
+        a hedge word          reads as `unclear`
+        a negated word        is not a claim of that word -- keep looking.
+                              Negation counts within the three words before it
+                              and does not cross a clause boundary, so "far
+                              from certain" is caught and "not certain, but
+                              likely" still reads as `likely`.
+
+    So `uncertain`, `not certain` and `far from certain` all come back
+    `unclear`, and nothing here can turn a qualified answer into a confident
+    one. An unrecognised word returns "", which renders as no label at all --
+    the contract asks for one of three and inventing a fourth is not parsing.
+    """
+    hedged = False
+    # Clause by clause, so a negation cannot reach across a comma: "not certain,
+    # but likely" is a claim of `likely`, and letting the "not" carry into the
+    # second clause would report it as `unclear` -- still safe, but less true
+    # than what the model actually said.
+    for clause in re.split(r"[,;.:]|--", (said or "").lower()):
+        words = _WORD.findall(clause)
+        for i, word in enumerate(words):
+            if word in _HEDGES:
+                hedged = True
+                continue
+            if word not in _CONFIDENCE:
+                continue
+            if _NEGATIONS & set(words[max(0, i - _NEGATION_REACH):i]):
+                hedged = True
+                continue
+            return word
+    return "unclear" if hedged else ""
 
 
 def _join(lines):
