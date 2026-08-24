@@ -93,6 +93,11 @@ from . import capabilities as capability_table
 from . import gate
 from . import modify
 from . import intake
+# Aliased, because langgraph exports a function called `interrupt` -- the
+# primitive the gate pauses with -- and this module is about ctrl-c. Two
+# genuinely different things with one obvious name; the import below would
+# otherwise shadow whichever came second, and it did.
+from . import interrupt as interrupting
 from . import override
 from . import preflight
 from . import runs as runs_store
@@ -650,27 +655,14 @@ def _call(node, state):
 
 
 def _quiet(node):
-    """Wrap a graph node so its stray printing never reaches the terminal.
+    """Wrap a graph node so its stray printing never reaches the terminal, and
+    so ctrl-c reaps biomni's worker instead of orphaning it.
 
-    Biomni's run_bash_script prints a full traceback.print_stack() and the raw
-    CompletedProcess object whenever a command exits non-zero (biomni/utils.py).
-    A non-zero exit is completely ordinary here -- `genpipes rnaseq` without -c
-    is how the agent discovers it needs one -- and everything worth seeing is
-    already in the string the node returns, which comes back as an <observation>
-    and gets drawn properly by display.render. The print is pure duplication.
-
-    It is also destructive: it arrives from inside biomni's worker thread, on
-    stderr, which the spinner does not proxy, so a forty-line stack lands in the
-    middle of the status line and tears the display apart. That is what this
-    fixes -- suppressed here rather than patched upstream because biomni is a
-    dependency, and because a node's return value is the only channel this
-    application reads.
+    The whole of it lives in genpipe/interrupt.py, which is stdlib-only and so
+    testable without installing biomni. This is the binding to a graph node --
+    the one thing that module cannot know about.
     """
-    def quietly(state):
-        sink = io.StringIO()
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            return _call(node, state)
-    return quietly
+    return interrupting.shielded(lambda state: _call(node, state))
 
 
 def _shell_not_python(node):
