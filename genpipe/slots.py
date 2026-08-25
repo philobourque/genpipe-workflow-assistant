@@ -17,6 +17,8 @@ document and the behaviour cannot drift apart silently.
 Standard library only. No filesystem access: callers that want to offer real
 files on disk pass them in.
 """
+import json
+import os
 
 DESIGN = "design"
 PAIRS = "pairs"
@@ -263,6 +265,73 @@ def from_data(data):
                 for o in data.get("options") or ()],
                free_text=bool(data.get("free_text", True)),
                note=data.get("note") or "")
+
+
+# ---------------------------------------------------------------------------
+# THE PROTOCOL'S OWN STEP LIST, read from the generated facts rather than from
+# the installed software at run time.
+#
+# `-s` has no argparse default and no choices, because "every step" is what
+# GenPipes does when you omit it -- so the range a rerun should carry
+# (1-23 for dnaseq somatic_fastpass) was a fact this application did not hold.
+# /diagnose established it by shelling out to
+# `module load genpipes && genpipes dnaseq --help` and reading the printed
+# list: 1.6 seconds, one model round trip, and a constant per GenPipes version
+# rediscovered on every single diagnosis.
+#
+# It comes from genpipes_facts.json, which tools/genpipes_facts.py generates
+# from a real install by reading each pipeline's own protocols(). Same source
+# --help prints from, one layer earlier and without a subprocess. That keeps
+# the version relationship honest: the number is whatever the install that
+# produced the manifest says, and test_requirements is what stops the two
+# drifting.
+#
+# Absent is a real answer. On a machine whose facts file predates this, or for
+# a protocol GenPipes has since renamed, step_range() returns None and the
+# caller says nothing rather than asserting a range it cannot support.
+_FACTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "genpipes_facts.json")
+_FACTS = None
+
+
+def _facts():
+    """The generated manifest, read once. {} when it cannot be read -- this is
+    reference data, and a missing or unparseable file must cost the fact, never
+    the command."""
+    global _FACTS
+    if _FACTS is None:
+        try:
+            with open(_FACTS_PATH) as f:
+                _FACTS = json.load(f)
+        except (OSError, ValueError):
+            _FACTS = {}
+    return _FACTS
+
+
+def step_names(pipeline, protocol=None):
+    """[step name, ...] in GenPipes' own order, or [] if not recorded.
+
+    The order IS the numbering: GenPipes numbers from 1 in this sequence, which
+    is what `--help` prints beside each name.
+    """
+    entry = (_facts().get("pipelines") or {}).get(str(pipeline or ""), {})
+    steps = entry.get("steps") or {}
+    if protocol and protocol in steps:
+        return list(steps[protocol])
+    # A pipeline with no -t has one protocol and GenPipes calls it "default".
+    if not protocol and len(steps) == 1:
+        return list(next(iter(steps.values())))
+    return list(steps.get("default") or [])
+
+
+def step_range(pipeline, protocol=None):
+    """"1-23" for a protocol whose step list is known, else None.
+
+    None means "not recorded here", and a caller must treat it as a fact it
+    does not have rather than as a range of zero.
+    """
+    names = step_names(pipeline, protocol)
+    return f"1-{len(names)}" if names else None
 
 
 def protocols(pipeline):

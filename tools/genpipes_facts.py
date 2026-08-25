@@ -111,7 +111,49 @@ def facts():
         out[name] = {"class": cls.__name__,
                      "parser_required": sorted(required),
                      "protocol": protocol,
-                     "optional_defaults": optional}
+                     "optional_defaults": optional,
+                     "steps": _steps(cls)}
+    return out
+
+
+def _steps(cls):
+    """{protocol: [step name, ...]} for one pipeline, in GenPipes' own order.
+
+    WHY THIS IS WORTH GENERATING. A step range is the one thing /diagnose has
+    to state that argparse cannot answer: `-s` has no default and no choices,
+    because "every step" is what GenPipes does when you omit it. So the range
+    to resubmit -- 1-23 for dnaseq somatic_fastpass -- lived nowhere in this
+    application, and the agent established it by shelling out to
+    `module load genpipes && genpipes dnaseq --help` and reading the printed
+    list. That is 1.6 seconds, a model round trip, and a fact that is CONSTANT
+    for a GenPipes version being rediscovered on every diagnosis.
+
+    NOT PARSED FROM --help. `protocols()` is where --help gets the list from,
+    so reading it directly is the same fact one layer earlier, without a
+    subprocess and without depending on the shape of printed output.
+
+    Called on an UNINITIALISED instance. `protocols()` is an instance method
+    whose body is nothing but `self.<method>` attribute lookups -- it builds a
+    dict of bound methods and touches no instance state -- so
+    `object.__new__(cls)` is enough to read it. Pipeline.__init__ wants a
+    parsed argv, a config stack and a readset file, none of which exist here
+    and none of which the step list depends on. Verified against every
+    pipeline on the 6.1.1 install.
+
+    Order is the whole value and it is positional: GenPipes numbers steps from
+    1 in the order this list returns them, which is exactly what --help prints.
+    """
+    inst = object.__new__(cls)
+    try:
+        protocols = cls.protocols(inst)
+    except Exception:                                    # noqa: BLE001
+        # A pipeline whose protocols() needs more than an attribute lookup is
+        # a fact we do not have, and an empty answer says so. Better than a
+        # partial list, which would make a WRONG range look established.
+        return {}
+    out = {}
+    for name, steps in (protocols or {}).items():
+        out[str(name)] = [getattr(s, "__name__", str(s)) for s in steps]
     return out
 
 
