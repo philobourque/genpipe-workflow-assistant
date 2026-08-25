@@ -1010,6 +1010,7 @@ class GenpipeA1(A1):
                     f"are stuck on.</observation>")))
                 state["next_step"] = "generate"
                 return state
+            args, more = capability_table.continues(request.get("args"))
             spec, complaint = capability_table.validate(name, request.get("args"))
             if complaint:
                 # Refused before any handler sees it, and the refusal goes back
@@ -1019,10 +1020,37 @@ class GenpipeA1(A1):
                 # behaves for a malformed question.
                 note = complaint
             else:
-                note = self._run_capability(spec, request.get("args") or {})
+                note = self._run_capability(spec, args)
             state["messages"].append(HumanMessage(
                 content=f"<observation>{note}</observation>"))
-            state["next_step"] = "generate"
+            # WHERE THE TURN ENDS, and this is the whole of the fix for it.
+            #
+            # This node used to set "generate" unconditionally, and the edge
+            # out of it was unconditional too, so EVERY capability -- including
+            # the ones that had just drawn the complete answer on screen --
+            # went back for another model call. The canonical panel was being
+            # treated as an intermediate tool observation. Two things that
+            # produced, both seen live:
+            #
+            #   list_runs drew twenty-one runs, and the model, handed an
+            #   observation that named no runs, said "No runs currently
+            #   recorded" underneath it.
+            #
+            #   a question about a failed run spent 36 model calls and 185
+            #   seconds AFTER the last panel was rendered, wandering through
+            #   inspect_jobs, show_run, where and run_history.
+            #
+            # A capability that renders has answered the person. It ends the
+            # turn unless the model said, in the call itself, that it is not
+            # finished -- see capabilities.continues. The observation is
+            # appended either way, so the conversation remembers what happened
+            # and a later turn can build on it; what does not happen is another
+            # generation in THIS one.
+            #
+            # A complaint is never terminal: nothing was rendered, so the model
+            # has to be given the chance to fix the call it wrote.
+            done = spec is not None and spec.renders and not more
+            state["next_step"] = "end" if done else "generate"
             return state
 
         # 6. The gate node. Pure before interrupt() (safe to re-run on resume).
@@ -1247,7 +1275,14 @@ class GenpipeA1(A1):
             path_map={"execute": "execute", "generate": "generate",
                       "end": END})
         workflow.add_edge("ask_user", "generate")
-        workflow.add_edge("capability", "generate")
+        # CONDITIONAL, where it used to be a plain edge to "generate". The node
+        # decides; this is what lets its decision be honoured. Anything other
+        # than the two it sets falls through to `generate`, for the same reason
+        # gate_routing does: an unrecognised value must never be a silent exit.
+        workflow.add_conditional_edges(
+            "capability",
+            lambda state: "end" if state.get("next_step") == "end" else "generate",
+            path_map={"generate": "generate", "end": END})
         workflow.add_edge("execute", "generate")
         workflow.add_edge(START, "generate")
 
@@ -1412,10 +1447,7 @@ check_run(name="ampliconseq-0813")
 
 {capability_table.catalogue()}
 
-The result comes back as an <observation> and you carry straight on in the same
-turn. The person also sees the real panel, the same one they would get from the
-matching command, so you do not need to reproduce it -- say what it means, not
-what it said.
+{capability_table.protocol()}
 
   - One call per block, and nothing else in the block.
   - These read state. None of them changes a run, a file or anything on the
@@ -1437,8 +1469,8 @@ meant, and look when looking is what would actually help.
 
 ONE LOOKUP USUALLY ANSWERS ONE QUESTION. Each of these already shows the person
 a full panel, so three of them is three screens to read for something they
-asked once. Chain a second only when the first genuinely left something open
-that the second can close.
+asked once. Ask for another only when the first genuinely leaves something open
+that the second can close -- and when it does, that is what `more=True` is for.
 
 WHAT TO AVOID IS REPEATING AN IDENTICAL LOOKUP -- the same call, with the same
 arguments, whose answer you already have. That shows them a panel they have
@@ -1446,9 +1478,8 @@ just read and tells you what you already know.
 
 Calling the same one again with DIFFERENT arguments is an ordinary thing to do
 and is often exactly right: "compare run-a and run-b" is two check_run calls,
-one per run, and "the failed jobs in both" is two inspect_jobs calls. So is
-going back to something once new information makes a second look worthwhile.
-The test is whether the next call can tell you something the last one did not.
+one per run, and "the failed jobs in both" is two inspect_jobs calls. The test
+is whether the next call can tell you something the last one did not.
 
 THE SLASH COMMANDS STILL EXIST and are not going anywhere: /check, /jobs,
 /diagnose, /monitor, /list, /view, /history. They are the same operations by
@@ -1564,11 +1595,12 @@ something you can do, do it rather than telling them what to type.
             # Every handler that can refuse has already said why on screen --
             # _need_run does it in four different wordings. Saying so plainly
             # keeps the model from narrating a result it did not get.
-            return (f"{spec.name} found nothing to report for "
-                    f"{subject or 'that'}; the reason was shown to the user. "
-                    f"Do not call it again; say what happened.")
+            return (f"{spec.name} could not answer for {subject or 'that'}; "
+                    f"the reason was shown to the user.")
 
         done = "This lookup is finished and its output is already on screen."
+        if spec.name == "diagnose_run" and isinstance(result, dict):
+            return self._diagnosis_note(result, subject, done)
         if hasattr(result, "counts") and result.counts is not None:
             counts = ", ".join(f"{n} {s.lower()}"
                                for s, n in sorted(result.counts.items())) or "no jobs"
@@ -1579,22 +1611,108 @@ something you can do, do it rather than telling them what to type.
                 facts += (f" Earliest independent failure: {cause['step']}"
                           + (f", {cause['count']} job(s) {str(cause.get('state') or '').lower()}"
                              if cause.get("count") else "") + ".")
-            if spec.name == "diagnose_run":
-                # The reasoning has ALREADY been produced and rendered by
-                # diagnose() on its own thread. What this turn owes the person
-                # is a sentence about it, not a second investigation.
-                return (f"{facts} The logs were read and the explanation has "
-                        f"been shown to the user. {done} You have this run's "
-                        f"diagnosis — comment on it rather than asking for it "
-                        f"again. (A different run is a different question.)")
             return f"{facts} {done}"
         if spec.name == "inspect_jobs" and isinstance(result, list):
             shown = "failed " if args.get("failed") else ""
             return (f"{subject}: {len(result)} {shown}job(s) listed for the "
                     f"user, grouped by step. {done}")
+        if spec.name in ("list_runs", "run_history") and isinstance(result, list):
+            # THE COUNT, because "was shown to the user" is content-free and a
+            # model handed nothing will fill the space itself. It filled it,
+            # live, with "No runs currently recorded" printed under a panel
+            # holding twenty-one of them. What goes back now is what the panel
+            # says, tallied from the same rows it was drawn from.
+            if not result:
+                return f"{spec.name}: there are no runs to show. {done}"
+            tally = {}
+            for row in result:
+                # list_runs yields (record, status) pairs and gets the same
+                # word the panel printed; run_history yields bare records and
+                # has no scheduler status to offer, so it reports the recorded
+                # one. Neither is invented and neither is re-derived.
+                if isinstance(row, tuple):
+                    word = runs_store.list_tag(row[0], row[1])
+                else:
+                    word = str((row or {}).get("status") or "unknown")
+                tally[word] = tally.get(word, 0) + 1
+            breakdown = ", ".join(f"{n} {w}" for w, n in sorted(tally.items()))
+            return (f"{spec.name}: {len(result)} run(s) shown to the user "
+                    f"({breakdown}). {done}")
         if spec.name in ("list_runs", "run_history", "where"):
             return f"{spec.name} was shown to the user. {done}"
         return f"{spec.name} completed for {subject or 'this session'}. {done}"
+
+    def _diagnosis_note(self, result, subject, done):
+        """What a diagnosis established, for the conversational model. Not a panel.
+
+        WHY IT IS ITS OWN BRANCH. diagnose() returns a DICT -- the gate status,
+        with the parsed answer and this run's scheduler facts on it -- and the
+        note builder tested `hasattr(result, "counts")`, which a dict does not
+        have. So the branch written for diagnose_run was unreachable and the
+        most expensive lookup in the product reported itself as "diagnose_run
+        completed for <name>". A model handed that and asked to carry on has
+        nothing to carry on FROM, which is how one ended up speculating about a
+        run underneath its own freshly rendered diagnosis.
+
+        EVERYTHING HERE IS ALREADY IN HAND. The tally and the root cause were
+        resolved before the model was called; the cause, the override and the
+        caveats were parsed out of the answer it gave. Nothing is re-read, re-
+        queried or re-derived -- this function has no scheduler, no log and no
+        model in it, and could not acquire one.
+
+        ONE RUN, NAMED. Every value comes out of `result["evidence"]`, which
+        diagnose() built under the name it was given, or out of the parse of
+        that run's own answer. There is no path by which another run's numbers
+        could arrive here, because no other run is in scope.
+
+        AND IT IS NOT A SECOND RENDERER. The screen has the full finding; this
+        is a handful of sentences so a following turn can compare two runs, or
+        answer a question about the one just diagnosed, without going and
+        looking again. Long values are cut rather than wrapped -- nobody reads
+        this, it is read.
+        """
+        evidence = result.get("evidence") or {}
+        parsed = result.get("diagnosis") or {}
+        name = evidence.get("name") or subject or "that run"
+
+        out = [f"{name}:"]
+        verdict = str(evidence.get("verdict") or "").strip()
+        counts = evidence.get("counts") or {}
+        if verdict:
+            out.append(f"{verdict}.")
+        if counts:
+            tally = ", ".join(f"{n} {state.lower()}"
+                              for state, n in sorted(counts.items()))
+            out.append(f"{tally}, of {evidence.get('total')} submitted.")
+        cause = evidence.get("root_cause") or {}
+        if cause.get("step"):
+            where = f"Earliest independent failure: {cause['step']}"
+            if cause.get("count"):
+                where += (f", {cause['count']} job(s) "
+                          f"{str(cause.get('state') or '').lower()}")
+            out.append(where + ".")
+
+        # The model's own conclusion, as diagnosis.parse structured it. Absent
+        # for an answer that came back unshaped, which is a real outcome and
+        # says so by omission rather than by an empty heading.
+        if parsed.get("cause"):
+            out.append(f"Diagnosed: {_one_line(parsed['cause'], 220)}.")
+        if parsed.get("override"):
+            fix = "; ".join(
+                f"[{step}] " + ", ".join(f"{k} = {v}" for k, v in
+                                         sorted(settings.items()))
+                for step, settings in sorted(parsed["override"].items()))
+            out.append(f"Proposed override for {name}: {_one_line(fix, 200)}.")
+        # THE CAVEATS TRAVEL WITH THE FIX, here as everywhere else. A value
+        # nothing proved sufficient must not reach a later turn as a bare
+        # recommendation -- see registry.remember_remediation for the same rule
+        # on the durable side.
+        uncertain = list(parsed.get("uncertain") or ())
+        if uncertain:
+            more = f" (+{len(uncertain) - 1} more)" if len(uncertain) > 1 else ""
+            out.append(f"Not established: {_one_line(uncertain[0], 160)}{more}.")
+        out.append(done)
+        return " ".join(out)
 
     def _show_run(self, name):
         """/view's body, as a capability. Reconciles first, like the command."""
@@ -1796,7 +1914,13 @@ something you can do, do it rather than telling them what to type.
         if not records:
             display.nothing("No runs recorded yet.",
                             "Describe a pipeline in plain English to start one.")
-            return
+            # An EMPTY LIST, not None. This used to return None here and, worse,
+            # from the bottom of the function as well -- so a screen showing
+            # twenty-one runs came back to the model indistinguishable from
+            # this one, and _capability_note's `result is None` branch told it
+            # "list_runs found nothing to report". The model said so underneath
+            # the twenty-one runs. Emptiness is a fact and it has a value.
+            return []
         rows = runs_store.resolve_all(records)
         for record, status in rows:
             if (status is not None and status.total
@@ -1805,6 +1929,7 @@ something you can do, do it rather than telling them what to type.
                                              status.total, status.verdict)
                 self.registry.remember_reasons(record["name"], status.reasons)
         display.run_list(rows)
+        return rows
 
     def history(self, name=None):
         """The archive of run records, newest first, or one record in full.
@@ -1821,17 +1946,21 @@ something you can do, do it rather than telling them what to type.
         """
         records = self.registry.all()
         if not records:
+            # [] rather than None, for the reason submissions() gives: a
+            # capability that rendered an empty archive and one that could not
+            # answer at all must not come back looking the same.
             display.nothing("No runs recorded yet.")
-            return
+            return []
         if name:
             record = self.registry.get(name)
             if record is None:
                 display.problem(f"No run named '{name}'.",
                                 "/history on its own lists every record.")
-                return
+                return None
             display.history_detail(record)
-            return
+            return [record]
         display.history(records)
+        return records
 
     def pending(self):
         """Runs paused at the gate. Surfaced at startup, so a decision left

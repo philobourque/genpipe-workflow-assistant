@@ -61,6 +61,13 @@ SCHEDULER = "scheduler"
 ENABLED = (READS,)
 
 
+# The argument that is not an argument. Any call may carry `more=True`, which
+# is the model saying "hand the result back to me, I am not finished". It is
+# not passed to a handler and no entry declares it -- it describes the TURN,
+# not the action. See CONTINUES below and agent's capability node.
+CONTINUE = "more"
+
+
 class Capability:
     """One callable action: its name, its arguments, and what it may touch.
 
@@ -70,16 +77,32 @@ class Capability:
     "call this when the user asks about jobs". The second phrasing would be an
     intent rule wearing a docstring, and the model is better at deciding when
     than any sentence here could be.
+
+    `renders` IS THE ONE THAT DECIDES WHERE THE TURN ENDS, and it is a fact
+    about the action rather than a preference about behaviour: this action
+    prints the complete user-facing answer itself -- the same panel the
+    matching slash command draws, with its own Actions block -- so when it
+    returns, the person has been answered.
+
+    Every entry in the table below is one of those today. The field exists
+    because the next one might not be: a lookup that returns a fact with no
+    screen of its own is genuine intermediate evidence and must go back to the
+    model, which is the only way the answer ever gets written. Marking those
+    two kinds the same is what let a rendered diagnosis be treated as a tool
+    observation and a rendered list of twenty runs be followed by "no runs
+    currently recorded".
     """
 
-    __slots__ = ("name", "args", "required", "kind", "summary")
+    __slots__ = ("name", "args", "required", "kind", "summary", "renders")
 
-    def __init__(self, name, args=(), required=(), kind=READS, summary=""):
+    def __init__(self, name, args=(), required=(), kind=READS, summary="",
+                 renders=False):
         self.name = name
         self.args = tuple(args)
         self.required = tuple(required)
         self.kind = kind
         self.summary = summary
+        self.renders = bool(renders)
 
     @property
     def enabled(self):
@@ -89,8 +112,8 @@ class Capability:
         return f"<Capability {self.name}({', '.join(self.args)}) {self.kind}>"
 
 
-def _c(name, args=(), required=(), kind=READS, summary=""):
-    return Capability(name, args, required, kind, summary)
+def _c(name, args=(), required=(), kind=READS, summary="", renders=False):
+    return Capability(name, args, required, kind, summary, renders)
 
 
 # The table. Read-only for now; every entry is backed by a method the
@@ -101,24 +124,31 @@ TABLE = {
         _c("check_run", ("name",), ("name",), READS,
            "the overall state of one run as the scheduler reports it: how many "
            "jobs are queued, running, done or broken, and the root cause if "
-           "something failed. `name` may be \"all\" for every run."),
+           "something failed. `name` may be \"all\" for every run.",
+           renders=True),
         _c("inspect_jobs", ("name", "failed"), ("name",), READS,
            "every individual job inside a run and its state, grouped by step. "
-           "`failed` true narrows it to the ones that did not complete."),
+           "`failed` true narrows it to the ones that did not complete.",
+           renders=True),
         _c("diagnose_run", ("name", "question"), ("name",), READS,
            "read the logs of a run's failed jobs and explain what went wrong. "
            "Gathers the evidence first, then reasons over it. `question` "
-           "narrows the investigation."),
+           "narrows the investigation.",
+           renders=True),
         _c("show_run", ("name",), ("name",), READS,
            "the exact GenPipes command a run is, flag by flag, and what can "
-           "still be done to it."),
+           "still be done to it.",
+           renders=True),
         _c("list_runs", (), (), READS,
-           "the runs that currently need attention or are still going."),
+           "the runs that currently need attention or are still going.",
+           renders=True),
         _c("run_history", (), (), READS,
-           "every run ever recorded, including finished and abandoned ones."),
+           "every run ever recorded, including finished and abandoned ones.",
+           renders=True),
         _c("where", (), (), READS,
            "the directories this session is using: the cluster, the working "
-           "directory, the run registry and the checkpoint store."),
+           "directory, the run registry and the checkpoint store.",
+           renders=True),
     )
 }
 
@@ -130,6 +160,31 @@ NAMES = frozenset(TABLE)
 def get(name):
     """The Capability for `name`, or None. Never raises on a bad name."""
     return TABLE.get(str(name or ""))
+
+
+def continues(args):
+    """(action arguments, whether the model said it is not finished).
+
+    `more=True` is stripped here rather than declared on every entry, because
+    it says nothing about the action -- it is the model stating, in the same
+    structured call it was already writing, that the panel this produces is not
+    the end of what it was asked for. "Check this run and if it failed diagnose
+    it" is check_run(name=..., more=True); "how are my runs doing" is
+    list_runs().
+
+    THE DEFAULT IS THE SAFE ONE. Absent means finished, so a model that forgets
+    the flag ends the turn with the complete canonical answer already on
+    screen. The opposite default is what the old unconditional edge back to
+    `generate` amounted to, and it cost 36 model calls and 185 seconds after
+    the answer was already rendered.
+
+    Anything other than a literal true is read as absent: this decides whether
+    a person gets their prompt back, and a string "maybe" must not be a reason
+    to keep going.
+    """
+    args = dict(args or {})
+    more = args.pop(CONTINUE, None)
+    return args, more is True
 
 
 def validate(name, args):
@@ -159,7 +214,7 @@ def validate(name, args):
         return None, (f"{spec.name} exists but is not available here. "
                       f"Anything that changes a run or the scheduler is done "
                       f"by the person, through a typed command.")
-    args = dict(args or {})
+    args, _ = continues(args)
     unknown = [k for k in args if k not in spec.args]
     if unknown:
         return None, (f"{spec.name} takes {', '.join(spec.args) or 'no arguments'}"
@@ -187,3 +242,28 @@ def catalogue():
             f"{a}=..." if a in spec.required else f"[{a}=...]" for a in spec.args)
         out.append(f"  {spec.name}({signature})\n      {spec.summary}")
     return "\n".join(out)
+
+
+def protocol():
+    """How a call ends a turn, stated for the model. Generated, not written.
+
+    Derived from the table's own `renders` flags for the same reason
+    catalogue() is generated: what the model is told and what the code does
+    cannot be allowed to drift, and this particular sentence decides whether a
+    person gets their prompt back.
+    """
+    drawn = sorted(n for n, c in TABLE.items() if c.enabled and c.renders)
+    if not drawn:
+        return ""
+    return (
+        f"EACH OF THESE ANSWERS THE PERSON ITSELF. {', '.join(drawn)} print the "
+        f"same panel the matching command prints, Actions block included, and "
+        f"the turn ENDS there -- you are not called again to summarise it, and "
+        f"you must not, because they are already reading it.\n\n"
+        f"If the panel is not the whole of what you were asked for, say so IN "
+        f"THE CALL by adding {CONTINUE}=True:\n\n"
+        f"    check_run(name=\"run-a\", {CONTINUE}=True)\n\n"
+        f"That hands the result back to you so you can carry on -- which is "
+        f"what \"check it, and diagnose it if it failed\" needs, and what "
+        f"\"how are my runs doing\" does not. Leave it off when the panel "
+        f"answers the question.")

@@ -253,6 +253,12 @@ jobs:
         # model wrote and the box somebody approves.
         run: GENPIPE_FAKE=1 python tests/test_rerun_gate.py
 
+      - name: Where a conversational turn ends
+        # The canonical panel is the answer: a capability that renders one ends
+        # the turn instead of going back for a model call that summarised it,
+        # contradicted it, or went looking through three more surfaces.
+        run: GENPIPE_FAKE=1 python tests/test_turn.py
+
       - name: Preparation carried across turns
         run: python tests/test_run_prep.py
 
