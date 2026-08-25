@@ -110,6 +110,11 @@ def main():
         "view": ["held-demo"], "check": ["done-demo"], "jobs": ["done-demo"],
         "history": [], "list": [], "sort": ["show"], "verbose": ["off"],
         "where": [], "user": [], "model": [], "help": [],
+        # A run with no diagnosis on record, which is the refusal path -- the
+        # only /relaunch outcome reachable without a model. The prepared-retry
+        # path is test_relaunch's, where it can be checked rather than merely
+        # survived.
+        "relaunch": ["done-demo"],
     }
     for name, _, _, _, handler, _ in cli.COMMAND_SPECS:
         if handler is None or name == "key":
@@ -144,6 +149,111 @@ def main():
             agent.registry.get("held-demo")["status"])
     r.equal("and it has no job list", agent.registry.get("held-demo")["job_list"],
             None)
+
+    # ------------------------------------------------------------------ #
+    r.section("/relaunch refuses rather than inventing a fix")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        cli._cmd_relaunch(agent, ["done-demo"])
+    out = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", buf.getvalue())
+    r.contains("it says there is no diagnosed fix", out, "No diagnosed fix")
+    r.contains("and names the command that makes one", out, "/diagnose")
+    r.contains("as well as the manual alternative", out, "/modify")
+    r.check("no override ini was written for a refused retry",
+            not [f for f in os.listdir(workdir) if f.endswith(".override.ini")],
+            os.listdir(workdir))
+    r.check("and no revision record was created",
+            [rec["name"] for rec in agent.registry.all(prune=False)
+             if rec.get("derived_from")] == [], "a revision appeared")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        cli._cmd_relaunch(agent, ["no-such-run"])
+    out = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", buf.getvalue())
+    r.contains("an unknown run is refused by name", out, "no-such-run")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        cli._cmd_relaunch(agent, ["held-demo"])
+    out = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", buf.getvalue())
+    r.contains("and a run still at the gate is sent to /modify", out, "/modify")
+
+    r.section("/relaunch is taught, but not offered indiscriminately")
+    r.check("it is a public command", "relaunch" in
+            {name for name, _, _ in cli.menu()})
+    r.check("filed with the deciding verbs",
+            [g for n, _, _, g in cli.help_rows() if n == "relaunch"]
+            == ["deciding"])
+    from genpipe import display
+    r.check("but it is in no state's generic verb table",
+            not any("/relaunch" in str(v) for v in display._VERBS.values()),
+            display._VERBS)
+    r.contains("and its one canonical description says it prepares",
+               display.action_text("/relaunch"), "prepare")
+    # PROPOSED, not "this". The diagnosis that produced the value may say in
+    # the same breath that it is not established, and a row that calls it "this
+    # fix" endorses it on the screen where the caveat is still two lines away.
+    r.contains("and calls the fix proposed rather than proven",
+               display.action_text("/relaunch"), "proposed fix")
+    r.check("nothing still says 'with this fix'",
+            "with this fix" not in " ".join(str(v) for v in
+                                            display._ACTION_TEXT.values()))
+
+    r.section("bare /relaunch, tab completion and /relaunch <name> agree")
+    # THE INVARIANT. Three ways in, one predicate: if a run is listed by the
+    # picker or offered by completion, /relaunch <name> accepts it -- unless
+    # the scheduler moved in between, which is revalidated at invocation.
+    import inspect
+    from genpipe import relaunch as relaunch_mod
+    picker_src = inspect.getsource(cli._pick_relaunch)
+    r.check("the picker asks relaunch.candidates",
+            "relaunch.candidates" in picker_src, picker_src)
+    r.check("completion asks the same function",
+            "relaunch.candidates" in inspect.getsource(cli._run_names))
+    body = picker_src.split('"""')[-1]
+    r.check("and neither builds a second idea of eligible out of statuses",
+            not any(word in body for word in
+                    ("SUBMITTED", "BROKE_STATES", "remediation_of",
+                     "override.applicable")),
+            body)
+    r.check("/relaunch is completed from the predicate, not a state filter",
+            "relaunch" in cli._ELIGIBLE
+            and "relaunch" not in cli._WATCH
+            and "relaunch" not in cli._DECIDE
+            and "relaunch" not in cli._EITHER)
+
+    r.section("bare /relaunch with nothing eligible says so, and asks nothing")
+    before_calls = getattr(agent.llm, "calls", None)
+    got = cli._pick_relaunch(agent)
+    r.equal("no run is picked", got, None)
+    if before_calls is not None:
+        r.equal("and no model was consulted to find that out",
+                agent.llm.calls, before_calls)
+    named = [n for n, _ in (cli._run_names(agent, "relaunch") or ())]
+    r.equal("completion offers nothing either", named, [])
+
+    r.section("/relaunch needs no model; /modify still may")
+    # THE ARCHITECTURAL LINE. A diagnosed remediation is a section, a key and a
+    # value, so /relaunch writes the command itself -- see relaunch.command and
+    # agent.hold_prepared. "give alignment more memory" is a sentence, so
+    # /modify's fork keeps the model. Asserted at the source, because the
+    # difference is a call path and this is the file that guards call paths.
+    import inspect
+    relaunch_src = inspect.getsource(cli._cmd_relaunch)
+    r.check("/relaunch builds its own command", "relaunch.command" in relaunch_src)
+    r.check("and gates it without a turn", "hold_prepared" in relaunch_src,
+            relaunch_src)
+    r.check("it does not go through the fork's model call",
+            "_fork_run" not in relaunch_src, relaunch_src)
+    fork_src = inspect.getsource(cli._fork_run)
+    r.check("while the fork still asks the model", "agent.run(" in fork_src,
+            fork_src)
+    r.check("and /modify on a launched run still reaches that fork",
+            "_fork_prose" in inspect.getsource(cli._cmd_modify))
+    r.check("hold_prepared runs the generation rather than describing it",
+            "run_block" in inspect.getsource(agent.hold_prepared))
+    r.check("and still hands the declaration to the same gate note",
+            "_gate_note" in inspect.getsource(agent.hold_prepared))
 
     # ------------------------------------------------------------------ #
     r.section("the fork path really reaches the seam that protects the parent")
@@ -199,7 +309,56 @@ def main():
                 ordered.index("held-demo") < ordered.index("done-demo"),
                 ordered)
 
+    _read_only_dispatch(r)
     return r.finish()
+
+
+
+def _read_only_dispatch(r):
+    """Every command the interrupt handler calls read-only really is one.
+
+    The claim printed after ctrl-c ("Nothing reached the scheduler -- that
+    command only reads") is only honest if the list backing it is accurate, and
+    the list is hand-maintained. This checks it against the command table
+    itself: a verb declared read-only must not be one of the gate verbs, and
+    every gate verb must be absent from it.
+    """
+    import inspect
+
+    from genpipe import cli
+
+    r.section("the read-only command list matches the command table")
+    table = set(cli.COMMANDS)
+    for verb in sorted(cli._READ_ONLY_COMMANDS):
+        r.check(f"/{verb} is a real command", verb in table, sorted(table))
+    # The verbs that CAN change something, none of which may be listed.
+    for verb in ("approve", "reject", "modify", "cancel", "hold", "track",
+                 "scan", "fork", "relaunch"):
+        r.check(f"/{verb} is never claimed read-only",
+                verb not in cli._READ_ONLY_COMMANDS)
+    r.check("and /diagnose is, because it only gathers evidence",
+            "diagnose" in cli._READ_ONLY_COMMANDS)
+
+    r.section("the interrupt claim covers every verb that cannot submit")
+    # /relaunch WRITES -- an override ini, and a generated script -- so it is
+    # not
+    # read-only, and it also cannot reach the scheduler, so falling through to
+    # _scheduler_claim would print "already submitted" about the run it was
+    # copying FROM. Two different true sentences; the map is what keeps them
+    # apart.
+    for verb in sorted(cli._READ_ONLY_COMMANDS):
+        r.contains(f"/{verb} still says it only reads",
+                   cli._INTERRUPT_CLAIM[verb], "only reads")
+    r.contains("/relaunch says what it actually did instead",
+               cli._INTERRUPT_CLAIM.get("relaunch", ""), "only prepares")
+    r.contains("while still ruling out the scheduler",
+               cli._INTERRUPT_CLAIM.get("relaunch", ""), "Nothing reached")
+    for verb in ("approve", "modify", "fork", "cancel"):
+        r.check(f"/{verb} still earns its claim by looking",
+                verb not in cli._INTERRUPT_CLAIM)
+    r.check("the claim is keyed on the RESOLVED name, so /rel and /diag work",
+            "verb = cmd" in inspect.getsource(cli._dispatch_line),
+            inspect.getsource(cli._dispatch_line)[:200])
 
 
 if __name__ == "__main__":

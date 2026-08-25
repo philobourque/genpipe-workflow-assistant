@@ -95,7 +95,14 @@ PIPELINES = {
 # something. Not the real step lists -- the real ones are read from `genpipes -h`
 # at runtime by design (see genpipes.md), and duplicating them here would create
 # exactly the drift that document avoids.
-STEP_COUNT = 20
+#
+# The CEILING, though, has to sit above every real protocol, and at 20 it did
+# not: 6.1.1's longest is dnaseq somatic_ensemble at 39, and rnaseq stringtie --
+# the protocol these end-to-end suites drive -- has 21. A stand-in that rejects
+# `-s 1-21` makes a deterministic full-range retry impossible to exercise here
+# for a reason that exists nowhere but in this file. 40 clears the longest real
+# range and still range-checks (test_fakecluster's `-s 1-99` is still refused).
+STEP_COUNT = 40
 
 
 def _write(path, body, executable=True):
@@ -134,7 +141,7 @@ import time
 STATE = os.environ.get("GENPIPE_FAKE_STATE", "happy")
 STORE = os.environ["GENPIPE_FAKE_STORE"]
 PIPELINES = __import__("json").load(open(os.path.join(STORE, "pipelines.json")))
-STEP_COUNT = 20
+STEP_COUNT = 40
 
 # How many jobs fake_submit will create (its STEPS x SAMPLES). Stated here as
 # well because the generator has to declare the total in the script's header

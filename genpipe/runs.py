@@ -695,6 +695,63 @@ class Registry:
             return self.get(name)
         return self.update(name, last_reasons={"at": _now(), "reasons": reasons})
 
+    def remember_remediation(self, name, override, uncertain=(), before=None):
+        """Persist the machine-applicable fix /diagnose worked out, as data.
+
+        THE POINT IS THAT NOTHING DOWNSTREAM RE-READS PROSE. /diagnose renders
+        a screen; the OVERRIDE section of that answer is already structured by
+        diagnosis.parse(), and this is where it stops being a thing on a
+        terminal and becomes a thing a later command can act on. /relaunch
+        reads it, applies it, and never sees a sentence -- which is the whole
+        reason the contract in diagnosis.SHAPE asks for an ini fragment rather
+        than advice.
+
+        `uncertain` TRAVELS WITH IT, and that is not bookkeeping. The fix and
+        what the run failed to establish about the fix are one finding: a
+        walltime raised to a value nothing proved sufficient is exactly as
+        uncertain a week later as it was on the screen it was printed on. Storing
+        the remedy without its caveats is how a proposal becomes a
+        recommendation somewhere between two commands.
+
+        `before` is what the run's own config trace recorded for the same keys
+        at generation time -- the left-hand side of `0:10:00 -> 35:00:00`. Read
+        from the trace rather than derived, and stored rather than recomputed,
+        because the trace is a snapshot of a moment that has passed.
+
+        Supersedes proposed_override, which held the same fragment and nothing
+        else. See remediation_of() for the read side, which still understands
+        the old field.
+        """
+        if not override:
+            return self.get(name)
+        return self.update(name, remediation={
+            "override": {s: dict(k) for s, k in override.items()},
+            "uncertain": [str(u) for u in (uncertain or ())],
+            "before": {s: dict(k) for s, k in (before or {}).items()},
+            "source": "diagnose", "at": _now()})
+
+    def derive(self, name, source, reason):
+        """Record that `name` was built from `source`, and why.
+
+        LINEAGE, NOT A SECOND PROVENANCE SUBSYSTEM. A revision is a new run
+        with its own name, its own thread and its own gate -- deliberately, so
+        that the original keeps its job list and its jobs -- and the cost of
+        that separation is that nothing on the new record says where it came
+        from. Two fields is the whole of the fix: /history reads them, and the
+        relationship survives in the same append-only file everything else
+        about a run lives in.
+
+        Never written to the SOURCE. The original is historical truth and this
+        would be a mutation of it; a parent that listed its children would also
+        have to be updated every time one appeared, which is a write to a
+        launched record for the sake of a link that can be found by reading
+        the other end.
+        """
+        if not source or not reason:
+            return self.get(name)
+        return self.update(name, derived_from=str(source),
+                           derived_reason=str(reason))
+
     def update(self, name, **fields):
         """Merge fields into the last record for a name. Returns it, or None."""
         records = self.load()
@@ -821,6 +878,41 @@ class Registry:
         return changed
 
 
+def remediation_of(record):
+    """The structured fix /diagnose proposed for this run, or {}.
+
+    Keys: `override` ({section: {key: value}}), `uncertain` (a list of the
+    things the run did NOT establish), `before` (what the config trace said for
+    the same keys), `at`, `source`.
+
+    READS THE OLD FIELD TOO. `proposed_override` held the same ini fragment
+    before remember_remediation() existed, and a cluster's runs.jsonl is full of
+    them. Those records come back with an empty `uncertain`, which is honest --
+    the caveats were never stored -- and callers must not read an empty list as
+    "nothing was uncertain". They read it as "nothing was recorded", which is
+    why /relaunch prints what it has and says where it came from rather than
+    asserting a clean bill of health.
+
+    An override that is present but empty is the same as no remediation. A
+    diagnosis that found no config change to make is the ordinary case (the
+    contract tells the model to omit OVERRIDE unless the fix really is one),
+    and it must not read as a remediation with nothing in it.
+    """
+    found = (record or {}).get("remediation")
+    if isinstance(found, dict) and found.get("override"):
+        return {"override": {s: dict(k) for s, k in found["override"].items()},
+                "uncertain": [str(u) for u in (found.get("uncertain") or ())],
+                "before": {s: dict(k) for s, k in
+                           (found.get("before") or {}).items()},
+                "at": found.get("at") or "",
+                "source": found.get("source") or "diagnose"}
+    legacy = (record or {}).get("proposed_override")
+    if isinstance(legacy, dict) and legacy:
+        return {"override": {s: dict(k) for s, k in legacy.items()},
+                "uncertain": [], "before": {}, "at": "", "source": "diagnose"}
+    return {}
+
+
 def _normalise(record):
     """Fill in fields a record predates, so an old runs.jsonl keeps working.
 
@@ -887,11 +979,19 @@ class Job:
     render the same way.
     """
 
-    __slots__ = ("job_id", "name", "step", "log", "state", "elapsed",
+    __slots__ = ("job_id", "name", "step", "log", "deps", "state", "elapsed",
                  "maxrss", "exit_code", "start", "timelimit", "reason")
 
-    def __init__(self, job_id=None, name="", log=None):
+    def __init__(self, job_id=None, name="", log=None, deps=()):
         self.job_id = job_id
+        # THE IDS THIS JOB WAITED ON. Column 3 of the manifest, which
+        # parse_job_list read and threw away -- so the dependency structure
+        # was parsed by this application and then rediscovered by the model,
+        # which read the raw job_list with `head -40` to find out which jobs
+        # were downstream of the one that broke. It is the only place the DAG
+        # is written down: sacct does not carry it and squeue forgets it once
+        # the jobs are terminal.
+        self.deps = tuple(deps or ())
         self.name = name
         # GenPipes names jobs `<step>.<sample>` -- the step is the part worth
         # grouping by, since a failure is nearly always a step failing across
@@ -1894,9 +1994,10 @@ def parse_job_list(path):
             if "\t" in line:
                 fields = [x.strip() for x in line.split("\t")]
                 if len(fields) == 4:
-                    job_id, name, _deps, log = fields
+                    job_id, name, deps, log = fields
                     jobs.append(Job(job_id=job_id or None, name=name,
-                                    log=log or None))
+                                    log=log or None,
+                                    deps=[d for d in deps.split(":") if d]))
                     continue
                 fields = [x for x in fields if x]
             else:
@@ -2554,6 +2655,10 @@ def _root_cause(jobs):
         # ran for different lengths, and which one is which is the first thing
         # anybody wants. It was reachable by then typing /jobs, and a fact that
         # needs a second command to see is a fact most people never see.
+        # The id as well as the name. The name is what a person reads; the id
+        # is what sacct, squeue, the log filename and the manifest's dependency
+        # column all agree on, and it is the key downstream_of() walks.
+        "job_id": first.job_id,
         "jobs": [{"name": j.name, "elapsed": j.elapsed, "maxrss": j.maxrss}
                  for j in sorted(same, key=lambda j: j.name or "")],
         "cancelled_after": sum(1 for j in jobs if j.state == "CANCELLED"),
@@ -2973,13 +3078,65 @@ def declared_log(job, record):
     """
     if not job.log:
         return None
-    workdir = record.get("workdir") or os.getcwd()
-    for path in (os.path.join(workdir, "job_output", job.log),
-                 os.path.join(workdir, job.log),
-                 job.log):
-        if os.path.isfile(path):
-            return path
-    return None
+    for base in _log_roots(record):
+        for path in (os.path.join(base, job.log),
+                     os.path.join(base, "job_output", job.log)):
+            if os.path.isfile(path):
+                return path
+    return job.log if os.path.isfile(job.log) else None
+
+
+def _log_roots(record):
+    """The directories this run's `job_output/` paths may be relative to,
+    most authoritative first.
+
+    THE MANIFEST'S OWN DIRECTORY COMES FIRST, and that is the fix for a whole
+    class of runs rather than a special case. `workdir` is written by
+    record_outcome() as os.getcwd() -- the directory the ASSISTANT was launched
+    from -- while the run itself writes wherever `-o` sent it. Those are the
+    same directory only when somebody happened to start the app inside the run
+    directory, and on 2026-08-05 they were not:
+
+        workdir    /home/pbourque/genpipe-workflow-assistant
+        job_list   /home/pbourque/genpipes_somatic_fastpass/COLO829_.../job_output/
+
+    Every declared path was therefore joined to the wrong root, every lookup
+    missed, and /diagnose reported "log not found for this run" for 46 jobs
+    whose logs were all sitting on disk. The model was then asked to explain a
+    timeout with no in-job evidence, and did what anybody would: it reasoned
+    from the absence.
+
+    The job_list path is the RUN'S OWN identity -- it is the manifest this run
+    wrote, recorded at submission -- so anchoring on its directory is stricter
+    than anchoring on workdir, not looser. config_trace() has always resolved
+    this way, which is why the trace was found for the same run whose logs
+    were not.
+
+    workdir is kept as a fallback for records that have no job_list path, and
+    the ORDER matters: a run whose manifest is known is never resolved against
+    a directory that merely happens to be the current one.
+    """
+    roots = []
+    listing = record.get("job_list")
+    if listing:
+        # dirname(job_list) IS job_output/, which is what column 4 is relative
+        # to; its parent covers a manifest that writes `job_output/...` itself.
+        here = os.path.dirname(listing)
+        if here:
+            roots.append(here)
+            parent = os.path.dirname(here)
+            if parent:
+                roots.append(parent)
+    workdir = record.get("workdir")
+    if workdir:
+        roots.append(workdir)
+    roots.append(os.getcwd())
+    seen, out = set(), []
+    for r in roots:
+        if r and r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
 
 
 def resolve_log(job, record, stamp=None):
@@ -3009,20 +3166,24 @@ def resolve_log(job, record, stamp=None):
     if found:
         return found
 
-    workdir = record.get("workdir") or os.getcwd()
-    output = os.path.join(workdir, "job_output")
-    if job.job_id:
-        for path in sorted(glob.glob(os.path.join(output, "**",
-                                                  f"*{job.job_id}*"),
-                                     recursive=True)):
-            if os.path.isfile(path):
-                return path
-    if job.name and stamp:
-        for path in sorted(glob.glob(os.path.join(output, "**",
-                                                  f"{job.name}*{stamp}*.o"),
-                                     recursive=True)):
-            if os.path.isfile(path):
-                return path
+    # Searched under the SAME roots the declared path is resolved against --
+    # see _log_roots. Globbing `workdir/job_output` while the manifest says the
+    # run lives somewhere else searches a directory belonging to no run at all.
+    for base in _log_roots(record):
+        output = base if os.path.basename(base) == "job_output" else \
+            os.path.join(base, "job_output")
+        if job.job_id:
+            for path in sorted(glob.glob(os.path.join(output, "**",
+                                                      f"*{job.job_id}*"),
+                                         recursive=True)):
+                if os.path.isfile(path):
+                    return path
+        if job.name and stamp:
+            for path in sorted(glob.glob(os.path.join(output, "**",
+                                                      f"{job.name}*{stamp}*.o"),
+                                         recursive=True)):
+                if os.path.isfile(path):
+                    return path
     return None
 
 
@@ -3082,6 +3243,40 @@ def tail(path, lines=40):
             return "".join(f.readlines()[-lines:])
     except OSError:
         return None
+
+
+def downstream_of(jobs, job_id):
+    """Every job that waited on `job_id`, directly or through a chain.
+
+    The transitive closure over the manifest's dependency column. This is the
+    only place the DAG exists: sacct never had it, and squeue forgets it the
+    moment the jobs go terminal.
+
+    WHAT IT IS FOR. "32 jobs were CANCELLED" is a count over the whole run and
+    says nothing about whether this failure caused them -- a person running
+    scancel produces the same number. The closure is what turns the count into
+    a statement about THIS job, and it is what the model went and read the raw
+    job_list to reconstruct.
+
+    Returns a set of ids, never including `job_id` itself. Cycles cannot occur
+    in a submitted Slurm DAG, and a malformed manifest that contained one would
+    still terminate here because `seen` gates the walk.
+    """
+    if not job_id:
+        return set()
+    waiting = {}
+    for j in jobs or ():
+        for dep in j.deps or ():
+            waiting.setdefault(dep, []).append(j.job_id)
+    seen, queue = set(), [job_id]
+    while queue:
+        current = queue.pop()
+        for child in waiting.get(current, ()):
+            if child and child not in seen:
+                seen.add(child)
+                queue.append(child)
+    seen.discard(job_id)
+    return seen
 
 
 def triage(record, jobs=None, limit=5, log_lines=40):

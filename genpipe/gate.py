@@ -966,6 +966,114 @@ def flag_values(cmd, flag):
     return list(dict.fromkeys(out))
 
 
+def rewrite(text, edits):
+    """The same genpipes call with exactly these flags changed. The WRITER.
+
+    Everything above this line reads a command: invocation() cuts it out of a
+    block, flag_value() and flag_values() ask what it says. This is the one
+    thing in the file that produces one, and it exists because /relaunch knows
+    every field of the revision it wants before anything runs -- the config
+    stack, the step range, the script path -- and asking a model to retype a
+    command the program can already write is thirty-six inference steps spent
+    on syntax. See relaunch.command().
+
+    `edits` maps a flag to what it should say:
+
+        {"-s": "1-23"}          set it, replacing whatever was there
+        {"-c": [a, b, c]}       a repeatable flag's whole value list, in order
+        {"-s": None}            remove the flag and its values
+
+    A flag already on the command keeps ITS POSITION; one that was not there is
+    added before any trailing redirection. Every other token survives exactly as
+    written -- quoting included, which is why the tokeniser runs in non-POSIX
+    mode. `-o "$OUTDIR"` has to come out the other side still quoted and still
+    unexpanded: the variable is assigned in the block around this call, and a
+    rewrite that resolved or dropped the quotes would change where the run
+    writes.
+
+    NOTHING HERE UNDERSTANDS GENPIPES. It does not know that -c is a config
+    stack or that -s is a step range; the caller decides what the command should
+    say and this puts it there without disturbing the rest. What it does know is
+    the same three token shapes flag_values() knows -- a flag, a redirection, a
+    shell separator -- because those are what decide where one flag's values
+    stop.
+
+    Returns "" when there is no genpipes call in the text, which is the same
+    "no opinion" invocation() returns and must be treated the same way: the
+    caller refuses rather than writing a command from scratch.
+    """
+    call = invocation(str(text or "")) or ""
+    if not call:
+        return ""
+    try:
+        tokens = shlex.split(call, comments=False, posix=False)
+    except ValueError:
+        tokens = call.split()
+
+    # Every spelling of every flag being edited, so `--steps 1-5` is recognised
+    # as the same flag as `-s 1-5` and is replaced rather than left beside it.
+    wanted = {}
+    for flag, value in (edits or {}).items():
+        for spelling in ([LONG_FORM[flag]] if flag in LONG_FORM else []) + [flag]:
+            wanted[spelling] = flag
+
+    out, seen, at = [], {}, 0
+    while at < len(tokens):
+        token = tokens[at]
+        name, _, _inline = token.partition("=")
+        flag = wanted.get(name)
+        if flag is None:
+            out.append(token)
+            at += 1
+            continue
+        # The flag and everything belonging to it come out. A placeholder marks
+        # where it was, so the replacement lands in the same place: a stack
+        # rewritten at the end of the line would read differently from the one
+        # somebody approved, and for -c a different position is a different run.
+        if flag not in seen:
+            seen[flag] = len(out)
+            out.append(_HOLE)
+        at += 1
+        if _inline:
+            continue
+        while at < len(tokens):
+            value = tokens[at]
+            if (_FLAG_TOKEN.match(value) or _REDIRECT_TOKEN.match(value)
+                    or value in _SEPARATOR_TOKEN):
+                break
+            at += 1
+
+    for flag, value in (edits or {}).items():
+        if value is None:
+            continue
+        words = [flag] + ([str(v) for v in value]
+                          if isinstance(value, (list, tuple))
+                          else [str(value)])
+        if flag in seen:
+            out[seen[flag]] = words
+        else:
+            # New to this command. Before the trailing redirection, which is
+            # not part of what genpipes is being told to do and must stay last.
+            stop = len(out)
+            while stop and isinstance(out[stop - 1], str) and (
+                    _REDIRECT_TOKEN.match(out[stop - 1])
+                    or out[stop - 1] in _SEPARATOR_TOKEN):
+                stop -= 1
+            out.insert(stop, words)
+
+    flat = []
+    for item in out:
+        if item is _HOLE:
+            continue                      # a removed flag, and nothing to add
+        flat.extend(item if isinstance(item, list) else [item])
+    return " ".join(flat)
+
+
+# Stands in for a flag that was cut out, so its replacement can be put back
+# exactly where it was. A list is never a token, so nothing can collide with it.
+_HOLE = object()
+
+
 def submission_line(code):
     """Pull the real submission command out of a noisy code block, even if
     the model buried it in a Python script or a string literal.
@@ -1024,15 +1132,23 @@ def script_name(code):
     return m.group(1) if m else None
 
 
-def build_proposal(messages, code):
+def build_proposal(messages, code, generated=None):
     """The payload shown to the human. The submission line is extracted from
     the caught block; the descriptive slots are parsed from the earlier
     generation command so the box stays populated even when the model splits
     generation and submission across separate blocks. Every fact is parsed
     from command text, never from the model's prose, so the explanation
-    cannot disagree with the box the user approves."""
+    cannot disagree with the box the user approves.
+
+    `generated` names the generation command outright, for a proposal the
+    program WROTE rather than found in a transcript -- see relaunch.command().
+    It changes nothing else: the same parse runs over it, producing the same
+    slots, the same `missing` and the same revision hash, so a deterministic
+    proposal and a model's are the same kind of object and the gate cannot
+    tell them apart. Which is the point. There is no second, weaker proposal
+    shape for the path with no model in it."""
     cmd = submission_line(code or "")
-    gen = generation_command(messages)
+    gen = generated if generated is not None else generation_command(messages)
     block = gen or (code or "")
 
     # Flags are read from the genpipes CALL, not from the block it arrived in.

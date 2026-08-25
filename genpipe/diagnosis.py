@@ -61,9 +61,9 @@ RELAUNCH_RULE = (
     "with, not a narrowed one starting at the failure. GenPipes checks whether "
     "each step's output is already up to date and skips it, so resubmitting the "
     "whole range re-runs only what never produced output and costs nothing for "
-    "what did. A narrowed range is how a run silently ends up half done: every "
-    "step downstream of the failure was CANCELLED, never ran, and has no output "
-    "to skip against."
+    "what did. A narrowed range is how a run silently ends up half done: the "
+    "jobs downstream of the failure were CANCELLED, never ran, and have no "
+    "output to skip against."
 )
 
 # What the model is told to produce. Given verbatim, headings included, because
@@ -84,7 +84,10 @@ OVERRIDE:
 [section_name]
 key = value
 RELAUNCH: the step range to resubmit, as a -s range.
-CONFIDENCE: certain, likely, or unclear.
+UNCERTAIN:
+- one line per thing this run does NOT establish, and nothing else. Whether \
+the value you propose is enough belongs here. So does any competing \
+explanation the evidence does not rule out.
 
 Rules for the content:
 - OVERRIDE is a literal ini fragment and nothing else -- no prose, no fences. \
@@ -97,10 +100,35 @@ that will succeed. If the evidence shows a limit was too small but does not \
 show what would be enough, say both: what is now known to be insufficient, and \
 what this run does not establish. Do not describe any value as sufficient, \
 safe or adequate unless something you observed shows it is.
+- PREFER A VALUE THE PIPELINE ITSELF ALREADY CARRIES over one you choose. If \
+an earlier ini in the -c stack sets this key and a later one lowered it, \
+proposing the earlier value is sourced rather than invented -- say where it \
+came from. It is still not proven sufficient for this input, and that belongs \
+under UNCERTAIN.
+- WRITE WHAT THE EVIDENCE SHOWS, NOT WHAT IT RULES OUT. "This is not a hang \
+and not an error in the tool" is a claim about everything that did not happen, \
+and no log establishes it. "The log's last entry is a progress line 15s before \
+the wall-clock limit, and no traceback or error appears after it" is the same \
+observation stated as one, and it is checkable.
+- A RESOURCE FIGURE NEAR ITS REQUEST IS AN OBSERVATION, NOT A CAUSE. Peak \
+memory at 99% of the request is worth reporting and does not by itself \
+establish that memory pressure made the job slow. If you raise it, put it \
+under EVIDENCE and put the causal question under UNCERTAIN.
+- MEASUREMENTS FROM DIFFERENT SOURCES MEASURE DIFFERENT THINGS. sacct times \
+the ALLOCATION; a job's epilogue times the job SCRIPT, which starts after the \
+allocation and ends before it, so the epilogue figure is nested inside sacct's \
+and is shorter by seconds. Two windows, not two readings of one. Quote the \
+scheduler's figure for what the scheduler enforced; if you quote the job's \
+own, name what each one measured. Never merge them into one number, and never \
+describe them as the same window.
 """
 
+# CONFIDENCE is still PARSED and no longer asked for -- see the note above
+# display.diagnosis. Keeping it in the table means a model that emits the
+# old heading out of habit has its text captured under a key nothing
+# renders, rather than spilled into whichever section came before it.
 _HEADINGS = ("MANNER", "CAUSE", "EVIDENCE", "FIX", "OVERRIDE", "RELAUNCH",
-             "CONFIDENCE")
+             "UNCERTAIN", "CONFIDENCE")
 
 # A heading at the start of a line, with or without the model's habitual
 # markdown bolding around it. `**FIX:**` and `FIX:` are the same heading, and
@@ -239,7 +267,8 @@ def parse(text):
     """
     body = strip_tags(text)
     out = {"manner": "", "cause": "", "evidence": [], "fix": "",
-           "override": {}, "relaunch": "", "confidence": "",
+           "override": {}, "relaunch": "", "uncertain": [],
+           "confidence": "",
            "prose": body, "shaped": False}
 
     buckets, current = {}, None
@@ -265,7 +294,14 @@ def parse(text):
     out["evidence"] = _bullets(buckets.get("evidence"))
     out["override"] = _ini(buckets.get("override"))
     out["relaunch"] = _join(buckets.get("relaunch"))[:80]
+    # WHAT THIS RUN DOES NOT ESTABLISH, as a list, beside the claims it is
+    # about. Bulleted like EVIDENCE because it is the same kind of thing --
+    # several separate statements, one per line -- and because a paragraph of
+    # caveats is read as hedging, while three named unknowns are read as three
+    # named unknowns.
+    out["uncertain"] = _bullets(buckets.get("uncertain"))
 
+    # PARSED, NOT RENDERED, AND NO LONGER ASKED FOR. See display.diagnosis.
     out["confidence"] = confidence(_join(buckets.get("confidence")))
     return out
 

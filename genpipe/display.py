@@ -57,11 +57,18 @@ import getpass
 import os
 import random
 import re
-import shutil
 import sys
 import textwrap
 import unicodedata
 
+# ALIASED, both of them, because this module already defines a `gate` -- the
+# renderer that draws the approval box -- and a plain `from . import gate`
+# is silently overwritten by that def further down the file. The import wins
+# at import time and loses the moment the def is executed, so every later
+# reference resolves to the renderer and any attribute lookup on it fails
+# quietly inside a try. Same shape as agent.py's `interrupt as interrupting`.
+from . import capabilities as capability_table
+from . import gate as gate_rules
 from . import mirror
 from . import modify
 # Stdlib-only, like this module: the status vocabulary lives with the registry
@@ -319,6 +326,63 @@ def terminal_rows():
         return max(1, int(os.environ.get("LINES", "24")))
     except ValueError:
         return 24
+
+
+# ---------------------------------------------------------------------------
+# THE LAST CANONICAL SURFACE, kept so it can be drawn again at a new width.
+#
+# WHY THIS EXISTS, AND WHAT IT HONESTLY CANNOT DO. Everything this application
+# prints is ordinary scrollback. When the window is resized the terminal
+# emulator reflows what is already on it, and it reflows it as text: a line
+# this module hard-wrapped to fit 100 columns is soft-wrapped again at 80, and
+# the overflow restarts at COLUMN ZERO -- left of and underneath the gutter it
+# was drawn beside. That is what breaks a diagnosis panel on resize, and no
+# amount of care here prevents it, because the bytes have already been written
+# to a stream this process cannot edit. Rewriting printed history would mean
+# owning the screen -- an alternate-screen TUI with a live region per surface --
+# which is a different application.
+#
+# What CAN be done is draw it again, now, at the width the window is now. This
+# memo is what makes that possible: the renderer and the arguments it was
+# called with, so /redraw is the SAME function over the SAME data. It cannot
+# call a model, re-read a log or ask the scheduler anything, because it does
+# not have the code to -- it holds a display function and a tuple.
+#
+# One slot, not a history: the question somebody has after resizing is about
+# the thing they were just looking at.
+_LAST = None
+
+
+def canonical(fn):
+    """Mark a renderer as a complete user-facing surface, and remember the last.
+
+    The same idea capabilities.Capability.renders records for the model, on the
+    display side: these are the screens somebody reads and acts from, as
+    opposed to a notice, a prompt or a line of progress.
+    """
+    def drawn(*args, **kwargs):
+        global _LAST
+        _LAST = (fn, args, kwargs)
+        return fn(*args, **kwargs)
+
+    drawn.__name__ = fn.__name__
+    drawn.__doc__ = fn.__doc__
+    drawn.__wrapped__ = fn
+    return drawn
+
+
+def last_surface():
+    """(name, callable) for the last canonical surface drawn, or (None, None)."""
+    if not _LAST:
+        return None, None
+    fn, args, kwargs = _LAST
+    return fn.__name__, lambda: fn(*args, **kwargs)
+
+
+def forget_surface():
+    """Drop the memo. For tests, and for /new."""
+    global _LAST
+    _LAST = None
 
 
 def terminal_cols():
@@ -687,10 +751,12 @@ def banner(source=None, model=None):
     # The checkout, not the package directory: what someone reads off the
     # banner is the thing they would cd into or git pull.
     path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    try:
-        cols = shutil.get_terminal_size((80, 24)).columns
-    except Exception:
-        cols = 80
+    # terminal_cols(), not shutil: shutil consults $COLUMNS first, and a
+    # $COLUMNS exported once by a login shell and never updated is exactly the
+    # stale width this whole module avoids. The banner was the last reader of
+    # it, which is why it was the one surface that could be drawn at the width
+    # the window used to be.
+    cols = terminal_cols()
 
     total = min(cols - 2, 104)
     left_w = _LEFT_W
@@ -1116,7 +1182,86 @@ def _close_open_rule():
         print()
 
 
-def _rule(colour, mark, label, text, dim_body=False, hold=False):
+def _wrapped(line, room):
+    """`line` broken to fit `room` columns, as a list. [line] when it fits or
+    when there is no width to fit it to.
+
+    Breaks on whitespace where there is any and mid-token where there is not --
+    a 200-character path has nowhere to break and still must not run off the
+    window. Measured with cells(), because a line may carry escape sequences
+    that occupy no columns.
+    """
+    if not room or cells(line) <= room:
+        return [line]
+    out, current = [], ""
+    for token in re.split(r"(\s+)", line):
+        while cells(token) > room:
+            take = room - cells(current)
+            if take <= 0:
+                out.append(current)
+                current = ""
+                take = room
+            current += token[:take]
+            token = token[take:]
+            out.append(current)
+            current = ""
+        if cells(current) + cells(token) > room:
+            out.append(current)
+            current = token.lstrip()
+        else:
+            current += token
+    if current.strip() or not out:
+        out.append(current)
+    return [p for p in out if p != ""] or [line]
+
+
+def _tool_of(code):
+    """The name of what ACTUALLY ran, for the caption over a verbose block.
+
+    WHAT WAS WRONG. The caption came from _code_label, which classifies a
+    block by the PURPOSE it infers from the command text -- HELP, GENERATE,
+    SUBMIT, READ, SCHEDULER. Those are the right words for deciding what to
+    colour and what to hide, and the wrong words for a caption that claims to
+    say what ran:
+
+        show_run(name="...")            captioned `bash`. It is not bash. It
+                                        is a capability call this application
+                                        answers itself, and nothing reached a
+                                        shell.
+        module load … --help            captioned `help`. It IS bash, and
+                                        `help` is why the model ran it, not
+                                        what it is.
+
+    So the caption is derived from execution metadata instead, and there are
+    exactly two kinds of thing an <execute> block can be:
+
+      a capability call   gate.capability_request() parses it, and the name it
+                          returns is the name of the tool. Same parser the
+                          router uses to decide the block is a capability, so
+                          the caption cannot disagree with what happened.
+      anything else       bash. Biomni runs every other block through a shell,
+                          which is the whole of what is known about it.
+
+    NO `read` AND NO `help` HERE, deliberately, and this is a departure worth
+    stating. Both were purposes inferred from the text -- `head -40 <path>` is
+    a read only in the sense that somebody reading the command can see that it
+    is, which is a judgement, not metadata. There is nothing in the execution
+    path that distinguishes a read from any other shell command, so captioning
+    one differently would be the same class of guess this function exists to
+    remove. _code_label still produces those words, because HIDING and
+    COLOURING are judgements and are allowed to be.
+    """
+    try:
+        wanted = gate_rules.capability_request(
+            code, tuple(capability_table.TABLE))
+    except Exception:                                    # noqa: BLE001
+        wanted = None
+    if wanted and wanted.get("capability"):
+        return str(wanted["capability"])
+    return "bash"
+
+
+def _rule(colour, mark, label, text, dim_body=False, hold=False, space=False):
     """Print a block behind a left rule: a quiet label, then the body.
 
     One glyph for every kind of block, and the label carries the difference.
@@ -1150,9 +1295,34 @@ def _rule(colour, mark, label, text, dim_body=False, hold=False):
     if not body.strip():
         return
     if label:
+        # A bare gutter row before the caption, where one block continues
+        # another. The rule is unbroken -- the two halves are one command and
+        # its output -- and the gap is what stops "output" reading as a third
+        # line of the command above it.
+        if space:
+            print(f"{colour}{mark}{RESET}")
         print(f"{colour}{mark} {label}{RESET}")
+    # WRAPPED, AND WRAPPED INTO THE BLOCK. This printed each line raw, so a
+    # generated command line or a job_list row -- routinely 150-200 columns --
+    # ran off the window and the TERMINAL wrapped it, at column zero, under the
+    # gutter. The overflow then sat left of the rule it was supposed to be
+    # beside, and on a /diagnose screen it collided with the ▌ panel. Every
+    # other long block in this module goes through fit() or _body_width; this
+    # one, which carries the longest text on screen, went through neither.
+    #
+    # Continuation lines are indented past the gutter rather than aligned with
+    # column zero, so a wrapped command still reads as ONE command: the mark
+    # says "this block", and the indent says "still the same line".
+    #
+    # Only against a real terminal. Piped to a file or a CI log there is no
+    # width to overflow, and folding the agent's own bytes there would lose
+    # information to solve a problem that does not exist off-screen.
+    cols = terminal_cols() if _tty() else 0
+    room = max(24, cols - 4) if cols else 0
     for line in body.splitlines():
-        print(f"{colour}{mark}{RESET} {shade}{line}{RESET}")
+        for i, part in enumerate(_wrapped(line, room)):
+            lead = "" if i == 0 else "  "
+            print(f"{colour}{mark}{RESET} {shade}{lead}{part}{RESET}")
     # _open_rule is left accurate either way, so a caller never has to clear it
     # by hand -- doing that at one of two call sites was what printed the gap
     # twice, once by the block that closed and once by the one that followed.
@@ -1367,7 +1537,8 @@ def _draw(event):
         # Held open: the output of this command, if there is any, belongs to
         # the same block and arrives on the next message.
         _rule(AMBER if label in _CONSEQUENTIAL else GREY,
-              "\u258f", label.lower(), event["text"], dim_body=True, hold=True)
+              "\u258f", _tool_of(event["text"]),
+              event["text"], dim_body=True, hold=True)
 
     elif k == "observation":
         # No caption. "terminal" named the channel rather than the event, and
@@ -1376,8 +1547,19 @@ def _draw(event):
         # command sitting directly above it. When there is no command above
         # (its block was hidden, or folded) the rule and the indent still mark
         # it as machine output.
-        _rule(_open_rule or GREY, "\u258f", "",
-              _clipped(event["text"]), dim_body=True)
+        # CAPTIONED NOW, because the block above it is captioned too. The
+        # caption was dropped when it read "terminal", which named the channel
+        # rather than the event and cost a line on every command -- but with a
+        # tool name over the command, an uncaptioned wall of text underneath
+        # reads as more command. "output" is one word and it is the boundary
+        # between what was asked and what came back, which is the whole
+        # hierarchy this block was missing.
+        #
+        # Only when a command is actually open above it. An observation with
+        # no visible command -- its block hidden, or folded -- is the only
+        # thing on screen and needs no boundary drawn against nothing.
+        _rule(_open_rule or GREY, "\u258f", "output" if _open_rule else "",
+              _clipped(event["text"]), dim_body=True, space=bool(_open_rule))
 
     elif k == "answer":
         # One quiet line. The panel above it is the event; this is the receipt.
@@ -1973,11 +2155,7 @@ def _panel_height():
     blank lines, the note and the hint -- plus a couple of lines of headroom so
     the panel is not flush against the top of the screen.
     """
-    try:
-        rows = shutil.get_terminal_size((80, 24)).lines
-    except Exception:
-        rows = 24
-    return max(8, rows - 9)
+    return max(8, terminal_rows() - 9)
 
 
 def _elide(lines, focus, room):
@@ -2257,7 +2435,40 @@ _ACTION_TEXT = {
     "/diagnose":  "explain what went wrong",
     "/jobs":      "inspect individual jobs",
     # Before anything is launched.
+    # TWO ENTRIES, BECAUSE /modify GENUINELY DOES TWO THINGS. On a run still
+    # at the gate it edits the proposal in place and asks again. On a run that
+    # has already been submitted it FORKS -- a new run is built and gated, and
+    # the launched one is not touched (see cli._cmd_modify). "change a run
+    # before launch" is right for the first and misleading for the second: it
+    # was printed under a /diagnose of a run that had been on the scheduler for
+    # nineteen days, where there is no "before launch" left and nothing about
+    # that run is going to change.
+    #
+    # This is the ONE sanctioned exception to "the same command is described
+    # the same way everywhere", and it earns it on the rule's own terms: the
+    # rule exists so a reader learns one meaning per command, and here the
+    # behaviour really is two. Everything else still comes from one entry.
     "/modify":    "change a run before launch",
+    "/modify@launched": "build a revised copy; this run is untouched",
+    # A THIRD WORDING, AND THE LAST ONE. It is used in exactly one place: an
+    # Actions block where /relaunch is also offered. There, "build a revised
+    # copy; this run is untouched" describes what BOTH verbs do, so as the
+    # label distinguishing them it says nothing -- and the thing a person is
+    # actually choosing between is whose change goes in, the diagnosis's or
+    # theirs. The copy is still made and the original is still untouched;
+    # /relaunch's own line says so one row above, which is why this one can
+    # spend its width on the distinction instead of repeating it.
+    "/modify@else": "make different changes",
+    # PREPARES, NEVER SUBMITS, and the description has to carry that or the
+    # verb reads as "run it again". What it produces is another run waiting at
+    # the gate; see cli._cmd_relaunch.
+    #
+    # PROPOSED, not "this". The diagnosis may say in the same breath that the
+    # value it names is not established -- 35:00:00 was the pipeline's own
+    # pre-CIT walltime, not a duration anything measured -- and a row reading
+    # "with this fix" endorses it on the one screen where the caveat is still
+    # two lines away. The word costs nothing and is the honest one.
+    "/relaunch":  "prepare a retry with the proposed fix",
     "/approve":   "launch a run",
     "/reject":    "discard a run",
     # Bringing something in, and looking things up.
@@ -2280,6 +2491,18 @@ def action_text(verb):
     return _ACTION_TEXT.get(verb, "")
 
 
+# Statuses for which /modify forks rather than edits. Read off the record's
+# own status, never guessed from the screen it is being drawn on.
+_LAUNCHED = frozenset(("submitted", "submitting", "submit_failed",
+                       "submit_unknown", "gone", "abandoned"))
+
+
+def modify_text(status):
+    """The right description of /modify for a run in `status`."""
+    return _ACTION_TEXT["/modify@launched" if status in _LAUNCHED
+                        else "/modify"]
+
+
 def _action_rows(group):
     """[(command, argument, description)] with the canonical text filled in.
 
@@ -2293,7 +2516,8 @@ def _action_rows(group):
         verb = row[0]
         arg = row[1] if len(row) > 1 else ""
         note = row[2] if len(row) > 2 else _ACTION_TEXT.get(verb, "")
-        rows.append((verb, str(arg or ""), note))
+        # `/modify@launched` is a lookup key, not something anybody types.
+        rows.append((verb.split("@")[0], str(arg or ""), note))
     return rows
 
 
@@ -2693,15 +2917,15 @@ _VERBS = {
     # was the alternative and was rejected -- that verdict can be three weeks
     # old, and this table is about what a run can SUPPORT, not about what
     # probably happened to it.
-    "submitted": [("/check",), ("/modify",)],
+    "submitted": [("/check",), ("/modify@launched",)],
     # A run that submitted real jobs and left no manifest. NOT the same list as
     # `submitted`, because two of those three verbs cannot do anything here:
     # /check and /diagnose both need job ids to ask the scheduler about, and
     # there are none. /track is what recovers one; /modify builds a fresh run
     # from the command still on the record. See runs.jobs_are_unreachable.
-    _UNREACHABLE: [("/track",), ("/modify",), ("/history",)],
-    "abandoned": [("/modify",)],
-    "gone": [("/modify",), ("/history",)],
+    _UNREACHABLE: [("/track",), ("/modify@launched",), ("/history",)],
+    "abandoned": [("/modify@launched",)],
+    "gone": [("/modify@launched",), ("/history",)],
 }
 
 
@@ -2718,6 +2942,7 @@ def _verbs_for(status, record=None):
     return _VERBS.get(status, ())
 
 
+@canonical
 def run_view(proposal, name, status, resources="", blockers=(), record=None):
     """/view -- what a run IS, drawn for any status rather than only at the gate.
 
@@ -2736,6 +2961,16 @@ def run_view(proposal, name, status, resources="", blockers=(), record=None):
     print()
     print(f"  {DIM}▌{RESET} {BOLD}{name}{RESET}  {DIM}·{RESET}  {DIM}{status}"
           f"{RESET}")
+    # WHERE IT CAME FROM, on the screen somebody reads before approving it. A
+    # revision's parent is otherwise only visible in the line /relaunch or
+    # /modify printed once and in /history, and "which run is this a retry of"
+    # is exactly the question /view exists to answer. Same table as
+    # history_detail, so the two cannot drift apart.
+    parent = str((record or {}).get("derived_from") or "")
+    if parent:
+        why = _DERIVED.get((record or {}).get("derived_reason"), "")
+        print(f"  {DIM}▌{RESET}   {GREY}{why or 'derived from'} "
+              f"{DIM}·{RESET}  {GREY}{parent}{RESET}")
     print()
     print(f"      {BOLD}{WHITE}{proposal.get('command', '?')}{RESET}")
     missing = proposal.get("missing") or ()
@@ -2867,7 +3102,8 @@ def post_approve(name, record):
             print(f"{gut}   {DIM}Slurm has no jobs from this attempt \u2014 it "
                   f"is safe to try again.{RESET}")
             print(gut)
-            actions([("/modify", name), ("/reject", name)], gutter=gut)
+            actions([("/modify@launched", name), ("/reject", name)],
+                    gutter=gut)
         else:
             # THE DEFAULT, AND /check COMES FIRST. A failed submission is not a
             # failed run: what broke is the launch, so there are no pipeline
@@ -2879,7 +3115,8 @@ def post_approve(name, record):
                   f"resubmitting \u2014 approving again is how a pipeline gets "
                   f"run twice.{RESET}")
             print(gut)
-            actions([("/check", name), ("/modify", name)], gutter=gut)
+            actions([("/check", name), ("/modify@launched", name)],
+                    gutter=gut)
             print(gut)
             print(f"{gut}   {DIM}squeue -u $USER says the same thing from "
                   f"outside this tool{RESET}")
@@ -3167,6 +3404,7 @@ def _cause_block(cause, gutter):
                    gutter)
 
 
+@canonical
 def run_status(name, status):
     """/check <name> -- what the scheduler says this run is doing.
 
@@ -3995,6 +4233,7 @@ _LIST_ACTIONS = (
 )
 
 
+@canonical
 def run_list(rows):
     """/list -- every run still worth acting on, one row each, tagged.
 
@@ -4175,6 +4414,7 @@ def _last_seen(record):
     return f"{verdict} when last checked{f' {at}' if at else ''}"
 
 
+@canonical
 def history(records, limit=None):
     """/history -- the archive of run records, newest first.
 
@@ -4250,6 +4490,16 @@ def history(records, limit=None):
     print()
 
 
+# Why a run was derived from another, said in English. The stored value is a
+# constant (see runs.Registry.derive) so that this table is the only place the
+# wording lives and an old record cannot carry a phrase that has since changed.
+_DERIVED = {
+    "relaunch_after_diagnosis": "a retry prepared from its diagnosis",
+    "fork": "a copy made with changes",
+}
+
+
+@canonical
 def history_detail(record):
     """One archived run, in full: what it was, and what was found out about it.
 
@@ -4272,14 +4522,26 @@ def history_detail(record):
     print()
     print(f"  {DIM}\u258c{RESET} {BOLD}{name}{RESET}  {DIM}\u00b7{RESET}  {colour}{word}{RESET}")
     print(f"  {DIM}\u258c{RESET}")
+    # WHERE IT CAME FROM, when it came from somewhere. A revision is a run in
+    # its own right -- own name, own thread, own gate -- and the cost of that
+    # separation is that nothing on its record says what it is a revision OF.
+    # /history is the screen that question is asked on, months later, so the
+    # link is printed here rather than left to be reconstructed from two
+    # timestamps and a similar command. `derived_reason` is a stored constant
+    # (relaunch.REASON, or "fork"), never prose, so it reads the same every
+    # time.
+    derived = str(record.get("derived_from") or "")
+    lineage = (f"{derived}  {DIM}·  {_DERIVED.get(record.get('derived_reason'), '')}"
+               if derived else "")
     for label, value in (("pipeline", _what(record)),
                          ("recorded", when),
                          ("origin", origin),
+                         ("derived from", lineage),
                          ("last seen", _last_seen(record)),
                          ("workdir", _tilde(record.get("workdir") or "")),
                          ("job list", os.path.basename(record.get("job_list") or ""))):
         if value:
-            print(f"  {DIM}\u258c{RESET}   {GREY}{label:<10}{RESET}{value}")
+            print(f"  {DIM}\u258c{RESET}   {GREY}{label:<14}{RESET}{value}{RESET}")
 
     notes = record.get("notes") or []
     if notes:
@@ -4297,6 +4559,7 @@ def history_detail(record):
 JOB_NAME_W = 38
 
 
+@canonical
 def jobs(name, job_list, only_failed=False):
     """Every job in a run, as a table grouped by step.
 
@@ -4377,10 +4640,42 @@ def triage(name, report):
     for f in report["findings"]:
         print(f"  {RED}\u258c{RESET} {WHITE}{f['step']}{RESET}"
               f"  {DIM}\u00d7{f['count']}{RESET}  {RED}{(f['state'] or '?').lower()}{RESET}")
+        # THE JOB, NOT JUST THE STEP. A paired tumour/normal run has two jobs
+        # per step whose names differ by one character, and naming only the
+        # step leaves the reader -- and anything reading this screen -- to
+        # guess which one. resolve() has always known; this panel did not say.
+        if f.get("job"):
+            print(f"  {RED}\u258c{RESET}   {DIM}{'job':<13}{RESET}{WHITE}{f['job']}{RESET}"
+                  + (f"{DIM}  \u00b7  {f['job_id']}{RESET}" if f.get("job_id") else ""))
         if f.get("maxrss"):
             print(f"  {RED}\u258c{RESET}   {DIM}{'peak memory':<13}{f['maxrss']}{RESET}")
-        if f.get("exit_code"):
-            print(f"  {RED}\u258c{RESET}   {DIM}{'exit code':<13}{f['exit_code']}{RESET}")
+        # ONLY FOR A JOB THAT ACTUALLY RAN. A CANCELLED job never started, so
+        # its recorded 0:0 is not its exit status -- it is the absence of one,
+        # printed identically on every cancelled row, which is thirty-two
+        # copies of a number that means nothing about any of them.
+        #
+        # EXIT CODE 0:0 BESIDE `timeout` READS AS A CONTRADICTION, and it is
+        # not one. Slurm records the step's own exit status; a job killed by
+        # the walltime enforcer never returned a failing code of its own, so
+        # TIMEOUT with ExitCode 0:0 is exactly what sacct reports and is not
+        # evidence that nothing went wrong. The STATE is the authoritative
+        # signal here -- runs.BROKE_STATES is keyed on it and nothing in this
+        # application infers failure from an exit code.
+        #
+        # So a 0:0 is annotated rather than printed bare next to a state that
+        # says the job died. A non-zero code is a real second fact and is
+        # printed plainly.
+        # `is not False`, matching the log branch below: a caller that does
+        # not say whether the job ran has not said it DIDN'T, and dropping a
+        # real exit code on that silence would lose evidence.
+        code = f.get("exit_code")
+        ran = f.get("ran") is not False
+        if code and ran and str(code).strip() not in ("0:0", "0"):
+            print(f"  {RED}\u258c{RESET}   {DIM}{'exit code':<13}{code}{RESET}")
+        elif code and ran:
+            print(f"  {RED}\u258c{RESET}   {DIM}{'exit code':<13}{code}"
+                  f"  \u2014 nothing the job returned; the state above is "
+                  f"what stopped it{RESET}")
         # WHY THERE IS NO LOG, WHEN THERE IS NO LOG. A cancelled job never
         # started and so never wrote one; that is not the same as a file that
         # should be there and is missing, and printing "not found" for both sent
@@ -4399,7 +4694,8 @@ def triage(name, report):
     print()
 
 
-def diagnosis(name, parsed, logs=()):
+@canonical
+def diagnosis(name, parsed, logs=(), applicable=False):
     """What /diagnose concluded, drawn rather than dumped.
 
     The old ending printed the model's markdown straight to the terminal:
@@ -4418,6 +4714,13 @@ def diagnosis(name, parsed, logs=()):
     `logs` are the log files the evidence came from, printed in full. The point
     is not that anybody reads them here; it is that "go and look yourself" stops
     being an invitation without an address.
+
+    `applicable` says whether the OVERRIDE this answer proposes is one the
+    program can apply on its own -- override.applicable()'s verdict, decided by
+    the caller and never re-derived here. It selects the verbs at the bottom.
+    Passed in rather than computed from `parsed` because "there is an override
+    section" and "there is a change this can make" are different claims, and
+    the screen must offer the command only for the second.
     """
     if not parsed.get("shaped"):
         print()
@@ -4426,13 +4729,30 @@ def diagnosis(name, parsed, logs=()):
         print()
         return
 
-    confidence = parsed.get("confidence")
-    tint = {"certain": WHITE, "likely": AMBER, "unclear": RED}.get(confidence, DIM)
-
+    # NO GLOBAL CONFIDENCE BADGE, and its removal is the point rather than a
+    # simplification.
+    #
+    # It printed ONE word over the whole answer -- "likely" -- above a screen
+    # whose first two rows are sacct facts. On 2026-08-05 that read as
+    # "probably gatk_sam_to_fastq.tumorPair_COLO829T probably timed out",
+    # when the job, the id, the state, the limit and the overrun are all
+    # certain and only the remedy is not. A label that spans claims of
+    # different standing takes its value from the weakest one and defames the
+    # rest; there is no single number that is true of a screen carrying both
+    # a scheduler record and a suggested walltime.
+    #
+    # CONFIDENCE BELONGS TO CLAIMS. So it is expressed where the doubt
+    # actually is -- the `uncertain` rows beneath the fix, one line per thing
+    # this run does not establish, in plain language. Three named unknowns
+    # read as three named unknowns; one adjective over everything reads as
+    # hedging, and teaches a reader to discount the facts too.
+    #
+    # `confidence` is still parsed (see diagnosis._HEADINGS) so an older
+    # stored note, or a model that emits the retired heading out of habit,
+    # lands somewhere harmless instead of spilling into another section.
     print()
     print(f"  {RED}▌{RESET} {BOLD}{name}{RESET}  {DIM}·{RESET}  "
-          f"{DIM}diagnosis{RESET}"
-          + (f"   {tint}{confidence}{RESET}" if confidence else ""))
+          f"{DIM}diagnosis{RESET}")
     print(f"  {RED}▌{RESET}")
     for label, key in (("died", "manner"), ("because", "cause")):
         if parsed.get(key):
@@ -4455,25 +4775,43 @@ def diagnosis(name, parsed, logs=()):
         print(f"  {RED}▌{RESET}   {'':<{LABEL_W}}{WHITE}[{section}]{RESET}")
         for key, value in keys.items():
             print(f"  {RED}▌{RESET}   {'':<{LABEL_W}}{DIM}{key} = {RESET}{value}")
-    if parsed.get("relaunch"):
+    if parsed.get("uncertain"):
         print(f"  {RED}▌{RESET}")
-        # PRINTED, NOT ANNOTATED. There used to be a second line here saying
-        # "the whole range -- GenPipes skips steps that already have output",
-        # under whatever range came back. The claim is true of GenPipes and not
-        # necessarily true of THIS answer: RELAUNCH_RULE asks the model for the
-        # full range but cannot make it comply, so a narrowed range was
-        # captioned with a sentence asserting it was not narrowed. The rule
-        # belongs where it already is -- in the prompt and in genpipes.md --
-        # rather than in a caption the renderer cannot verify.
-        _labelled(f"  {RED}▌{RESET}", "resubmit", parsed["relaunch"])
+        for i, item in enumerate(parsed["uncertain"]):
+            _labelled(f"  {RED}▌{RESET}", "not established" if i == 0 else "",
+                      item, style=AMBER)
+    # NO `resubmit` ROW. It printed a raw `-s 1-23` on the screen whose job is
+    # to explain a failure, which put GenPipes command syntax in front of
+    # somebody two rows below a sentence about a walltime -- and then left them
+    # to assemble the command around it. The range has not gone anywhere: it is
+    # established deterministically from the generated step lists (see
+    # relaunch.scope, and slots.step_range under it), carried as internal state,
+    # and rendered where command syntax belongs -- in the `-s` row of the mirror
+    # /view and the gate draw for the revision /relaunch prepares.
+    #
+    # `relaunch` is still PARSED, and still what the model is asked for. It is
+    # a cross-check on the range this computes rather than the source of it,
+    # and a source that can be wrong has no business being the one on screen.
     gut = f"  {RED}▌{RESET}"
     print(gut)
-    # /modify only where there IS a fix to apply. What it does to this run --
-    # write the recommended override and gate a fresh copy -- is already stated
-    # by the `fix` and `resubmit` rows a few lines above, which is where a
-    # situation belongs; the description here teaches the command.
-    rows = ([("/modify", name)] if parsed.get("override") else []) + \
-           [("/jobs", name)]
+    # WHICH VERBS, AND WHY THE FIRST ONE IS CONDITIONAL.
+    #
+    # /relaunch appears only where the diagnosis produced a fix this program
+    # can actually apply -- `applicable` is the caller's answer from
+    # override.applicable(), never merely "the run failed". Offering it on a
+    # failure whose fix is "the readset points at a file that is not there"
+    # would propose an operation that has nothing to perform.
+    #
+    # /modify is always here, and reads differently depending on whether it has
+    # company. Beside /relaunch it is the manual alternative -- the same fork,
+    # with changes somebody chooses -- and says so. Alone, it is the only next
+    # step on the screen, and then it has to carry the fact that a launched run
+    # is copied rather than edited. See _ACTION_TEXT.
+    #
+    # /jobs stays last either way: it is evidence, not a remedy.
+    rows = ([("/relaunch", name)] if applicable else []) + \
+           [("/modify@else" if applicable else "/modify@launched", name),
+            ("/jobs", name)]
     actions(rows, gutter=gut)
     print()
 
@@ -4666,6 +5004,7 @@ def pending(records, since=None, seen=""):
     print()
 
 
+@canonical
 def where(paths):
     """/where -- the directories that decide where everything lands.
 
@@ -4712,6 +5051,7 @@ ATTENTION = "NEEDS ATTENTION"
 FINISHED = "FINISHED"
 
 
+@canonical
 def status_overview(groups):
     """/check all -- every registered run, grouped by what it needs from you.
 
@@ -4954,6 +5294,91 @@ def forked(original, new, standing="held"):
     print(f"  {DIM}▌{RESET}   {DIM}"
           f"{'both are waiting' if waiting else f'{new} is waiting for you'}"
           f"  ·  /list{RESET}")
+    print()
+
+
+@canonical
+def prepared_retry(original, new, standing, applied=(), scope="",
+                   scope_from="", uncertain=(), skipped=()):
+    """What /relaunch built, and what it is still not sure about.
+
+    Drawn INSTEAD OF forked() on the relaunch path, and the difference is not
+    decoration. forked() answers one question -- which run is which -- and that
+    is the whole of what a plain fork has to say, because a person who filled
+    the panel in already knows what they changed. Here nobody filled anything
+    in: the change came out of a diagnosis, deterministic code applied it, and
+    this is the first and last screen where what was applied can be read before
+    an allocation is spent on it.
+
+    So the rows are in the order the questions arrive:
+
+      original / revision   which run is which, original first, for forked()'s
+                            reason -- the point of a retry is that the failed
+                            run survives to be compared against.
+      applied               the change itself, `was -> now` where a `was` is
+                            known. This is the one thing nobody typed and
+                            therefore the one thing that must be legible.
+      relaunch              the step range, in words rather than as a flag. The
+                            syntax belongs on the command, which /view and the
+                            gate both print; what this row is for is that
+                            somebody sees the retry covers the WHOLE protocol
+                            and not just the step that broke.
+      not established       genpipes.md's rule, carried to the last screen
+                            before /approve. A walltime raised to a value
+                            nothing proved sufficient is exactly as unproven
+                            here as it was on the diagnosis, and this is where
+                            somebody is about to act on it. AMBER, like the
+                            same rows in diagnosis().
+      skipped               settings the diagnosis proposed that were NOT
+                            applied. Printed because a smaller file than the
+                            fix described is the kind of difference nobody
+                            notices, and silence about it would make this
+                            screen a claim that the whole fix landed.
+      unchanged             the original, in /list's own words for where it
+                            now stands. The reassurance this whole flow is
+                            arranged around, so it is stated rather than
+                            implied by the absence of bad news.
+
+    NO ACTIONS BLOCK. The gate has already drawn one for this revision by the
+    time this prints -- /relaunch ends at the ordinary gate, which is where
+    /approve, /modify and /reject belong and where the command itself is on
+    screen to be read. A second set of the same three verbs under a summary
+    would put the authorisation question on two screens, and the one that is
+    not the gate is the one somebody would answer.
+    """
+    gut = f"  {DIM}▌{RESET}"
+    print()
+    print(f"{gut} {BOLD}{new}{RESET}  {DIM}·{RESET}  "
+          f"{DIM}prepared retry of {original}{RESET}")
+    print(gut)
+    for i, (step, key, was, now) in enumerate(applied or ()):
+        _labelled(gut, "applied" if i == 0 else "", f"{step}.{key}",
+                  style=WHITE)
+        # `was -> now` only where a `was` was actually observed. An arrow with
+        # nothing on its left would invent a baseline, and the baseline here is
+        # a reading of the run's own config trace that may not exist -- see
+        # agent._trace_values.
+        arrow = f"{DIM}{was} → {RESET}{now}" if was else str(now)
+        print(f"{gut}   {'':<{LABEL_W}}{arrow}{RESET}")
+    if scope:
+        print(gut)
+        _labelled(gut, "relaunch", scope, style=DIM)
+    elif scope_from:
+        print(gut)
+        _labelled(gut, "relaunch", scope_from, style=DIM)
+    if uncertain:
+        print(gut)
+        for i, item in enumerate(uncertain):
+            _labelled(gut, "not established" if i == 0 else "", item,
+                      style=AMBER)
+    if skipped:
+        print(gut)
+        for i, (where, why) in enumerate(skipped):
+            _labelled(gut, "not applied" if i == 0 else "",
+                      f"{where} — {why}", style=AMBER)
+    print(gut)
+    print(f"{gut}   {DIM}{original} is unchanged — {standing}{RESET}")
+    print(f"{gut}   {DIM}nothing has been submitted{RESET}")
     print()
 
 

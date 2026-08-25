@@ -312,3 +312,53 @@ def describe(sections):
         for key, value in sections[step].items():
             out.append((step, _LABEL.get(key, key), value))
     return out
+
+
+def applicable(sections):
+    """The part of a proposed override this program knows how to WRITE, and
+    what it left out.
+
+    Returns `(applicable, refusals)` -- a `{section: {key: value}}` in the same
+    shape merge() and write() take, and a list of `("section.key", why)` for
+    every setting that did not survive.
+
+    WHY THIS IS SEPARATE FROM validate(). validate() answers "is this a
+    plausible value for this key", which is the question a person typing into
+    the resources row is asking. This answers a different one: is the whole
+    fragment something deterministic code can apply on its own, with nobody
+    reading it first. /relaunch is the caller, and it prepares a retry without
+    asking anybody to confirm the ini -- so a fragment it half-understands must
+    produce a refusal, never a partial file.
+
+    THE KEY MUST BE ONE OF SETTINGS, and that is the conservative half. Writing
+    `[step] anything = value` into an ini is mechanically trivial; knowing that
+    the result is the change somebody meant is not, and SETTINGS is the exact
+    list of knobs this module was built around -- the ones it can validate the
+    shape of, label on a screen, and be held to. A key outside it is refused
+    rather than written blind, and the refusal is reported so the reason is on
+    screen instead of being a silently smaller file.
+
+    NOTHING HERE JUDGES THE VALUE'S MEANING. Whether 35:00:00 is enough is not
+    a question this can answer and is not asked -- see validate(). It is the
+    thing /relaunch carries forward as uncertainty instead.
+    """
+    good, refusals = {}, []
+    for step in sorted(sections or {}):
+        settings = sections[step] or {}
+        if not valid_section(step):
+            refusals.append((str(step), "not a step name"))
+            continue
+        kept = {}
+        for key, value in settings.items():
+            if key not in _LABEL:
+                refusals.append((f"{step}.{key}",
+                                 "not a cluster setting this can write"))
+                continue
+            verdict = validate(key, value)
+            if not verdict:
+                refusals.append((f"{step}.{key}", verdict.message))
+                continue
+            kept[key] = str(value).strip()
+        if kept:
+            good[step] = kept
+    return good, refusals

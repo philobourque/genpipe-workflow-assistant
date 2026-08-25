@@ -24,6 +24,7 @@ would, and everything downstream of it is the real thing.
 
 Run:  GENPIPE_FAKE=1 python tests/test_rerun_gate.py
 """
+import copy
 import os
 import pathlib
 import shutil
@@ -35,8 +36,12 @@ from harness import (Report, ScriptedLLM, execute_block, solution,
 from genpipe import cli
 from genpipe import display
 from genpipe import fakecluster
+from genpipe import gate
 from genpipe import modify
+from genpipe import override
+from genpipe import relaunch
 from genpipe import runs as runs_store
+from genpipe import slots
 from genpipe.cli import build_agent
 
 
@@ -296,6 +301,189 @@ def main():
                 agent.resume(name_g, approved=True).get("submitted"), False)
         r.equal("and nothing was submitted",
                 agent.registry.get(name_g)["status"], runs_store.HELD)
+
+        # ============================================================== #
+        r.section("/relaunch: a diagnosis becomes a prepared retry")
+        # END TO END, through the real graph, WITH NOTHING STUBBED -- because
+        # there is no longer a model in this path to stub. The script below is
+        # EMPTY on purpose: ScriptedLLM raises IndexError the moment anything
+        # asks it for a reply, so a single inference step anywhere between
+        # /relaunch and the gate fails this suite loudly rather than quietly
+        # costing 108 seconds. agent.llm.calls is asserted as well, so a
+        # future llm that answers without being scripted cannot hide either.
+        #
+        # The suite must not be able to pass because something recognised a
+        # walltime. The remediation is put on the record as DATA, the way
+        # /diagnose stores it, and the assertions are about what deterministic
+        # code did with it.
+        launched = agent.registry.get(name)
+        agent.registry.remember_remediation(
+            name, {"picard_sam_to_fastq": {"cluster_walltime": "35:00:00"}},
+            ["whether 35:00:00 is sufficient for this input"],
+            before={"picard_sam_to_fastq": {"cluster_walltime": "0:10:00"}})
+        frozen = copy.deepcopy(agent.registry.get(name))
+
+        # The name /relaunch will allocate is not assumed: earlier sections of
+        # this suite have already consumed several suffixes in this workdir, so
+        # the test asks the same allocator the command will ask.
+        revised = agent.registry.unique_name(name)
+        retry_ini = os.path.join(work, f"{revised}.override.ini")
+        # The range is NOT written down here. It is whatever relaunch.scope
+        # computed from the generated 6.1.1 facts. A literal would let the
+        # suite pass while the facts said something else.
+        full = relaunch.scope(launched)[0]
+        agent.llm = ScriptedLLM([])
+        cli._cmd_relaunch(agent, [name])
+        r.equal("the retry was prepared without asking a model anything",
+                agent.llm.calls, 0)
+
+        revision = agent.registry.get(revised)
+        r.truthy("a revision was created under an allocated name", revision)
+        r.check("under a name the original did not have", revised != name)
+        r.equal("waiting for approval, not submitted",
+                revision["status"], runs_store.HELD)
+        r.equal("with no job list of its own", revision.get("job_list"), None)
+        r.equal("its lineage points at the original",
+                revision.get("derived_from"), name)
+        r.equal("and says why it exists",
+                revision.get("derived_reason"), relaunch.REASON)
+
+        r.check("an override ini was written under the REVISION's name",
+                os.path.exists(retry_ini), os.listdir(work))
+        r.equal("carrying exactly the diagnosed setting",
+                override.read(retry_ini),
+                {"picard_sam_to_fastq": {"cluster_walltime": "35:00:00"}})
+        r.check("and no ini was written under the original's name",
+                not os.path.exists(os.path.join(work,
+                                                f"{name}.override.ini")))
+
+        stack = revision["proposal"]["slots"]["inis"]
+        r.check("the revision's -c stack carries the override",
+                any(os.path.basename(str(i)) == os.path.basename(retry_ini)
+                    for i in stack), stack)
+        r.equal("as its LAST entry, where an override has to be",
+                os.path.basename(str(stack[-1])), os.path.basename(retry_ini))
+        r.equal("and the deterministic full step range is on the command",
+                revision["proposal"]["slots"]["steps"], full)
+        r.equal("which came from the generated facts, not the model",
+                full, slots.step_range("rnaseq", "stringtie"))
+        r.check("and it is not the range the original ran",
+                full != frozen["proposal"]["slots"].get("steps"))
+
+        r.equal("the command is the SOURCE's, not a new one",
+                gate.flag_value(revision["proposal"]["generated"], "-r"),
+                gate.flag_value(frozen["proposal"]["generated"], "-r"))
+        r.equal("with every other flag the source wrote left alone",
+                gate.flag_value(revision["proposal"]["generated"], "-d"),
+                gate.flag_value(frozen["proposal"]["generated"], "-d"))
+        r.check("and a script for /approve to run, generated for real",
+                os.path.exists(os.path.join(work, "cmd.sh")), os.listdir(work))
+
+        r.equal("the declared step change was verified as applied",
+                (revision.get("changed") or {}).get("steps"), modify.APPLIED)
+        r.equal("and so was the override's arrival on -c",
+                (revision.get("changed") or {}).get("config"), modify.APPLIED)
+
+        r.section("/relaunch changed nothing about the run it copied")
+        after = agent.registry.get(name)
+        for field in ("status", "job_list", "submitted_at", "workdir",
+                      "thread_id"):
+            r.equal(f"the original's {field} is untouched",
+                    after.get(field), frozen.get(field))
+        r.equal("its generated command is byte-identical",
+                after["proposal"]["generated"], frozen["proposal"]["generated"])
+        r.equal("its -c stack is byte-identical",
+                after["proposal"]["slots"]["inis"],
+                frozen["proposal"]["slots"]["inis"])
+        r.equal("its step range is byte-identical",
+                after["proposal"]["slots"].get("steps"),
+                frozen["proposal"]["slots"].get("steps"))
+        r.equal("and its diagnosis survives for a second retry",
+                runs_store.remediation_of(after)["override"],
+                runs_store.remediation_of(frozen)["override"])
+
+        r.section("the revision still has to be approved like anything else")
+        r.equal("nothing was submitted by preparing it",
+                agent.registry.get(revised)["status"], runs_store.HELD)
+        status = agent.resume(revised, approved=True)
+        r.check("and a typed approval goes through the ordinary gate",
+                status.get("submitted") is not False, status)
+        r.check("only then does it leave the held state",
+                agent.registry.get(revised)["status"] != runs_store.HELD)
+
+        r.section("a second /relaunch does not overwrite the first")
+        # ALSO THE REGRESSION FOR THE FLAG THAT SILENCED THE GATE. This runs
+        # after the approval above, and submission_gate() ends the turn without
+        # interrupting while `_submitted_this_turn` stands. That flag is
+        # cleared by _drive(), which neither regate() nor hold_prepared() goes
+        # through -- so before agent._raise_gate cleared it, every gate raised
+        # after any approval in the same session parked nothing, said nothing,
+        # and left a record behind claiming to be held.
+        second = agent.registry.unique_name(name)
+        second_ini = os.path.join(work, f"{second}.override.ini")
+        agent.llm = ScriptedLLM([])
+        cli._cmd_relaunch(agent, [name])
+        r.check("the next name is allocated instead", second != revised)
+        r.truthy("and that name now holds a run", agent.registry.get(second))
+        r.truthy("with a real decision behind it, not just the word held",
+                 agent.gate_interrupt(agent._config(
+                     agent.registry.get(second)["thread_id"])))
+        r.equal("recorded in the run's own directory, where /approve will "
+                "re-run its generation",
+                agent.registry.get(second)["workdir"], work)
+        r.check("with its own override ini, not the first one's",
+                os.path.exists(second_ini) and second_ini != retry_ini)
+        r.equal("and the first revision is still there and still itself",
+                agent.registry.get(revised)["proposal"]["slots"]["steps"], full)
+
+        r.section("/modify on a prepared revision still reaches the model")
+        # THE ONE THING THE DETERMINISTIC PATH COULD HAVE BROKEN. A revision
+        # built without a model has no conversation behind it, and /modify's
+        # in-place rework says "change -s from X to Y" and trusts the thread to
+        # still have the command in front of it. agent.prepared_transcript is
+        # what puts it there; this is the check that it really is readable by
+        # the same parser every other reader uses.
+        # Done on the SECOND revision, which is still held: the first has been
+        # approved by now, and /modify on a launched run forks and asks for a
+        # name rather than reworking in place.
+        narrowed = GEN_WITHOUT.replace(" -s 1-5", " -s 1-4").replace(
+            " -r readset.tsv", f" {second_ini} -r readset.tsv")
+        agent.llm = ScriptedLLM([
+            execute_block(f"#!BASH\n{narrowed}"),
+            execute_block('propose_submission("cmd.sh", changes=[',
+                          '    {"field": "steps", "operation": "set",',
+                          '     "value": "1-4"}])'),
+            solution("Narrowed it."),
+        ])
+        cli._cmd_modify(agent, [second, "run only steps 1-4"])
+        r.check("the model was asked", agent.llm.calls > 0)
+        asked = "\n".join(agent.llm.seen)
+        r.contains("and it was given the command it is changing", asked,
+                   "genpipes rnaseq -t stringtie")
+        r.contains("including the override the retry put on -c", asked,
+                   os.path.basename(second_ini))
+        r.contains("and the change that was asked for", asked, "1-4")
+        r.equal("so the rework landed on the same run, not a new one",
+                agent.registry.get(second)["proposal"]["slots"]["steps"], "1-4")
+        r.equal("and it is still the retry it was",
+                agent.registry.get(second).get("derived_reason"),
+                relaunch.REASON)
+
+        r.section("a generation that fails is not called prepared")
+        # The deterministic path's version of the truth-telling rule: the
+        # command is written here, so the way it can go wrong is GenPipes
+        # refusing it. Nothing may be held on the strength of a generation that
+        # did not produce a script -- an approval spent on one can only fail.
+        third = agent.registry.unique_name(name)
+        agent.llm = ScriptedLLM([])
+        held = agent.hold_prepared(third, "#!BASH\nexit 3", "cmd.sh", work,
+                                   f"{third}::thread")
+        r.equal("a refused generation holds nothing", held, None)
+        r.equal("no run was created under the name it would have used",
+                agent.registry.get(third), None)
+        r.equal("and no model was asked to rescue it", agent.llm.calls, 0)
+        r.equal("the original is still exactly what it was",
+                agent.registry.get(name)["status"], frozen["status"])
 
         # ============================================================== #
         r.section("modifying a launched run still leaves the original alone")

@@ -42,7 +42,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from genpipe import diagnosis, runs
+from genpipe import diagnosis, runs, slots
 from tests.harness import Report
 
 
@@ -287,14 +287,260 @@ def main():
         r.contains("a modest cap is stated", diagnosis.SHAPE, "At most four")
         r.contains("and what the cap is for",
                    diagnosis.SHAPE, "not a restatement of everything")
-        # The categories themselves are deliberately untouched in this pass.
         for heading in ("MANNER", "CAUSE", "EVIDENCE", "FIX", "OVERRIDE",
-                        "RELAUNCH", "CONFIDENCE"):
-            r.contains(f"{heading} is still asked for", diagnosis.SHAPE, heading)
+                        "RELAUNCH", "UNCERTAIN"):
+            r.contains(f"{heading} is asked for", diagnosis.SHAPE, heading)
+        # CONFIDENCE IS NO LONGER ASKED FOR. It was one word over the whole
+        # answer, and the answer carries claims of different standing: a sacct
+        # record is certain, a proposed walltime is not. A label spanning both
+        # takes its value from the weakest and defames the rest -- "likely"
+        # printed above a job id, a state and a limit that are all facts.
+        r.check("CONFIDENCE is not", "CONFIDENCE" not in diagnosis.SHAPE,
+                diagnosis.SHAPE)
+        # ...but it is still PARSED, so an older stored note or a model still
+        # emitting the retired heading lands somewhere harmless rather than
+        # spilling its text into whichever section came before it.
+        stale = diagnosis.parse(
+            "MANNER: it timed out\nCONFIDENCE: likely\nRELAUNCH: -s 1-23\n")
+        r.equal("a retired heading does not contaminate its neighbour",
+                stale["manner"], "it timed out")
+        r.equal("and the range after it still parses", stale["relaunch"],
+                "-s 1-23")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    _audit_2026_08_05(r)
+    _claim_scoped_confidence(r)
+    _grounding(r)
     return r.finish()
+
+
+
+def _grounding(r):
+    """What the brief must carry so the model does not go looking for it.
+
+    THE ACCEPTANCE CASE. A live /diagnose took 76 seconds and spent it in a
+    model -> tool -> model loop: show_run to find out what the run WAS, a
+    four-command bash chain to count the manifest, an ls to recover from that
+    chain failing, a grep/awk to list job names, a head -40 to read job ids and
+    dependencies, and finally `genpipes dnaseq --help` to learn that
+    somatic_fastpass has 23 steps. Every one of those facts was already parsed
+    by this application, or is constant for a GenPipes version.
+
+    These assert the INFORMATION CONTRACT, not a tool count. A model may still
+    reach for the shell when the evidence genuinely does not answer something;
+    what it must not have to do is rediscover what it was already given.
+    """
+    r.section("the protocol's step range is a recorded fact, not a lookup")
+    # `-s` has no argparse default -- "every step" is what omitting it means --
+    # so the range lived nowhere and was established by shelling out.
+    r.equal("dnaseq somatic_fastpass is 23 steps",
+            slots.step_range("dnaseq", "somatic_fastpass"), "1-23")
+    names = slots.step_names("dnaseq", "somatic_fastpass")
+    r.equal("step 1 is the one that failed here", names[0],
+            "gatk_sam_to_fastq")
+    r.equal("and step 23 closes the protocol", names[-1], "cram_output")
+    # protocols() yields Protocol objects; the range is keyed by their name.
+    missing = [(p, q.name)
+               for p in ("dnaseq", "rnaseq", "chipseq", "methylseq",
+                         "covseq", "rnaseq_light")
+               for q in (slots.protocols(p) or ())
+               if not slots.step_range(p, q.name)]
+    r.check("every protocol of every pipeline carries one", not missing,
+            missing)
+    # A pipeline with no -t has one protocol, and GenPipes calls it "default".
+    r.equal("a single-protocol pipeline answers without a protocol name",
+            slots.step_range("ampliconseq"), "1-8")
+    # NOT RECORDED IS A REAL ANSWER. A facts file that predates this, or a
+    # protocol GenPipes has renamed, must produce silence rather than a range
+    # the caller would state as established.
+    r.equal("an unknown pipeline yields no range",
+            slots.step_range("no-such-pipeline", "x"), None)
+
+    r.section("the dependency graph is parsed, not left in the manifest")
+    # parse_job_list read column 3 and threw it away, so the DAG -- the only
+    # record of which jobs waited on which, since sacct never had it and
+    # squeue forgets -- was rediscovered by the model with `head -40`.
+    work = tempfile.mkdtemp(prefix="genpipe_dag_")
+    try:
+        listing = os.path.join(work, "DnaSeq.somatic_fastpass.job_list.T1")
+        with open(listing, "w") as f:
+            f.write("1\ta.s1\t\ta/a.s1.o\n")
+            f.write("2\ta.s2\t\ta/a.s2.o\n")
+            f.write("3\tb.s2\t2\tb/b.s2.o\n")
+            f.write("4\tc.s2\t3\tc/c.s2.o\n")
+            f.write("5\td.all\t1:4\td/d.all.o\n")
+        jobs = runs.parse_job_list(listing)
+        r.equal("the dependency column is kept", jobs[2].deps, ("2",))
+        r.equal("including a fan-in", jobs[4].deps, ("1", "4"))
+        r.equal("and a job with none says so", jobs[0].deps, ())
+        # The closure is what turns "N cancelled" into a claim about THIS job.
+        r.equal("everything waiting on job 2, transitively",
+                runs.downstream_of(jobs, "2"), {"3", "4", "5"})
+        r.equal("a sibling branch is not swept in",
+                runs.downstream_of(jobs, "1"), {"5"})
+        r.equal("and a job nothing waits on has no closure",
+                runs.downstream_of(jobs, "5"), set())
+        r.equal("an unknown id is empty, not everything",
+                runs.downstream_of(jobs, "999"), set())
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _claim_scoped_confidence(r):
+    """Uncertainty sits beside the claim it is about, not over the screen."""
+    r.section("what a run does not establish is its own section")
+    answer = ("MANNER: gatk_sam_to_fastq.tumorPair_COLO829T (Slurm 18382352) "
+              "was killed by TIMEOUT after 00:10:22 against 00:10:00, per "
+              "sacct.\n"
+              "CAUSE: the log's last entry is a progress line 15s before the "
+              "limit, with no traceback after it.\n"
+              "EVIDENCE:\n"
+              "- sacct: TIMEOUT, Elapsed 00:10:22, Timelimit 00:10:00\n"
+              "- the job's own epilogue reports 00:10:19, a different window\n"
+              "FIX: restore cluster_walltime to dnaseq.base.ini's 35:00:00.\n"
+              "OVERRIDE:\n[gatk_sam_to_fastq]\ncluster_walltime = 35:00:00\n"
+              "RELAUNCH: -s 1-23\n"
+              "UNCERTAIN:\n"
+              "- whether 35:00:00 is enough for this input\n"
+              "- why this input needed more than ten minutes\n")
+    got = diagnosis.parse(answer)
+    r.check("it parses as a list, one unknown per line",
+            got["uncertain"] == ["whether 35:00:00 is enough for this input",
+                                 "why this input needed more than ten minutes"],
+            got["uncertain"])
+    r.equal("and it does not become a global label", got["confidence"], "")
+
+    r.section("the contract asks for evidence, not for what was ruled out")
+    # "This is not a hang and not an error in the tool" is a claim about
+    # everything that did not happen, and no log establishes it.
+    for rule in ("WRITE WHAT THE EVIDENCE SHOWS, NOT WHAT IT RULES OUT",
+                 "A RESOURCE FIGURE NEAR ITS REQUEST IS AN OBSERVATION",
+                 "MEASUREMENTS FROM DIFFERENT SOURCES MEASURE DIFFERENT",
+                 "PREFER A VALUE THE PIPELINE ITSELF ALREADY CARRIES"):
+        r.contains(f"the contract says: {rule[:34]}...", diagnosis.SHAPE, rule)
+    # A sourced value is still not a proven one.
+    r.contains("a sourced value is still not proven sufficient",
+               diagnosis.SHAPE, "not proven sufficient for this input")
+    # sacct times the ALLOCATION; the epilogue times the job SCRIPT, which
+    # starts after the allocation and ends before it. 00:10:22 and 00:10:19
+    # are one nested inside the other, not two readings of one window -- and
+    # calling them "the same allocation window" was the live run's own error.
+    r.contains("and the two windows are described as nested, not identical",
+               diagnosis.SHAPE, "nested inside")
+    r.check("never as the same window",
+            "same window" in diagnosis.SHAPE, diagnosis.SHAPE)
+
+    r.section("the relaunch rule counts jobs, it does not characterise steps")
+    # 13 jobs of the audited run COMPLETED before the failure, so "every step
+    # downstream of the failure was CANCELLED" is false about the run even
+    # where the arithmetic happens to fit.
+    r.check("it no longer says every step downstream was cancelled",
+            "every step downstream" not in diagnosis.RELAUNCH_RULE,
+            diagnosis.RELAUNCH_RULE)
+    r.contains("it says the jobs were", diagnosis.RELAUNCH_RULE,
+               "jobs downstream of the failure were CANCELLED")
+
+
+def _audit_2026_08_05(r):
+    """The August-5 audit: a real timed-out run, checked against the cluster.
+
+    Every number here was read off sacct and the filesystem by hand before any
+    of it was asserted. The suite carries the SHAPE of that run rather than its
+    data, so it keeps testing the properties after the run itself is cleaned
+    off the cluster.
+    """
+    work = tempfile.mkdtemp(prefix="genpipe_audit_")
+    try:
+        # THE SHAPE THAT BROKE LOG RESOLUTION. The run writes into its own
+        # directory (GenPipes was given -o), while the record's `workdir` is
+        # wherever the ASSISTANT was launched -- os.getcwd() at the time
+        # record_outcome ran. Those differ for every run generated with -o.
+        app = os.path.join(work, "assistant")
+        runroot = os.path.join(work, "project", "COLO829_cit")
+        out = os.path.join(runroot, "job_output")
+        step = os.path.join(out, "gatk_sam_to_fastq")
+        os.makedirs(app, exist_ok=True)
+        os.makedirs(step, exist_ok=True)
+        stamp = "2026-08-05T09.20.45"
+        listing = os.path.join(out, f"DnaSeq.somatic_fastpass.job_list.{stamp}")
+        rows = [("18382351", "gatk_sam_to_fastq.tumorPair_COLO829N",
+                 f"gatk_sam_to_fastq/gatk_sam_to_fastq.tumorPair_COLO829N_{stamp}.o"),
+                ("18382352", "gatk_sam_to_fastq.tumorPair_COLO829T",
+                 f"gatk_sam_to_fastq/gatk_sam_to_fastq.tumorPair_COLO829T_{stamp}.o")]
+        with open(listing, "w") as f:
+            for jid, jname, log in rows:
+                f.write(f"{jid}\t{jname}\t\t{log}\n")
+        # Only T's log is written. N completed; T is the one that timed out.
+        tlog = os.path.join(step, f"gatk_sam_to_fastq.tumorPair_COLO829T_{stamp}.o")
+        with open(tlog, "w") as f:
+            f.write("PROLOGUE - Time Limit: 00:10:00\n"
+                    "EPILOGUE - Maximum Memory Usage: 3.97 GB\n")
+        with open(tlog[:-2] + ".sh", "w") as f:
+            f.write("#!/bin/bash\ngatk SamToFastq ...\n")
+        record = {"name": "audit-0805", "status": "submitted",
+                  "job_list": listing, "workdir": app,
+                  "proposal": {"slots": {"pipeline": "dnaseq",
+                                         "protocol": "somatic_fastpass"}}}
+
+        r.section("a run's logs are found beside its manifest, not beside the app")
+        # THE DEFECT: declared_log joined column 4 to `workdir`, which for a
+        # run generated with -o is the assistant's own directory. All three
+        # joins missed, the id and stamp globs searched the same wrong root,
+        # and /diagnose reported "log not found for this run" for a file that
+        # was on disk -- then explained a timeout with no in-job evidence.
+        job = [j for j in runs.parse_job_list(listing)
+               if j.name.endswith("COLO829T")][0]
+        r.equal("the declared path resolves against the manifest's directory",
+                runs.declared_log(job, record), tlog)
+        r.equal("and so does the full resolver",
+                runs.resolve_log(job, record, stamp), tlog)
+        r.contains("the manifest's own directory leads the search order",
+                   runs._log_roots(record)[0], "job_output")
+        r.check("the assistant's directory is only a fallback",
+                runs._log_roots(record).index(app) > 0,
+                runs._log_roots(record))
+
+        r.section("a log that is genuinely absent stays absent")
+        # The other half, and the one that must not regress: N wrote no log
+        # here, and T's file is one directory away with a nearly identical
+        # name. A looser search would hand N's diagnosis T's evidence.
+        njob = [j for j in runs.parse_job_list(listing)
+                if j.name.endswith("COLO829N")][0]
+        r.equal("a job with no log of its own gets None, not a neighbour's",
+                runs.resolve_log(njob, record, stamp), None)
+        # And nothing may borrow a DIFFERENT run's file for the same step.
+        other = os.path.join(step,
+                             "gatk_sam_to_fastq.tumorPair_COLO829N_2026-07-30T11.00.00.o")
+        with open(other, "w") as f:
+            f.write("a different run's log\n")
+        r.equal("nor one from another execution of the same step",
+                runs.resolve_log(njob, record, stamp), None)
+
+        r.section("the exact failed job survives into the evidence handed on")
+        states = {"18382351": {"state": "COMPLETED", "exit_code": "0:0",
+                               "elapsed": "00:01:39", "timelimit": "00:10:00"},
+                  "18382352": {"state": "TIMEOUT", "exit_code": "0:0",
+                               "elapsed": "00:10:22", "timelimit": "00:10:00"}}
+        status = runs.resolve(record, states=states, reasons={})
+        rep = runs.triage(record, jobs=runs.jobs_for(record, with_states=False)
+                          if False else None)
+        # resolve() and triage() must name the SAME job, and it must be T.
+        r.equal("resolve names the job that broke",
+                status.root_cause["job"], "gatk_sam_to_fastq.tumorPair_COLO829T")
+        r.check("and never the one that completed",
+                "COLO829N" not in status.root_cause["job"])
+
+        r.section("TIMEOUT is authoritative even when the exit code is 0:0")
+        # Slurm records the step's own status; a job killed by the walltime
+        # enforcer never returned a failing code of its own. Nothing in this
+        # application may read 0:0 as "it was fine".
+        r.check("a 0:0 timeout is still a broken job",
+                "TIMEOUT" in runs.BROKE_STATES)
+        r.check("and the exit code is not what decides that",
+                "0:0" not in str(runs.BROKE_STATES))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

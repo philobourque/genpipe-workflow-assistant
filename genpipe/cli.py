@@ -22,6 +22,7 @@ from . import override
 from . import preflight
 from . import prep
 from . import readset
+from . import relaunch
 from . import runs as runs_store
 from . import settings
 from . import slots
@@ -940,6 +941,165 @@ def _cmd_modify(agent, args):
     _modify_guided(agent, name, record)
 
 
+def _cmd_relaunch(agent, args):
+    """/relaunch <name> -- prepare a retry of a failed run with its diagnosed fix.
+
+    THE MISSING VERB. /diagnose ends by naming a section, a key and a value;
+    the only way to act on that was /modify, which forks the run and then asks
+    somebody to open the resources row and type all three back in from a screen
+    they are now scrolling away from. The operation had a shape and no name, so
+    the shape was performed by hand -- which is where a step name gets
+    misspelled and an override silently does nothing.
+
+    PREPARES. DOES NOT SUBMIT. This is the property the whole command is
+    arranged around, and it is structural rather than promised: what this does
+    is write a command, run the GENERATION -- which produces a script and puts
+    nothing on a scheduler -- and stop at the same gate every other run stops
+    at. There is no path from here to sbatch that does not go through a typed
+    /approve. The review screen says so; so does this docstring, because the
+    name is the one thing about the command that could be read as "run again".
+
+    AND IT ASKS NO MODEL ANYTHING. Every field of the revision is known before
+    this function starts: the config stack from the source command, the
+    override path from relaunch.prepare, the step range from the generated
+    facts. The first version handed all of that to the model as prose so it
+    could type a command back, which cost 36 inference steps and 108 seconds
+    and lost the `OUTDIR=` assignment its own `-o` depended on. relaunch.command
+    writes it instead; agent.hold_prepared gates it. What did NOT come off with
+    the model is the checking -- the declaration below is the same one the
+    /modify panel makes, modify.realized still reads the regenerated command
+    back, and a change that did not land still stops /approve.
+
+    THE ORIGINAL IS NOT TOUCHED. Not its command, not its config stack, not its
+    job list, not its submission record, not its job ids. It is read from and
+    nothing else -- and relaunch.prepare() writes the override under the NEW
+    run's name precisely so the parent's file cannot be edited by a retry.
+
+    WHAT IT REFUSES, AND WHY IT REFUSES SO READILY. Every precondition lives in
+    relaunch.plan() and comes back as a Refusal with a hint naming the command
+    to reach for instead. The one that matters most is the first: no stored
+    remediation means no retry, and no hidden /diagnose is run to obtain one.
+    A command that quietly calls a model when its input is missing is a command
+    nobody can predict the cost or the latency of, and the boundary between
+    "explain this" and "act on that explanation" is worth more than the
+    keystroke it saves.
+    """
+    if not args:
+        name = _pick_relaunch(agent)
+        if not name:
+            return
+    else:
+        name = args[0]
+    record = agent.registry.get(name)
+    if record is None:
+        display.problem(f"No run named '{name}'.", "/list shows what there is.")
+        return
+
+    # Resolved BEFORE planning, not cached from the diagnosis. The precondition
+    # most likely to have changed since /diagnose drew its screen is whether
+    # the run is still going -- see relaunch.plan, which refuses on active jobs
+    # -- and answering it from a stored tally would be revalidating against the
+    # state that raised the question.
+    status = None
+    if record.get("job_list"):
+        with ui.Activity("checking the run"):
+            status = runs_store.resolve(record)
+
+    plan = relaunch.plan(record, status=status)
+    if isinstance(plan, relaunch.Refusal):
+        display.problem(plan.message, plan.hint)
+        return
+
+    proposal = record.get("proposal") or {}
+    directory = record.get("workdir") or os.getcwd()
+    new_name = agent.registry.unique_name(name)
+    display.forking_from(name, runs_store.list_tag(record, status))
+
+    path, changes, applied = relaunch.prepare(plan, record, new_name, directory)
+    declared = relaunch.declaration(plan, record, changes, directory)
+
+    # THE COMMAND IS WRITTEN HERE, not asked for. Every field of it was decided
+    # before this line: the stack by relaunch.stack, the range by
+    # relaunch.scope, the override path by relaunch.prepare. See
+    # relaunch.command for what it keeps and what it refuses to invent, and the
+    # module docstring for the 36 inference steps this replaces.
+    built = relaunch.command(record, plan, path)
+    if isinstance(built, relaunch.Refusal):
+        display.problem(built.message, built.hint)
+        return
+    generated, script = built
+
+    # What the conversation behind this revision knows. There is no
+    # conversation -- nothing was asked of a model -- so the thread is seeded
+    # with the request that would have been made and the command that answers
+    # it, in the shape gate.generation_command() reads. Without it a later
+    # /modify on the revision would reach the model with a change to make and
+    # no command to make it to. Stated by the application, in the application's
+    # own turn; nothing here is attributed to the model.
+    request = modify.fork_sentence(proposal, dict(changes))
+    seed = agent.prepared_transcript(request, generated) if request else None
+
+    thread = f"{name}::retry-{datetime.datetime.now():%m%d%H%M%S}"
+    with ui.Activity("building the retry") as act:
+        _ = act
+        held = agent.hold_prepared(
+            new_name, generated, script, directory, thread,
+            declared=declared, changed=list(changes), seed=seed)
+    if not held:
+        return
+    agent.registry.derive(new_name, name, relaunch.REASON)
+    display.prepared_retry(
+        name, new_name, _standing(record), applied=applied,
+        scope=(f"steps {plan.scope} — {plan.scope_from}" if plan.scope
+               else ""),
+        scope_from=plan.scope_from, uncertain=plan.uncertain,
+        skipped=plan.skipped)
+
+
+def _pick_relaunch(agent):
+    """Bare /relaunch: which runs have a fix this can apply. Returns a name or None.
+
+    DISCOVERY, because the alternative was a usage line. Somebody who has just
+    read a diagnosis should not have to remember the exact name of the run it
+    was about, and "usage: /relaunch <name>" answers a question nobody asked --
+    they know the shape of the command, they wanted to know which run.
+
+    THE LIST IS NOT A GUESS AT WHAT LOOKS RETRYABLE. Every row here went
+    through relaunch.plan(), the same function /relaunch <name> goes through,
+    so a run that is offered is a run that would be accepted. Failed runs with
+    no diagnosis, diagnoses this program cannot write, runs still on the
+    scheduler and runs that never launched are all absent -- not because
+    anything here reasons about them, but because plan() refused them.
+
+    NOTHING IS PREPARED BY LOOKING. Even with one candidate the name goes back
+    to _cmd_relaunch to be planned again from scratch, against a freshly
+    resolved status. That is the revalidation the picker cannot do for every
+    row: a run whose jobs restarted between the list being drawn and a row
+    being chosen is refused there, with the reason, rather than quietly
+    retried.
+
+    No model call anywhere in it.
+    """
+    found = relaunch.candidates(agent.registry.live())
+    if not found:
+        display.nothing(
+            "No run has a diagnosed fix this can apply.",
+            "/diagnose <name> on a failed run works one out, or /modify "
+            "<name> to choose the changes yourself.")
+        return None
+    # _run_note is what the completion menu puts beside a name, and it is used
+    # here for the same reason it is used there: it reads the CACHED verdict
+    # rather than inventing one. list_tag() without a resolved status answers
+    # "completed" for anything terminal, which on this screen would call two
+    # failed runs finished.
+    options = [slots.Option(record["name"], record["name"],
+                            _relaunch_note(record, plan))
+               for record, plan in found]
+    return ui.choose("Which run should be retried?", options, free_text=False,
+                     note="nothing is prepared until you pick one, and "
+                          "nothing is submitted until you approve it")
+
+
 def _cmd_fork(agent, args):
     """/fork <name> [new name] [what to change] -- build a second run from this one.
 
@@ -1062,6 +1222,8 @@ def _fork_prose(agent, name, record, change, wanted=None):
     thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
     with ui.Activity("building the variant") as act:
         agent.run(request, thread, on_step=_narrate(act), name=new_name)
+    if agent.registry.get(new_name):
+        agent.registry.derive(new_name, name, "fork")
     display.forked(name, new_name, _standing(record))
 
 
@@ -1753,7 +1915,8 @@ def _fill_resources(agent, name, proposal, directory, editing=None, fresh=False)
     #                    all (genpipes.md, and its worked example is a timeout
     #                    whose obvious walltime fix was the wrong one). The
     #                    only honest offer is "which step, which knob".
-    proposed = (agent.registry.get(name) or {}).get("proposed_override") or {}
+    proposed = (runs_store.remediation_of(agent.registry.get(name))
+                .get("override") or {})
     proposed = {s: k for s, k in proposed.items() if s not in sections}
     if proposed:
         display.overrides(editing, override.describe(proposed), path)
@@ -1901,7 +2064,8 @@ def _ask_settings(step, existing):
     return out
 
 
-def _fork_run(agent, name, record, proposal, changes, wanted=None):
+def _fork_run(agent, name, record, proposal, changes, wanted=None,
+              reason="fork"):
     """Apply a change set as a SECOND run, leaving the first one untouched.
 
     The reason this is not a rename: a thread parked at the gate holds exactly
@@ -1921,6 +2085,22 @@ def _fork_run(agent, name, record, proposal, changes, wanted=None):
     have no panel to have asked in, and the `name` row is popped either way: a
     rename belongs to the run being forked FROM, and applying it here would
     rename the original as a side effect of copying it.
+
+    THE SHARED REVISION PRIMITIVE. /fork, /modify on a launched run and
+    /relaunch all end here, and that is deliberate: forking is the operation
+    with the safety property everything else depends on -- the original keeps
+    its name, its command, its job list and its jobs -- and a second
+    implementation of it is a second place for that property to stop holding.
+    The three callers differ in what they put in `changes` and in nothing else.
+
+    `reason` is why this revision exists, recorded on it.
+
+    THE INTERPRETIVE PATH, and it stays that way. What arrives here is a change
+    somebody stated -- "give alignment more memory", a protocol swapped in a
+    panel -- and turning that into a command is what the model is for. It is
+    not what /relaunch needs: a diagnosed remediation is already a section, a
+    key and a value, so that path writes its own command and never comes here.
+    See relaunch.command and agent.hold_prepared.
     """
     changes.pop("name", None)
     if not wanted:
@@ -1973,7 +2153,25 @@ def _fork_run(agent, name, record, proposal, changes, wanted=None):
     thread = f"{name}::variant-{datetime.datetime.now():%m%d%H%M%S}"
     with ui.Activity("building the variant") as act:
         agent.run(request, thread, on_step=_narrate(act), name=new_name)
+    # LINEAGE, WRITTEN AFTER THE RUN EXISTS and only if it does. agent.run()
+    # mints the record at the gate; a revision that never reached one has
+    # nothing to attach a parent to, and writing the link first would leave a
+    # dangling one behind every abandoned regeneration. Recorded for every
+    # caller, not just /relaunch: a fork's parent has always been findable only
+    # by reading a confirmation line that scrolled away.
+    if not agent.registry.get(new_name):
+        # The regeneration never reached the gate, so there is no revision --
+        # and saying "prepared" over an empty registry is the one thing this
+        # screen must not do. Nothing was written under the new name and the
+        # original was never touched, so there is nothing to undo either.
+        display.problem(
+            f"'{new_name}' was not prepared — the regeneration stopped "
+            f"before the approval gate.",
+            f"'{name}' is unchanged and nothing was submitted.")
+        return None
+    agent.registry.derive(new_name, name, reason)
     display.forked(name, new_name, _standing(record))
+    return new_name
 
 
 def _apply_changes(agent, name, proposal, changes, workdir=None):
@@ -2032,6 +2230,39 @@ def _redraw(agent, name, changed):
                      resources=override.summary(override.read(
                          override.path_for(name, record.get("workdir") or ".",
                                            record["proposal"]))))
+
+
+def _cmd_redraw(agent, args):
+    """/redraw -- draw the last panel again, at the width the window is now.
+
+    WHY THIS IS A COMMAND AND NOT A RESIZE HANDLER. Everything here is ordinary
+    scrollback. Resizing a terminal makes the EMULATOR reflow what is already
+    printed, and it reflows it as text: a line wrapped by this application to
+    fit 100 columns is soft-wrapped again at 80, and the overflow restarts at
+    column zero -- underneath the gutter it was drawn beside. The diagnosis
+    panel loses its structure that way and nothing in this process can prevent
+    it, because those bytes were written to a stream it cannot edit.
+
+    Catching SIGWINCH would not fix it either. It cannot rewrite the panel; it
+    can only print a second copy, and it would fire repeatedly while a window
+    is being dragged, in the middle of whatever the person was typing. A copy
+    on request is the honest version of the same thing.
+
+    DISPLAY ONLY, and structurally rather than by promise: what is stored is a
+    display function and the arguments it was called with (see
+    display.canonical), so there is no model to call, no log to re-read and no
+    record to touch. Redrawing twice draws the same panel twice.
+    """
+    if args:
+        display.problem("usage: /redraw",
+                        "It draws the last panel again, at the current width.")
+        return
+    name, again = display.last_surface()
+    if again is None:
+        display.nothing("Nothing has been drawn to redraw yet.",
+                        "/list, /check, /jobs, /view or /diagnose draws one.")
+        return
+    again()
 
 
 def _cmd_view(agent, args):
@@ -2396,7 +2627,7 @@ def _cmd_readset(agent, args):
 
 
 def _cmd_verbose(agent, args):
-    """/verbose -- show the agent's working, including what already scrolled by.
+    """/verbose -- show the agent's activity, including what already scrolled by.
 
     The transcript folds away the commands, the machine output and the
     connective prose by default, the way a chain of thought is folded away. This
@@ -2429,7 +2660,15 @@ def _cmd_verbose(agent, args):
     # work it is describing rather than above a screen of it.
     replayed = display.replay()
     display.done(
-        "Showing the agent's working."
+        # WHAT IT ACTUALLY UNFOLDS, said accurately. "the agent's working"
+        # promises a chain of thought and this shows no reasoning at all: the
+        # folded events are `code` (commands the agent ran), `observation`
+        # (what they printed) and `note` (its connective prose) -- see
+        # display._draw and the _folded list. That is ACTIVITY, observable from
+        # outside, and nothing here depends on a model exposing anything
+        # private. Promising working and delivering a command log is the kind
+        # of small overclaim that makes somebody distrust the rest of a screen.
+        "Showing agent activity — commands, their output, and what it read."
         + (f"  {replayed} step{'s' if replayed != 1 else ''} replayed." if replayed else ""),
         "/verbose to fold it away")
 
@@ -2637,9 +2876,15 @@ def _cmd_help(agent, args):
 # has typed before stops working. What changes is what the product claims.
 COMMAND_SPECS = [
     ("new",      "",                   "start a fresh conversation",              "talking",  None,          True),
-    ("verbose",  "[off]",              "show or fold away the agent's working",   "talking",  _cmd_verbose,  True),
+    ("verbose",  "[off]",              "show or fold away agent activity",     "talking",  _cmd_verbose,  True),
     ("approve",  "<name>",             "let a held submission through to Slurm",  "deciding", _cmd_approve,  True),
     ("modify",   "<name>",             "change a run before it is launched",      "deciding", _cmd_modify,   True),
+    # PREPARES A RETRY, and the description says "prepare" for the same reason
+    # the docstring does: this is the one verb in the table whose name could be
+    # read as reaching the scheduler, and it stops at the gate like everything
+    # else. Filed under "deciding" beside /modify and /fork, which is what it
+    # is -- a third way to arrive at a run waiting for approval.
+    ("relaunch", "<name>",             "prepare a retry using a diagnosed fix",   "deciding", _cmd_relaunch, True),
     ("fork",     "<name>",             "build a second run from an existing one", "deciding", _cmd_fork,     True),
     ("reject",   "<name>",             "abandon a held run; nothing submitted",   "deciding", _cmd_reject,   True),
     ("view",     "<name>",             "the command a run is, and what it takes", "watching", _cmd_view,     True),
@@ -2666,6 +2911,11 @@ COMMAND_SPECS = [
     ("track",    "<name> <job_list>",  "adopt a run launched outside the agent",  "fixing",   _cmd_track,    True),
     ("readset",  "[dir|schema]",       "build a readset file from filenames",     "setup",    _cmd_readset,  False),
     ("where",    "",                   "the cluster, and where runs are written", "setup",    _cmd_where,    True),
+    # AFTER A RESIZE. The terminal reflows printed scrollback as plain text, so
+    # a panel drawn at one width loses its structure at another; this draws the
+    # last one again at the width the window is now. See _cmd_redraw for why it
+    # is not a SIGWINCH handler.
+    ("redraw",   "",                   "draw the last panel again, at this width", "setup",   _cmd_redraw,   True),
     ("telemetry", "",                  "generate/execute/checkpoint timings",     "setup",    _cmd_telemetry, False),
     ("user",     "[name]",             "show or change what it calls you",        "setup",    _cmd_user,     True),
     ("model",    "[provider [model]]", "show or switch the model behind this",    "setup",    _cmd_model,    True),
@@ -2706,9 +2956,9 @@ def _specs_now():
             continue
         if name == "verbose":
             args = ""
-            desc = ("fold the agent's working away  ·  now: showing"
+            desc = ("fold agent activity away  ·  now: showing"
                     if display.VERBOSE else
-                    "show the agent's working  ·  now: folded away")
+                    "show agent activity  ·  now: folded away")
         out.append((name, args, desc, group, fn))
     return out
 
@@ -2953,6 +3203,11 @@ _WATCH = ("check", "jobs", "diagnose", "cancel", "monitor", "hold")
 # a completion list that still hid every finished run would hide exactly the
 # runs somebody reaches for when they want to run something again.
 _EITHER = ("modify", "view", "fork")
+# The one command whose completion is not a state filter but a PREDICATE: a run
+# is offered only if relaunch.plan() would accept it. Same source as the bare
+# command's picker, so the two cannot offer different sets -- see
+# relaunch.candidates for why that matters.
+_ELIGIBLE = ("relaunch",)
 
 
 def _provider_names():
@@ -3019,6 +3274,13 @@ def _run_names(agent, command, focus=None):
     if command == "model":
         return _provider_names()
     try:
+        if command in _ELIGIBLE:
+            # The same row the bare command's picker draws, from the same
+            # candidate list and through the same note -- so what is offered
+            # here and what is listed there cannot read differently.
+            return _ranked([(record["name"], _relaunch_note(record, plan))
+                            for record, plan in
+                            relaunch.candidates(agent.registry.live())], focus)
         if command in _DECIDE:
             records = agent.registry.held()
         elif command in _EITHER:
@@ -3043,6 +3305,16 @@ def _run_names(agent, command, focus=None):
     return _ranked([(r["name"], _run_note(r)) for r in reversed(records)], focus)
 
 
+def _relaunch_note(record, plan):
+    """One row's description, wherever a relaunch candidate is offered.
+
+    What it is, how it stands, and the fix that makes it a candidate. Written
+    once because the picker and the completion menu must not describe the same
+    run differently.
+    """
+    return f"{_run_note(record)}  ·  {relaunch.summary(plan)}".strip()
+
+
 def _ranked(rows, focus):
     """`rows` with the focused run first, when it is one of them."""
     return focus.rank(rows) if focus is not None else rows
@@ -3061,10 +3333,19 @@ def _run_note(record, status=None):
     values = (record.get("proposal") or {}).get("slots") or {}
     what = " ".join(str(values[k]) for k in ("pipeline", "protocol")
                     if values.get(k)) or (record.get("proposal") or {}).get("command", "")
-    if status is not None or record.get("job_list"):
+    if status is not None:
         return f"{what}  {runs_store.list_tag(record, status)}".strip()
+    # NO RESOLVED STATUS MEANS THE CACHED VERDICT, not list_tag's answer for a
+    # missing one. list_bucket() files an unresolved submitted run under
+    # FINISHED and list_tag words that "completed" -- correct on /list, where a
+    # status is always resolved, and a lie in a menu, where it is not: two runs
+    # that had timed out were offered as "completed" beside the fix for the
+    # timeout. The cache says what the last look actually found.
     check = record.get("last_check") or {}
-    return f"{what}  {check.get('verdict', '')}".strip()
+    verdict = str(check.get("verdict") or "")
+    if verdict:
+        return f"{what}  {verdict}".strip()
+    return f"{what}  {runs_store.list_tag(record, status)}".strip()
 
 
 # _learned_files() lived here. It pulled a readset, design or pairs file out of

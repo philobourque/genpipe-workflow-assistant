@@ -2673,6 +2673,180 @@ something you can do, do it rather than telling them what to type.
         except Exception:                       # noqa: BLE001
             pass                                # a spinner label is never worth a turn
 
+    @staticmethod
+    def prepared_transcript(request, generated):
+        """The conversation behind a run the program built for itself.
+
+        A revision produced without a model has no history, and an empty
+        history is not neutral: /modify on that run would later send the model
+        a change to make with no command in front of it to make it to, and
+        gate.generation_command() -- which several checks read -- would find
+        nothing at all.
+
+        So the thread is opened with what actually happened, in one turn from
+        the application's side: what was asked for, and the command that
+        answers it. The command travels inside <execute> because that is the
+        shape every reader in this file already knows how to find a generation
+        in, and because it IS the block /approve will run.
+
+        NOTHING IS ATTRIBUTED TO THE MODEL. There is no AIMessage here and
+        there must not be: the model said nothing, and a transcript that
+        claimed otherwise would be the same class of lie as a status word that
+        says held for a run with no decision open. Same rule as
+        _render_decision.
+        """
+        return [HumanMessage(content=(
+            f"{request}\n\nThis run was prepared without you: every field of "
+            f"it was already decided, so the command below was written "
+            f"directly and is what the gate is holding.\n\n"
+            f"<execute>\n{generated}\n</execute>"))]
+
+    def _raise_gate(self, config, proposal, seed=None, on_error=None):
+        """Open a real gate interrupt for `proposal`, with NO model call.
+
+        The one mechanism two very different callers need. regate() uses it to
+        put a decision back after a turn consumed it; hold_prepared() uses it to
+        gate a proposal the program wrote itself. Both want the same thing --
+        the actual LangGraph interrupt, carrying the actual proposal, so that
+        /approve, /reject, /modify and the checkpoint all behave exactly as they
+        do for a run the model built. A status word saying "held" is not that,
+        and the difference between the two is the whole of regate's docstring.
+
+        HOW IT AVOIDS THE MODEL. update_state(as_node="generate") writes the
+        channels and evaluates that node's outgoing edge; routing_function sees
+        `regate` and queues the gate; invoke(None) runs it. `generate` is never
+        re-entered -- verified against the pinned LangGraph 0.3.18 rather than
+        assumed, because this is the one mechanism in the file whose semantics
+        are not obvious from its name.
+
+        `seed` is a message list for a thread that has none -- a revision this
+        program generated has no conversation behind it, and /modify on it later
+        would otherwise send the model a change with no command in front of it.
+        Written to the same `messages` channel a real turn writes, because it is
+        the same fact: this is the command that exists. Nothing in it is
+        attributed to the model.
+        """
+        # THE ONE-SUBMISSION-PER-TURN FLAG HAS TO BE CLEARED HERE.
+        #
+        # submission_gate()'s first branch ends the turn without interrupting
+        # when `_submitted_this_turn` is set, which is right for a model that
+        # re-proposes after a failed submission and wrong for this: the flag is
+        # cleared by _drive(), and neither of these callers goes through it --
+        # they invoke the graph directly. So after any approval in this
+        # session, raising a gate silently produced no interrupt at all. What
+        # that looked like: a revision written to the registry as `held` with
+        # no decision behind it, and no message on screen either way, which is
+        # exactly the "held is a status word rather than a decision" failure
+        # regate() exists to have ended.
+        #
+        # Raising a gate IS the start of a turn -- something is about to be put
+        # in front of a person -- so the flag is cleared the same way _drive
+        # clears it.
+        self._submitted_this_turn = False
+        try:
+            state = {"pending_proposal": dict(proposal), "next_step": "regate"}
+            if seed is not None:
+                state["messages"] = list(seed)
+            self.app.update_state(config, state, as_node="generate")
+            self.app.invoke(None, config)
+        except Exception as e:                  # noqa: BLE001
+            if on_error:
+                on_error(e)
+            return False
+        if self.gate_interrupt(config) is None:
+            # The graph ran and parked nothing. Reported through the same
+            # handler an exception is, because it is the same outcome for the
+            # caller and the alternative -- returning False in silence -- is
+            # how a revision reached the registry with no decision behind it
+            # and nothing on screen saying so.
+            if on_error:
+                on_error(RuntimeError("the graph parked no decision"))
+            return False
+        return True
+
+    def hold_prepared(self, name, generated, script, workdir, thread_id,
+                      declared=(), changed=(), warnings=(), seed=None):
+        """Gate a proposal this program built. Returns the status, or None.
+
+        THE PATH WITH NO INFERENCE IN IT. /relaunch knows every field of the
+        revision it wants before anything runs, so there is nothing for a model
+        to decide -- see relaunch.command(). What is left is the work a
+        submission still needs: run the generation, parse the command that ran,
+        check it against what was asked for, and stop at the gate.
+
+        NOTHING IS WEAKENED BY THE MODEL'S ABSENCE. The proposal is built by
+        gate.build_proposal, the same parse of the same command text; the
+        install's own opinion is attached by the same with_usage; the
+        declaration rides the same `_gate_note` the /modify panel uses, so
+        modify.realized() reads the regenerated command back and the gate draws
+        an IGNORED row exactly as it would have; and _settle does the holding,
+        the verdicts and the box. The only thing that changed is who wrote the
+        command.
+
+        THE GENERATION REALLY RUNS, here rather than at /approve. It is not a
+        model call -- it is `module load ... && genpipes ...` in a subprocess,
+        the same command /approve will re-run -- and running it now is what
+        makes the box honest: the script the submission names exists, GenPipes
+        has accepted every flag, and a command it would have refused is refused
+        HERE, before anybody spends an approval on it.
+
+        The two refusals below are deliberately taken before the gate is raised
+        rather than inside it. submission_gate() sends an incomplete proposal
+        back to `generate` to be fixed -- which is right when a model is driving
+        and is a model call this path exists to not make.
+        """
+        out, code = runs_store.run_block(generated, cwd=workdir)
+        if code != 0:
+            display.problem(
+                f"'{name}' was not prepared -- the command could not be "
+                f"generated.",
+                f"GenPipes exited {code} building the script, so there is "
+                f"nothing to approve. Nothing has reached the scheduler.")
+            display.output(out)
+            return None
+
+        proposal = gate.build_proposal([], f'propose_submission("{script}")',
+                                       generated=generated)
+        proposal = gate.with_usage(proposal, runs_store.pipeline_usage(
+            (proposal.get("slots") or {}).get("pipeline")))
+        if declared:
+            proposal["declared"] = list(declared)
+
+        missing = proposal.get("missing") or []
+        lacking = proposal.get("lacking") or []
+        if missing or lacking:
+            display.problem(
+                f"'{name}' was not prepared -- the command it would build is "
+                f"missing {', '.join(missing or lacking)}.",
+                "The run it was copied from did not record them either. "
+                "Nothing has reached the scheduler.")
+            return None
+
+        # NOTHING IS WRITTEN UNTIL THERE IS A DECISION TO WRITE. The registry
+        # entry is made by _settle, after the interrupt exists -- so a graph
+        # that parks nothing leaves no record claiming to be held, which is the
+        # same rule regate() follows and for the same reason.
+        self._gate_note = {"warnings": list(warnings or ()),
+                           "changed": list(changed or ()),
+                           "declared": list(declared or ())}
+        config = self._config(thread_id)
+        if not self._raise_gate(config, proposal, seed=seed,
+                                on_error=lambda e: display.problem(
+                                    f"'{name}' could not be put at the gate.",
+                                    f"{type(e).__name__}: {e}  ·  nothing has "
+                                    f"reached the scheduler.")):
+            self._gate_note = {}
+            return None
+        status = self._settle(thread_id, config, held=name)
+        # _settle records the run under os.getcwd(), which is right for a
+        # command the model just ran in this process and wrong here: the
+        # generation above ran in the source run's directory, and /approve
+        # re-runs it from whatever the record says. The two have to be the same
+        # directory or a relative -g resolves to two different files.
+        if workdir and (self.registry.get(name) or {}).get("workdir") != workdir:
+            self.registry.update(name, workdir=workdir)
+        return status
+
     def regate(self, name, thread_id, record):
         """Restore the DECISION after a turn that consumed it without replacing it.
 
@@ -2746,20 +2920,13 @@ something you can do, do it rather than telling them what to type.
                 f"gate the new one, or /modify {name}.")
             return False
 
-        try:
-            self.app.update_state(
-                config,
-                {"pending_proposal": dict(proposal), "next_step": "regate"},
-                as_node="generate")
-            self.app.invoke(None, config)
-        except Exception as e:                  # noqa: BLE001
-            # A graph that cannot be re-parked is a run whose decision is
-            # genuinely gone. Say nothing here and let the caller mark it
-            # lapsed, which is the truthful outcome -- inventing a HELD status
-            # is the exact failure this method exists to end.
-            display.problem(
+        if not self._raise_gate(config, proposal, on_error=lambda e: display.problem(
                 f"'{name}' could not be put back at the gate.",
-                f"{type(e).__name__}: {e}  ·  /modify {name} rebuilds it.")
+                f"{type(e).__name__}: {e}  ·  /modify {name} rebuilds it.")):
+            # A graph that cannot be re-parked is a run whose decision is
+            # genuinely gone. The caller marks it lapsed, which is the truthful
+            # outcome -- inventing a HELD status is the exact failure this
+            # method exists to end.
             return False
 
         if self.gate_interrupt(config) is None:
@@ -3848,8 +4015,16 @@ something you can do, do it rather than telling them what to type.
         # gone. A run that is dead because 28 jobs are queued behind a
         # dependency that will never be satisfied has NO failed job to triage,
         # and the old refusal below would have sent that person away.
-        status = runs_store.resolve(record)
-        report = runs_store.triage(record, jobs=status.jobs)
+        # PHASES, RECORDED SEPARATELY, under the debug mode that already
+        # exists (GENPIPE_TELEMETRY=1, read back with /telemetry). The question
+        # this answers is where a 76-second diagnosis actually goes, and it is
+        # worth being able to answer it without a stopwatch: the deterministic
+        # half measured at ~40ms, so anything else is the model and its tools,
+        # and the fix for that is grounding rather than optimisation.
+        status = self.telemetry.timed(
+            "diagnose.scheduler", runs_store.resolve, record)
+        report = self.telemetry.timed(
+            "diagnose.evidence", runs_store.triage, record, jobs=status.jobs)
         stored = (record.get("last_reasons") or {}).get("reasons") or {}
         reasons = status.reasons or stored
 
@@ -3864,17 +4039,25 @@ something you can do, do it rather than telling them what to type.
             display.run_status(name, status)
 
         thread = f"{name}::why-{datetime.datetime.now():%m%d%H%M%S}"
-        prompt = self._diagnose_prompt(name, record, report, question,
-                                  status=status, reasons=reasons)
+        prompt = self.telemetry.timed(
+            "diagnose.brief", self._diagnose_prompt, name, record, report,
+            question, status=status, reasons=reasons)
         self.critic_count = 0
         self.user_task = prompt
         self.log = []
         display.defer_solution(True)
         try:
-            self._drive({"messages": [HumanMessage(content=prompt)],
-                         "next_step": None}, self._config(thread), on_step)
+            self.telemetry.timed(
+                "diagnose.model", self._drive,
+                {"messages": [HumanMessage(content=prompt)],
+                 "next_step": None}, self._config(thread), on_step)
         finally:
             display.defer_solution(False)
+        # The RunStatus is about to be shadowed by the gate status, and its
+        # tally is the half of the finding the parsed answer does not carry.
+        # Kept here, at the last moment both exist, for the same reason
+        # _settle reads `previous` before hold() overwrites it.
+        scheduler = status
         status = self._gate_status(self._config(thread))
 
         # Drawn here rather than left to _drive's transcript renderer, because
@@ -3886,19 +4069,64 @@ something you can do, do it rather than telling them what to type.
         # not a guarantee -- the graph is gated for exactly that reason -- and
         # if the model decided to resubmit, `final` is the pause, not an answer.
         if status.get("final") and status.get("status") != "paused":
+            # WHETHER THE FIX IS ONE WE CAN APPLY is decided here, by
+            # override.applicable(), and handed to the renderer as an answer.
+            # The screen offers /relaunch on that verdict and on nothing else
+            # -- not on "the run failed", and not on "there is an OVERRIDE
+            # heading", which is a claim about the model's output rather than
+            # about what this program can do with it.
+            good, _ = override.applicable(parsed.get("override") or {})
             display.diagnosis(name, parsed,
                               logs=[f["log"] for f in report["findings"]
-                                    if f.get("log")])
+                                    if f.get("log")],
+                              applicable=bool(good))
             # The one-line note keeps the CAUSE where there is one. /history six
             # weeks later wants "gatk_sam_to_fastq killed at its walltime", not
             # the first 140 characters of a heading.
             self.registry.add_note(
                 name, _one_line(parsed["cause"] or status["final"]))
-        # Parsed and kept, so /modify's resources row can offer to write the
-        # override the diagnosis proposed instead of making somebody retype it.
+        # PARSED AND KEPT AS DATA, which is what makes /relaunch possible at
+        # all. The override fragment is already structured by diagnosis.parse
+        # -- section, key, value -- so nothing downstream has to read prose off
+        # a screen to act on it. /modify's resources row offers it instead of
+        # making somebody retype it; /relaunch applies it into a revision.
+        #
+        # THREE THINGS ARE STORED, NOT ONE. The fix on its own is a
+        # recommendation with its reservations stripped off:
+        #
+        #   override   what to change
+        #   uncertain  what this run does NOT establish about it -- including,
+        #              routinely, whether the value proposed is sufficient.
+        #              It survives to /relaunch's review screen, which is the
+        #              last screen before somebody spends an allocation on it.
+        #   before     what the run's own config trace recorded for the same
+        #              keys, so the review can say `0:10:00 -> 35:00:00` from
+        #              two observations rather than showing a value with no
+        #              baseline. Read from the trace here, while the trace path
+        #              is in hand -- it is a snapshot of a moment that is over.
         if parsed.get("override"):
-            self.registry.update(name, proposed_override=parsed["override"])
+            self.registry.remember_remediation(
+                name, parsed["override"], parsed.get("uncertain") or (),
+                before=_trace_values(report.get("trace"), parsed["override"]))
         status["diagnosis"] = parsed
+        # WHAT THIS RUN'S DIAGNOSIS ESTABLISHED, as data, on the value the
+        # caller gets back. The screen already has all of it; what did not have
+        # it was the conversational model, which reaches diagnose_run through a
+        # capability and was told only that a lookup had happened -- see
+        # _capability_note, whose diagnose_run branch was unreachable because
+        # this function returns a dict and the branch tested for a RunStatus.
+        #
+        # `name` is carried explicitly and is the name that was diagnosed. It is
+        # the anchor every other value here is under: a note built from this
+        # cannot attribute one run's tally to another, because there is only
+        # ever one run in it.
+        status["evidence"] = {
+            "name": name,
+            "verdict": scheduler.verdict,
+            "counts": dict(scheduler.counts or {}),
+            "total": scheduler.total,
+            "root_cause": dict(scheduler.root_cause or {}),
+        }
         return status
 
     def _diagnose_prompt(self, name, record, report, question, status=None,
@@ -3936,13 +4164,81 @@ something you can do, do it rather than telling them what to type.
             lines.append(f"  source: {status.source}")
             cause = status.root_cause
             if cause:
+                # NAMED, not just counted. "gatk_sam_to_fastq, 1 job(s)
+                # TIMEOUT" tells a model which STEP broke and leaves it to
+                # work out which of that step's jobs did -- and on a paired
+                # tumour/normal run there are two candidates with almost the
+                # same name. On 2026-08-05 the model was handed exactly that
+                # and answered "tumorPair_COLO829N (or T -- one of the two)",
+                # leading with the sample that had COMPLETED in 00:01:39.
+                # resolve() knew it was T all along, and /check printed it.
                 lines.append(
                     f"  earliest independent failure: {cause['step']}, "
                     f"{cause['count']} job(s) {cause['state']}"
+                    + (f", first of them {cause['job']}"
+                       if cause.get("job") else "")
                     + (f", ran {cause['elapsed']} of {cause['timelimit']}"
                        if cause.get("timelimit") else ""))
-                lines.append("  CANCELLED jobs downstream of it never ran and "
-                             "their logs explain nothing.")
+                # WHOSE MEASUREMENT THAT IS, said before the log arrives with a
+                # different one. A job's GenPipes epilogue times its own window
+                # -- from the script's start to the script's end -- while sacct
+                # times the allocation. For 18382352 those were 00:10:19 and
+                # 00:10:22, four seconds apart at the start and one at the end,
+                # and each is internally consistent. Feeding the log tail (which
+                # is right, and new) put the second number in front of the model
+                # for the first time, and it quoted that one as though it were
+                # the scheduler's. Naming the source is what keeps two true
+                # measurements from collapsing into one wrong citation.
+                if cause.get("elapsed"):
+                    lines.append(
+                        "  That elapsed time is SACCT'S: it measures the "
+                        "ALLOCATION, start to end, and it is the figure the "
+                        "walltime was enforced against. A GenPipes epilogue in "
+                        "the .o log reports a different quantity -- the job "
+                        "SCRIPT'S own runtime, which begins after the "
+                        "allocation does and ends when the script does, so it "
+                        "is a measurement nested inside sacct's and will be "
+                        "shorter by seconds. They are two windows, not two "
+                        "readings of one. If you quote both, say which "
+                        "measured which; never merge them into one number or "
+                        "attribute one figure to both sources.")
+                # COUNTED, NOT CHARACTERISED. cancelled_after is
+                # sum(state == CANCELLED) over the whole run -- see
+                # runs._root_cause. It is a count of jobs, not a proof that
+                # each was cancelled BY this failure, and it says nothing
+                # about steps: 13 jobs of this run completed before the
+                # failure, so "every step after it was cancelled" is false
+                # about the run even when the arithmetic happens to fit.
+                # THE DEPENDENCY CLOSURE, not a bare count. "32 CANCELLED"
+                # is a tally over the whole run and says nothing about whether
+                # THIS job caused them. The manifest's dependency column is
+                # the only record of the DAG -- sacct never had it, squeue has
+                # forgotten it -- and the model went and read the raw job_list
+                # with `head -40` to reconstruct exactly this.
+                cancelled = cause.get("cancelled_after") or 0
+                waiting = runs_store.downstream_of(status.jobs,
+                                                   cause.get("job_id"))
+                if waiting:
+                    states = {}
+                    for j in status.jobs or ():
+                        if j.job_id in waiting:
+                            states[j.state] = states.get(j.state, 0) + 1
+                    tally = ", ".join(f"{n} {s}" for s, n in sorted(
+                        states.items(), key=lambda kv: -kv[1]))
+                    lines.append(
+                        f"  {len(waiting)} job(s) waited on this one, directly "
+                        f"or through a chain of dependencies, and they are: "
+                        f"{tally}. That is the manifest's own dependency "
+                        f"column -- you do not need to read the job list to "
+                        f"establish it.")
+                if cancelled:
+                    lines.append(
+                        f"  {cancelled} job(s) in this run are CANCELLED "
+                        f"overall. A CANCELLED job never started, so it wrote "
+                        f"no log and its log explains nothing. Say how many "
+                        f"jobs were cancelled -- do not say that every later "
+                        f"step was, and do not describe branches that "
+                        f"completed as though they had not.")
         if reasons:
             lines.append("  jobs still queued, and what they are waiting on: "
                          + ", ".join(f"{n} {why}" for why, n in
@@ -3951,13 +4247,54 @@ something you can do, do it rather than telling them what to type.
                 lines.append("  DependencyNeverSatisfied means those jobs will "
                              "NEVER run, whatever sacct calls them.")
         for label, key in (("pipeline", "pipeline"), ("protocol", "protocol"),
-                           ("steps", "steps"), ("readset", "readset")):
+                           ("readset", "readset"), ("pairs", "pairs"),
+                           ("design", "design")):
             if slots.get(key):
                 lines.append(f"  {label}: {slots[key]}")
+        # THE COMMAND ITSELF. The model opened its last diagnosis by calling
+        # show_run() to find out what this run WAS -- a whole round trip for a
+        # string sitting on the record. Naming it here is not duplication: the
+        # brief is what the model reads, and a fact it has to ask for is a fact
+        # it was not given.
+        command = (record.get("proposal") or {}).get("command")
+        if command:
+            lines.append(f"  the command that produced it: {command}")
         if slots.get("inis"):
             lines.append(f"  config layering: {' , '.join(slots['inis'])}")
         if record.get("job_list"):
             lines.append(f"  job list: {record['job_list']}")
+
+        # THE STEP RANGE, ESTABLISHED HERE RATHER THAN LOOKED UP THERE.
+        #
+        # `-s` has no argparse default, so a run submitted without one carries
+        # `steps: None` -- and this block used to print the row only when it
+        # was truthy, which meant the commonest case told the model NOTHING and
+        # left it to work out both what was originally asked for and what the
+        # protocol's full range is. It did that by shelling out to
+        # `module load genpipes && genpipes dnaseq --help` and reading the
+        # printed list: 1.6s, a model round trip, and a constant per GenPipes
+        # version rediscovered on every diagnosis.
+        #
+        # Both halves are now stated. The range comes from
+        # genpipes_facts.json, generated from a real install by
+        # tools/genpipes_facts.py -- the same source --help prints from, one
+        # layer earlier. When the manifest does not record it, step_range()
+        # returns None and this says nothing rather than asserting a range.
+        asked = slots.get("steps")
+        lines.append(f"  steps originally requested: "
+                     + (str(asked) if asked else
+                        "none -- `-s` was omitted, which is GenPipes for "
+                        "every step of the protocol"))
+        full = slot_table.step_range(slots.get("pipeline"),
+                                      slots.get("protocol"))
+        if full:
+            names = slot_table.step_names(slots.get("pipeline"),
+                                           slots.get("protocol"))
+            lines.append(f"  this protocol's full step range: {full}  "
+                         f"(step 1 is {names[0]}, step {len(names)} is "
+                         f"{names[-1]})")
+            lines.append("  That range is recorded from the installed "
+                         "GenPipes -- do not run --help to rediscover it.")
         lines += [
             f"  failed jobs: {report['failed_total']} "
             f"across {report['steps_affected']} step(s)",
@@ -3967,7 +4304,27 @@ something you can do, do it rather than telling them what to type.
             lines += ["No job wrote a log worth reading -- which is itself the "
                       "finding. Explain what that means for this run.", ""]
         for f in report["findings"]:
-            lines.append(f"--- step {f['step']}: {f['count']} job(s) {f['state']} ---")
+            # THE EXACT JOB, AND ITS SLURM ID. triage() has carried both since
+            # it was written; this block printed neither, so the one identity
+            # question a diagnosis must not get wrong was the one fact the
+            # model had to reconstruct for itself from a job list. The id is
+            # here too because it is the only globally unique handle -- it is
+            # what sacct, squeue and the log filename all agree on, and a model
+            # that wants to check a claim can quote it.
+            lines.append(f"--- step {f['step']}: {f['count']} job(s) "
+                         f"{f['state']} ---")
+            if f.get("job"):
+                lines.append(f"    failing job: {f['job']}"
+                             + (f"  (Slurm job id {f['job_id']})"
+                                if f.get("job_id") else ""))
+                if f["count"] > 1:
+                    lines.append(f"    {f['count'] - 1} other job(s) in this "
+                                 f"step are in the same state; this is the "
+                                 f"first of them.")
+                else:
+                    lines.append("    this is the ONLY job of this step in "
+                                 "that state -- do not hedge about which one "
+                                 "it was.")
             if f["maxrss"]:
                 lines.append(f"    peak memory: {f['maxrss']}")
             if f["exit_code"]:
@@ -4061,6 +4418,30 @@ def _epoch(stamp):
         return datetime.datetime.fromisoformat(str(stamp)).timestamp()
     except (TypeError, ValueError):
         return None
+
+
+def _trace_values(trace_path, override):
+    """What this run's config trace recorded for the keys an override changes.
+
+    {section: {key: value}}, and {} when there is no trace or it says nothing
+    about them. TRANSCRIPTION, in provenance.py's sense: the trace is GenPipes'
+    own resolved snapshot of the stack it used, so reading a key out of it is
+    reading a file, not concluding anything. Nothing here compares it to the
+    proposed value or decides what the difference means.
+
+    Read at diagnosis time because that is when the path is in hand and when
+    the file is still the one that describes this run. A retry prepared a week
+    later must not go looking for a trace that may by then belong to a
+    different execution.
+    """
+    if not trace_path or not override:
+        return {}
+    out = {}
+    for step, settings in override.items():
+        found = provenance.effective(trace_path, step, keys=tuple(settings))
+        if isinstance(found, dict) and found:
+            out[step] = dict(found)
+    return out
 
 
 def _one_line(text, limit=140):

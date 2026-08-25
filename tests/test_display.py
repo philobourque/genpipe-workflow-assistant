@@ -740,6 +740,72 @@ def main():
                            or l.startswith("  ▌") and "16.17.43.o" in l),
                    "16.17.43.o")
 
+    r.section("the width is read at every render, so a resize is picked up")
+    # WHAT RESIZING ACTUALLY DOES, and the honest boundary around it. Printed
+    # scrollback belongs to the terminal emulator: on resize it reflows what is
+    # already on screen as plain text, so a line this module wrapped for 100
+    # columns is soft-wrapped again at 80 and its tail restarts at column zero,
+    # under the gutter. Nothing in this process can edit bytes it has already
+    # written. What it CAN do is read the width afresh every time it draws --
+    # which is what these transitions assert, one render per width, in the
+    # order somebody would actually resize.
+    # The whole panel, including the two sections the shorter fixture above
+    # leaves out -- what the run did not establish, and the Actions block that
+    # depends on the fix being one this program can apply.
+    whole = dict(answer, uncertain=[
+        "whether 35:00:00 is actually sufficient for this input",
+        "whether memory pressure at 99.3% of the request contributed"])
+    for before, after in ((120, 80), (80, 120), (100, 60), (60, 100)):
+        for cols in (before, after):
+            text = drawn(_at_width, cols, display.diagnosis,
+                         "Test_walltimefail", whole, [long_path],
+                         applicable=True)
+            lines = [l for l in text.splitlines() if l.strip()]
+            r.check(f"{before}->{after}: nothing overflows at {cols}",
+                    max(len(l) for l in lines) <= cols,
+                    max(len(l) for l in lines))
+            r.check(f"{before}->{after}: every line still sits on its gutter "
+                    f"at {cols}",
+                    all(l.startswith("  ▌") for l in lines),
+                    [l for l in lines if not l.startswith("  ▌")][:2])
+            for label in ("died", "because", "evidence", "fix",
+                          "not established", "Actions"):
+                r.check(f"{before}->{after}: '{label}' survives at {cols}",
+                        label in text, label)
+            for verb in ("/relaunch", "/modify", "/jobs"):
+                r.check(f"{before}->{after}: {verb} is offered at {cols}",
+                        verb in text, verb)
+
+    r.section("the last canonical surface can be drawn again, from its own data")
+    # /redraw's mechanism. What is stored is the FUNCTION and the ARGUMENTS --
+    # there is no model in it, no log path it re-reads and no record it can
+    # touch, because it does not hold any of those things.
+    display.forget_surface()
+    r.equal("nothing to redraw before anything is drawn",
+            display.last_surface(), (None, None))
+    at100 = drawn(_at_width, 100, display.diagnosis, "Test_walltimefail",
+                  whole, [long_path], applicable=True)
+    name, again = display.last_surface()
+    r.equal("the diagnosis is what is remembered", name, "diagnosis")
+    r.truthy("and it can be drawn again", again)
+
+    at60 = drawn(_at_width, 60, again)
+    r.check("redrawn at 60 it fits 60",
+            max(len(l) for l in at60.splitlines() if l.strip()) <= 60)
+    r.check("and is not the same text as the 100-column render", at60 != at100)
+    for label in ("died", "because", "evidence", "fix", "not established"):
+        r.contains(f"'{label}' is still there after the redraw", at60, label)
+    r.contains("and so is the fix's value", at60, "3:00:00")
+
+    twice = drawn(_at_width, 60, again)
+    r.equal("redrawing twice draws the same thing", twice, at60)
+    r.equal("and the memo is unchanged by being read",
+            display.last_surface()[0], "diagnosis")
+
+    back = drawn(_at_width, 120, again)
+    r.check("and widening redraws wider again",
+            len(back.splitlines()) < len(at60.splitlines()))
+
     r.section("a wide window is actually used, not squandered")
     narrow = drawn(_at_width, 74, display.diagnosis, "n", answer, [long_path])
     wide = drawn(_at_width, 140, display.diagnosis, "n", answer, [long_path])
@@ -759,17 +825,125 @@ def main():
     r.equal("a path that fits is left alone",
             display._wrap_path("/short/path", 40), ["/short/path"])
 
-    r.section("Python no longer captions the model's resubmit range")
-    # The renderer used to print "the whole range -- GenPipes skips steps that
-    # already have output" under WHATEVER range came back. True of GenPipes,
-    # not necessarily true of that answer: RELAUNCH_RULE asks for the full
-    # range but cannot make the model comply, so a narrowed range was captioned
-    # with a sentence asserting it was not narrowed.
+    r.section("the resubmit range is no longer on the diagnosis screen")
+    # It printed raw `-s` syntax two rows under a sentence about a walltime,
+    # and then left somebody to assemble a command around it. The range is now
+    # established deterministically (relaunch.scope) and rendered where command
+    # syntax belongs -- the revision's own command. The renderer had already
+    # stopped CAPTIONING the model's range, for the reason that RELAUNCH_RULE
+    # asks for a full range and cannot make a model comply; this goes further
+    # and stops printing a number the screen cannot vouch for at all.
     narrowed = dict(answer, relaunch="7-9")
     out = drawn(_at_width, 100, display.diagnosis, "n", narrowed, [])
-    r.contains("the range the model gave is printed", out, "7-9")
-    r.check("with no claim about what it covers",
+    r.check("a narrowed range the model returned is not shown",
+            "7-9" not in out, out)
+    r.check("nor is the row it sat on", "resubmit" not in out)
+    r.check("and no claim about what a range covers survives",
             "the whole range" not in out and "already have output" not in out)
+
+    # ---------------------------------------------------------------- #
+    r.section("/diagnose offers /relaunch only when the fix can be applied")
+    # THE DISTINCTION UNDER TEST. "There is an OVERRIDE heading" is a claim
+    # about the model's output; "there is a change this program can make" is a
+    # claim about this program. The screen must offer the command only for the
+    # second, which is why `applicable` is an argument rather than something
+    # the renderer re-derives from `parsed`.
+    out = drawn(_at_width, 100, display.diagnosis, "n", answer, [],
+                applicable=True)
+    r.contains("/relaunch is offered", out, "/relaunch")
+    r.check("first, above the manual alternative",
+            out.index("/relaunch") < out.index("/modify"))
+    r.contains("with wording that says it prepares rather than submits",
+               out, "prepare a retry")
+    r.contains("/modify stays as the manual route", out, "/modify")
+    r.contains("and reads as the alternative beside it", out,
+               "make different changes")
+    r.check("the fork wording is not ALSO on the screen — one meaning per row",
+            "build a revised copy" not in out, out)
+    r.contains("/jobs is still the evidence rung", out, "/jobs")
+    r.check("no submission is proposed anywhere on the screen",
+            "/approve" not in out, out)
+
+    out = drawn(_at_width, 100, display.diagnosis, "n", answer, [],
+                applicable=False)
+    r.check("a fix this cannot apply offers no /relaunch",
+            "/relaunch" not in out, out)
+    r.contains("/modify is then the only next step", out, "/modify")
+    r.contains("so it carries the fact that the run is copied, not edited",
+               out, "build a revised copy")
+    r.contains("and that the original is untouched", out, "untouched")
+
+    nofix = dict(answer, override={})
+    out = drawn(_at_width, 100, display.diagnosis, "n", nofix, [],
+                applicable=False)
+    r.check("a diagnosis with no config fix at all offers no /relaunch",
+            "/relaunch" not in out)
+    r.contains("but still offers the evidence rung", out, "/jobs")
+
+    r.section("the prepared-retry review screen")
+    out = drawn(_at_width, 100, display.prepared_retry,
+                "study-0805", "study-0805-2", "needs attention",
+                [("gatk_sam_to_fastq", "cluster_walltime", "0:10:00", "35:00:00")],
+                "steps 1-23 — the whole protocol", "the whole protocol",
+                ["whether 35:00:00 is sufficient for this input"],
+                [("step.odd_key", "not a cluster setting this can write")])
+    r.contains("both runs are named", out, "study-0805-2")
+    r.contains("the original first, since keeping it is the point",
+               out, "prepared retry of study-0805")
+    r.contains("the change is spelled out", out, "gatk_sam_to_fastq.cluster_walltime")
+    r.contains("as a transition, not a bare value", out, "0:10:00")
+    r.contains("with what it became", out, "35:00:00")
+    r.contains("the retry's scope is stated in words", out, "1-23")
+    r.contains("what is still unproven survives to this screen",
+               out, "whether 35:00:00 is sufficient")
+    r.contains("what was NOT applied is named too", out, "odd_key")
+    r.contains("the original is confirmed unchanged", out, "is unchanged")
+    r.contains("in /list's words for where it stands", out, "needs attention")
+    r.contains("and nothing was submitted", out, "nothing has been submitted")
+    r.check("the gate owns the verbs, so this screen proposes none",
+            "/approve" not in out and "Actions" not in out, out)
+
+    out = drawn(_at_width, 100, display.prepared_retry,
+                "a", "a-2", "held",
+                [("s", "cluster_mem", "", "96G")], "", "", [], [])
+    r.contains("a setting with no observed baseline prints the value alone",
+               out, "96G")
+    r.check("and invents no arrow to put in front of it", "→" not in out, out)
+
+    for cols in (60, 74, 100):
+        text = drawn(_at_width, cols, display.prepared_retry,
+                     "study-0805", "study-0805-2", "needs attention",
+                     [("gatk_sam_to_fastq", "cluster_walltime", "0:10:00",
+                       "35:00:00")],
+                     "steps 1-23 — the whole somatic_fastpass protocol", "",
+                     ["whether 35:00:00 is sufficient for this input and this "
+                      "reference, which nothing observed here establishes"], [])
+        lines = [l for l in text.splitlines() if l.strip()]
+        r.check(f"the review screen fits a {cols}-column window",
+                max(len(l) for l in lines) <= cols,
+                f"widest={max(len(l) for l in lines)}")
+        r.check(f"and stays right of its gutter at {cols}",
+                all(l.startswith("  ▌") for l in lines),
+                [l for l in lines if not l.startswith("  ▌")][:2])
+
+    r.section("/history shows where a revision came from")
+    out = drawn(display.history_detail,
+                {"name": "study-0805-2", "status": "held", "source": "agent",
+                 "held_at": "2026-08-24T09:00:00", "workdir": "/w",
+                 "derived_from": "study-0805",
+                 "derived_reason": "relaunch_after_diagnosis",
+                 "proposal": {"slots": {"pipeline": "dnaseq"}}})
+    r.contains("the parent is named", out, "study-0805")
+    r.contains("under a label somebody can read", out, "derived from")
+    r.contains("and the reason is words, not a stored constant",
+               out, "a retry prepared from its diagnosis")
+    r.check("the constant itself never reaches the screen",
+            "relaunch_after_diagnosis" not in out, out)
+    out = drawn(display.history_detail,
+                {"name": "plain", "status": "held", "source": "agent",
+                 "workdir": "/w", "proposal": {"slots": {"pipeline": "dnaseq"}}})
+    r.check("a run that came from nowhere shows no lineage row",
+            "derived from" not in out, out)
 
     # ---------------------------------------------------------------- #
     r.section("the small messages always offer a way forward")
@@ -1011,10 +1185,34 @@ def main():
     r.equal("a documentation lookup is HELP",
             label("module load mugqic/genpipes/6.1.1 && genpipes rnaseq --help"),
             "HELP")
-    # Drawn lowercase: the label is a quiet caption on a block, not a heading
-    # shouted at the reader. _code_label's own vocabulary stays uppercase.
-    r.contains("and the label is what gets drawn", loud(
-        display.render, Msg("<execute>\nbash cmd.sh\n</execute>")), "submit")
+    # THE CAPTION IS NO LONGER THE LABEL. _code_label's vocabulary decides what
+    # is HIDDEN (HELP) and what is COLOURED as consequential (SUBMIT, GENERATE)
+    # -- both judgements, and both allowed to be. What the caption says is what
+    # ACTUALLY RAN, which is a different question with a definite answer.
+    r.equal("a shell block is captioned as the shell",
+            display._tool_of("bash cmd.sh"), "bash")
+    r.equal("...whatever purpose the label assigns it",
+            label("bash cmd.sh"), "SUBMIT")
+    # ...and a capability call is not shell at all. This is the bug: the live
+    # run captioned `show_run(name="…")` as `bash`, and nothing about it
+    # reached a shell -- the application answered it.
+    r.equal("a capability call is captioned with the capability",
+            display._tool_of('show_run(name="patient-42")'), "show_run")
+    r.equal("and so is another one",
+            display._tool_of('check_run(name="patient-42")'), "check_run")
+    # `help` and `read` are gone from the caption: both were purposes inferred
+    # from the command text, and neither is distinguishable in the execution
+    # path -- everything that is not a capability is run by a shell.
+    for shell in ("module load mugqic/genpipes/6.1.1 && genpipes rnaseq --help",
+                  "head -40 /s/job_output/DnaSeq.job_list.T1",
+                  "ls -la /s/job_output/"):
+        r.equal(f"{shell[:24]!r} is captioned bash",
+                display._tool_of(shell), "bash")
+    r.check("but the colouring judgement is untouched",
+            label("bash cmd.sh") in display._CONSEQUENTIAL)
+    r.check("and so is the hiding one", label(
+        "module load mugqic/genpipes/6.1.1 && genpipes rnaseq --help")
+        in display._HIDDEN)
 
     # ---------------------------------------------------------------- #
     r.section("long machine output is clipped at both ends, not one")
@@ -1240,9 +1438,20 @@ def main():
     # phrasing of a verb three other screens already described differently.
     # What /modify does to a submitted run -- fork it -- is a property of the
     # run's state, and the screen says the state on its own header line.
-    r.check("and it is described the way every other screen describes it",
+    # A SANCTIONED EXCEPTION, and it earns it on the consistency rule's own
+    # terms. /modify on a HELD run edits the proposal and asks again; on a
+    # SUBMITTED one it forks -- a new run is built and gated, and the launched
+    # one is not touched. "change a run before launch" is right for the first
+    # and misleading for the second: it was printed under a /diagnose of a run
+    # that had been on the scheduler for nineteen days. The rule exists so a
+    # reader learns one meaning per command; here the behaviour really is two.
+    r.check("a submitted run says /modify builds a copy",
             _offers(sent, "/modify", "pouletrun",
-                    display._ACTION_TEXT["/modify"]), sent)
+                    display.modify_text("submitted")), sent)
+    r.check("and does not imply the launched run is edited",
+            display._ACTION_TEXT["/modify"] not in sent, sent)
+    r.contains("saying plainly that this one is untouched", sent,
+               "this run is untouched")
     for stale in ("copies it into a new run", "this one is untouched",
                   "how it is doing on the scheduler",
                   "read the logs and explain a failure"):
@@ -1266,6 +1475,18 @@ def main():
                   resources="gatk_sam_to_fastq  walltime 35:00:00")
     r.contains("tuning shows as its own row, not as an ini path",
                tuned, "walltime 35:00:00")
+
+    # WHERE A REVISION CAME FROM, on the screen read before approving it.
+    # /view is where somebody asks what a run IS, and for a retry that
+    # includes which run it is a retry of.
+    retry = drawn(display.run_view, viewed, "pouletrun-3", "held",
+                  record={"status": "held", "derived_from": "pouletrun",
+                          "derived_reason": "relaunch_after_diagnosis"})
+    r.contains("a revision names the run it came from", retry, "pouletrun")
+    r.contains("and says why it exists, in the same words /history uses",
+               retry, display._DERIVED["relaunch_after_diagnosis"])
+    r.check("a run with no parent gets no such line",
+            display._DERIVED["relaunch_after_diagnosis"] not in held, held)
 
     # ---------------------------------------------------------------- #
     r.section("the transcript folds the working away, and keeps it")
@@ -2028,6 +2249,31 @@ def main():
     r.check("and never an approval that would be refused",
             "/approve" not in lapsed_view, lapsed_view)
 
+    r.section("/modify is described by what it does to THIS run")
+    r.equal("a held run: it edits the proposal",
+            display.modify_text("held"), "change a run before launch")
+    r.equal("a lapsed one too -- nothing has launched",
+            display.modify_text("lapsed"), "change a run before launch")
+    for launched in ("submitted", "submitting", "submit_failed",
+                     "submit_unknown", "gone", "abandoned"):
+        r.equal(f"a {launched} run: it builds a copy",
+                display.modify_text(launched),
+                "build a revised copy; this run is untouched")
+    # The internal key never reaches a screen as something to type.
+    for screen in (strip(drawn(display.run_view, {"command": "genpipes dnaseq"},
+                               "r", "submitted")),
+                   strip(drawn(display.diagnosis, "r",
+                               {"shaped": True, "manner": "m", "fix": "f",
+                                "override": {"s": {"k": "v"}},
+                                "evidence": [], "uncertain": [],
+                                "relaunch": "", "confidence": ""}, []))):
+        r.check("the lookup key is never printed", "@launched" not in screen,
+                screen)
+        r.contains("the fork wording is", screen, "this run is untouched")
+    # ...and /list, which is about runs in every state, keeps the generic one.
+    r.contains("while /list keeps the pre-launch wording", acted,
+               "change a run before launch")
+
     r.section("the gate keeps its own words, and that is deliberate")
     # THE ONE PLACE A DESCRIPTION IS NOT USED. gate_box is where an allocation
     # is actually spent, and "submits to Slurm — cannot be undone" is a
@@ -2041,6 +2287,155 @@ def main():
                "cannot be undone")
     r.check("and does not borrow the listing's gentler wording",
             display._ACTION_TEXT["/approve"] not in gate, gate)
+
+    r.section("a diagnosis carries no single confidence label over everything")
+    shaped = {"shaped": True, "manner": "killed by TIMEOUT after 00:10:22",
+              "cause": "the log's last entry is a progress line",
+              "evidence": ["sacct: TIMEOUT, Elapsed 00:10:22"],
+              "fix": "restore cluster_walltime to 35:00:00",
+              "override": {"gatk_sam_to_fastq": {"cluster_walltime": "35:00:00"}},
+              "relaunch": "-s 1-23",
+              "uncertain": ["whether 35:00:00 is enough for this input",
+                            "why this input needed more than ten minutes"],
+              "confidence": "likely"}
+    diag = strip(drawn(display.diagnosis, "audit-0805", shaped, []))
+    # THE BADGE IS GONE. It printed one word over a screen whose first rows are
+    # sacct facts -- "likely" above a job id, a state and a limit that are all
+    # certain. A label spanning claims of different standing takes its value
+    # from the weakest one and defames the rest.
+    r.check("no global badge, even when the model still supplies one",
+            "likely" not in diag, diag)
+    r.contains("the heading is just the diagnosis", diag, "diagnosis")
+    # ...and the doubt is where the doubt is.
+    r.contains("what is not established has its own rows", diag,
+               "not established")
+    r.contains("naming the untested value", diag,
+               "whether 35:00:00 is enough")
+    r.check("beside the fix it is about, not above the facts",
+            diag.index("fix") < diag.index("not established"), diag)
+    # The facts above it are stated plainly, with nothing hedging them.
+    head = diag[:diag.index("not established")]
+    r.contains("the scheduler's finding is stated flatly", head, "TIMEOUT")
+    r.check("with no adjective attached to it",
+            "likely" not in head and "unclear" not in head, head)
+    # A diagnosis with nothing unestablished prints no such block rather than
+    # an empty one.
+    plain = strip(drawn(display.diagnosis, "x",
+                        dict(shaped, uncertain=[], confidence=""), []))
+    r.check("and a diagnosis with no unknowns prints no empty block",
+            "not established" not in plain, plain)
+
+    r.section("the panel names the job, and does not read 0:0 as 'fine'")
+    # A paired tumour/normal run has two jobs per step whose names differ by
+    # one character. Naming only the step left the reader -- and the model --
+    # to work out which one, and on 2026-08-05 the answer came back as
+    # "COLO829N (or T -- one of the two)", leading with the sample that had
+    # COMPLETED in 00:01:39.
+    audit = drawn(display.triage, "audit-0805", {
+        "failed_total": 33, "broke_total": 1, "cancelled_total": 32,
+        "steps_affected": 23, "truncated": 18,
+        "findings": [
+            {"step": "gatk_sam_to_fastq", "count": 1, "state": "TIMEOUT",
+             "job": "gatk_sam_to_fastq.tumorPair_COLO829T",
+             "job_id": "18382352", "maxrss": None, "exit_code": "0:0",
+             "ran": True, "log": "/p/job_output/gatk/x_T.o", "log_tail": "..."},
+            {"step": "trim_fastp", "count": 1, "state": "CANCELLED",
+             "job": "trim_fastp.tumorPair_COLO829T", "job_id": "18382354",
+             "maxrss": None, "exit_code": "0:0", "ran": False,
+             "log": None, "log_tail": None}]})
+    r.contains("the exact failing job is named", audit,
+               "gatk_sam_to_fastq.tumorPair_COLO829T")
+    r.contains("with the id sacct and the log filename both agree on",
+               audit, "18382352")
+    # TIMEOUT with ExitCode 0:0 is exactly what Slurm reports for a job the
+    # walltime enforcer killed -- the job never returned a failing code of its
+    # own. Printed bare beside "timeout" it reads as a contradiction.
+    timeout_row = audit.split("trim_fastp")[0]
+    r.contains("a 0:0 beside a timeout is explained, not left bare",
+               timeout_row, "the state above is what stopped it")
+    r.check("and the state is still the thing that says it failed",
+            "timeout" in timeout_row, timeout_row)
+    # A cancelled job never started, so its recorded 0:0 is the absence of an
+    # exit status rather than one. Thirty-two identical copies of a number
+    # that means nothing about any of them is not evidence.
+    # The cancelled block runs from its step heading to the end of the panel.
+    cancelled_row = audit[audit.index("trim_fastp"):]
+    r.check("a job that never ran shows no exit code at all",
+            "exit code" not in cancelled_row, cancelled_row)
+    r.contains("only that it never ran", cancelled_row, "never ran, no log")
+
+    r.section("agent activity is drawn inside its own gutter, at any width")
+    # THE DEFECT. _rule printed every line raw. A generated command line or a
+    # job_list row is routinely 150-200 columns, so the TERMINAL wrapped it --
+    # at column zero, under the gutter and left of the rule it was supposed to
+    # sit beside. On a /diagnose screen the overflow collided with the ▌ panel.
+    display.set_verbose(True)
+    long_cmd = ("module load mugqic/genpipes/6.1.1 && genpipes dnaseq --help "
+                "2>&1 | sed -n '/somatic_fastpass/,/^$/p' | head -80\n"
+                "head -50 /home/p/genpipes_somatic_fastpass/COLO829_somatic_"
+                "fastpass_cit/job_output/DnaSeq.somatic_fastpass.job_list."
+                "2026-08-05T09.20.45")
+    long_out = ("18382365    preprocess_vcf.panel.somatic.tumorPair_COLO829    "
+                "18382364    preprocess_vcf/preprocess_vcf.panel.somatic."
+                "tumorPair_COLO829_2026-08-05T09.20.45.o")
+    for cols in (60, 80, 100, 120):
+        shown = strip(drawn(_at_width, cols, display._draw,
+                            {"kind": "code", "text": long_cmd, "label": "BASH"}))
+        shown += strip(drawn(_at_width, cols, display._draw,
+                             {"kind": "observation", "text": long_out}))
+        rows = [l for l in shown.splitlines() if l.strip()]
+        widest = max(display.cells(l) for l in rows)
+        r.check(f"nothing overflows at {cols} columns", widest <= cols,
+                f"widest={widest}\n{shown}")
+        # EVERY row stays inside the block. A continuation that starts at
+        # column zero is the bug, not a cosmetic issue: it lands under the
+        # gutter and reads as a different kind of line.
+        r.check(f"every row keeps the gutter at {cols}",
+                all(l.lstrip().startswith("\u258f") for l in rows), shown)
+        r.check(f"and continuations are indented past it at {cols}",
+                any(l.startswith("\u258f   ") for l in rows), shown)
+    # The content survives the wrap -- this folds, it does not truncate.
+    wide = strip(drawn(_at_width, 80, display._draw,
+                       {"kind": "code", "text": long_cmd, "label": "BASH"}))
+    joined = "".join(l.lstrip("\u258f ").rstrip() for l in wide.splitlines())
+    for piece in ("mugqic/genpipes/6.1.1", "somatic_fastpass", "job_list"):
+        r.contains(f"{piece!r} survives the wrap", joined, piece)
+    display.set_verbose(False)
+
+    r.section("a verbose block separates what ran from what came back")
+    display.set_verbose(True)
+    pair = strip(drawn(_at_width, 88, lambda: (
+        display._draw({"kind": "code", "text": "head -50 /a/very/long/path",
+                       "label": "BASH"}),
+        display._draw({"kind": "observation",
+                       "text": "Protocol somatic_fastpass\n1 gatk_sam_to_fastq"}))))
+    # THE TOOL, NAMED. "code" is the routing tag the model writes for our own
+    # router; "bash" is the thing a reader recognises.
+    r.contains("the command is captioned with the tool", pair, "bash")
+    r.check("not with the internal routing word", "code" not in pair, pair)
+    r.contains("and its output is captioned as output", pair, "output")
+    r.check("command before output", pair.index("bash") < pair.index("output"),
+            pair)
+    r.check("with a break between them, and the rule unbroken",
+            all(l.lstrip().startswith("\u258f")
+                for l in pair.splitlines() if l.strip()), pair)
+    # An observation with no command above it needs no boundary drawn against
+    # nothing -- its block was hidden or folded and it is the only thing here.
+    display._open_rule = None
+    lone = strip(drawn(_at_width, 88, display._draw,
+                       {"kind": "observation", "text": "a line with no command above it"}))
+    r.check("a lone observation is not captioned",
+            "output" not in lone and "bash" not in lone, lone)
+    display.set_verbose(False)
+
+    r.section("machine output is clipped in the middle, keeping both ends")
+    long_text = "\n".join(f"line {i}" for i in range(200))
+    clipped = display._clipped(long_text)
+    r.contains("the head is kept", clipped, "line 0")
+    r.contains("the tail is kept", clipped, "line 199")
+    r.contains("and the gap is counted", clipped, "more lines")
+    r.check("so a screen of output cannot bury the reply",
+            len(clipped.splitlines()) < 20, clipped)
 
     r.section("an Actions block fits the window it is drawn in")
     # _hint() used to do this for /diagnose's two lines and nothing else did it

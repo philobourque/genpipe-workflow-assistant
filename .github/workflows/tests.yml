@@ -175,6 +175,13 @@ jobs:
       - name: Reading a generated command back
         run: python tests/test_mirror.py
 
+      - name: A diagnosed fix becomes a prepared retry, not a submission
+        # The deterministic half of /relaunch: which proposed override this
+        # program will write, the step range it takes from the generated facts
+        # rather than from the model, the lineage it records, and the fact that
+        # planning one reads the original and never writes to it.
+        run: python tests/test_relaunch.py
+
       - name: Step ranges, scoped to the protocol they belong to
         # Seven dnaseq protocols whose step numbers all restart at 1. Also the
         # scoping that stops "set walltime to 24 hours" being read as step 24.
