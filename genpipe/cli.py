@@ -3026,6 +3026,13 @@ def _dispatch_line(agent, line, focus=None):
         print(f"  {display.RED}No such command: {line.split()[0]}{display.RESET}"
               f"  {display.GREY}(try /help){display.RESET}\n")
         return
+    # THE RESOLVED NAME, not the word that was typed. _resolve accepts any
+    # unambiguous abbreviation, so `/diag` runs /diagnose -- and the
+    # interrupt claim below, keyed on the raw word, did not recognise it and
+    # fell through to _scheduler_claim. Ctrl-c during `/diag <an old run>`
+    # printed the "already submitted" false alarm the read-only list exists to
+    # prevent, for the only reason that the command had been abbreviated.
+    verb = cmd
     try:
         handler(agent, args)
     except KeyboardInterrupt as stop:
@@ -3035,9 +3042,19 @@ def _dispatch_line(agent, line, focus=None):
         # begin_submission() writes before the command runs. The runs this
         # command NAMED are the ones asked about; a command with no run
         # argument gets the general answer.
+        #
+        # AND A READ-ONLY COMMAND SAYS SO PLAINLY. _scheduler_claim reads the
+        # STATUS of the runs it is handed, so ctrl-c during
+        # `/diagnose <a run submitted three weeks ago>` reported "'<name>' had
+        # already been approved -- already submitted", which is true of the run
+        # and a false alarm about the interruption: it reads as though the
+        # diagnosis might have put something on Slurm. Nothing /diagnose can
+        # call does that -- every capability the model may use is
+        # capabilities.READS -- so the honest claim is the reassuring one.
         left = getattr(stop, "genpipe_unreaped", 0)
+        claim = (_INTERRUPT_CLAIM.get(verb) or _scheduler_claim(agent, args))
         display.interrupted(
-            _scheduler_claim(agent, args),
+            claim,
             note=(f"a tool was still finishing in the background "
                   f"({left} worker{'' if left == 1 else 's'})" if left else None))
     except Exception as e:
@@ -3153,7 +3170,47 @@ def _scheduler_claim(agent, names=()):
     return runs_store.interrupt_claim(entries)
 
 
-def _turn(agent, thread, text, raw=None, label="thinking"):
+# Commands that cannot reach the scheduler, whatever the runs in this thread
+# say about themselves.
+#
+# WHY THIS LIST EXISTS. _scheduler_claim answers "could this interruption have
+# left something on Slurm" by reading the STATUS of the runs the thread holds --
+# which is right for a conversational turn, where the model may have been in
+# the middle of anything, and for /approve, where it may have been in the
+# middle of the one thing that matters. It is wrong for a read-only command:
+# ctrl-c during /diagnose on a run submitted three weeks ago printed "'<name>'
+# had already been approved -- already submitted. /check before assuming either
+# way", which is a true sentence about the RUN and a false alarm about the
+# INTERRUPTION. Nothing /diagnose does can submit anything.
+#
+# Keyed on the command, not on the run, because that is the fact in question:
+# what was interrupted. Every capability the model can call during one of these
+# is capabilities.READS (see capabilities.ENABLED), so the claim is safe.
+_READ_ONLY_COMMANDS = frozenset((
+    "check", "diagnose", "jobs", "list", "view", "history", "where",
+    "monitor", "sort", "help", "verbose", "redraw",
+))
+
+
+# What may be said after ctrl-c, for the commands that can say something
+# stronger than _scheduler_claim's reading of a run's status.
+#
+# /relaunch is here and is NOT read-only: it writes an override ini and runs a
+# GenPipes generation. What it cannot do is submit -- it ends at the gate by
+# construction -- so _scheduler_claim, which answers by reading the SOURCE
+# run's status, would report "already submitted" about a run that was launched
+# weeks ago and read as a warning about the interruption. That is the same
+# false alarm _READ_ONLY_COMMANDS exists to prevent, with a different true
+# sentence to replace it: the command did things, and none of them was a
+# submission.
+_INTERRUPT_CLAIM = dict(
+    {verb: "Nothing reached the scheduler — that command only reads."
+     for verb in _READ_ONLY_COMMANDS},
+    relaunch="Nothing reached the scheduler — /relaunch only prepares a run.",
+)
+
+
+def _turn(agent, thread, text, raw=None, label="thinking", read_only=False):
     """One exchange: the user's line in, the agent's work out.
 
     A conversation parked at the gate does not take a normal turn -- see
@@ -3182,8 +3239,12 @@ def _turn(agent, thread, text, raw=None, label="thinking"):
         note = (f"a tool was still finishing in the background "
                 f"({left} worker{'' if left == 1 else 's'}) — its output is "
                 f"suppressed from here on" if left else None)
-        display.interrupted(
-            _scheduler_claim(agent, _names_on(agent, thread)), note=note)
+        # A read-only command has no run to be uncertain about -- see
+        # _READ_ONLY_COMMANDS.
+        claim = ("Nothing reached the scheduler — that command only reads."
+                 if read_only
+                 else _scheduler_claim(agent, _names_on(agent, thread)))
+        display.interrupted(claim, note=note)
     except Exception as e:
         display.problem(f"{type(e).__name__}: {e}")
     finally:

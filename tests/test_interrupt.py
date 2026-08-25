@@ -22,6 +22,7 @@ were kept free of biomni precisely so the lifecycle can be checked in CI in
 milliseconds rather than only by pressing ctrl-c on a login node.
 """
 import io
+import os
 import sys
 import threading
 import time
@@ -234,7 +235,54 @@ def main():
                                  ("b", runs.SUBMITTING, "")])
     r.contains("several at once are counted rather than listed", many, "2 runs")
 
+    _read_only_claim(r)
     return r.finish()
+
+
+
+def _read_only_claim(r):
+    """Ctrl-c during a command that cannot submit says so.
+
+    THE FALSE ALARM. _scheduler_claim answers "could this interruption have
+    left something on Slurm" from the STATUS of the runs it is handed. That is
+    right for a conversational turn and for /approve. It is wrong for
+    /diagnose: interrupting a diagnosis of a run submitted three weeks ago
+    printed "'<name>' had already been approved -- already submitted. /check
+    before assuming either way", which is true of the RUN and a false alarm
+    about the INTERRUPTION -- it reads as though the diagnosis might have put
+    work on the cluster.
+    """
+    from genpipe import capabilities
+
+    # cli.py is not importable here -- this suite runs in the offline CI job,
+    # which installs no biomni -- so the command list is read as SOURCE. What
+    # is being asserted is a table, and a table can be checked without
+    # importing the module that acts on it. test_surface, which does have the
+    # stack, exercises the dispatcher itself.
+    r.section("interrupting a read-only command claims nothing about Slurm")
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, "genpipe", "cli.py")).read()
+    block = src[src.index("_READ_ONLY_COMMANDS = frozenset(("):]
+    block = block[:block.index("))")]
+    for verb in ("diagnose", "check", "jobs", "list", "view", "history"):
+        r.check(f"/{verb} is known to be read-only", f'"{verb}"' in block)
+    for verb in ("approve", "modify", "reject", "cancel", "hold", "track"):
+        r.check(f"/{verb} is NOT, so it still asks the registry",
+                f'"{verb}"' not in block)
+    r.contains("and the claim it makes says why", src,
+               "that command only reads")
+
+    r.section("and nothing a diagnosis may call can reach the scheduler")
+    # The claim above is only honest because of this: every capability the
+    # model is allowed to invoke is READS. LOCAL and SCHEDULER are declared so
+    # the shape is settled, and deliberately not enabled.
+    r.equal("only read-only capabilities are enabled",
+            capabilities.ENABLED, (capabilities.READS,))
+    for name, cap in sorted(capabilities.TABLE.items()):
+        r.equal(f"{name} only reads", cap.kind, capabilities.READS)
+    r.check("a submitting capability does not exist to be called",
+            not any(c.kind == capabilities.SCHEDULER
+                    for c in capabilities.TABLE.values()))
 
 
 if __name__ == "__main__":
