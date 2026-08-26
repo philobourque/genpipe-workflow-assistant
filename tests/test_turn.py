@@ -44,7 +44,8 @@ import shutil
 import sys
 import tempfile
 
-from harness import Report, ScriptedLLM, execute_block, solution
+from harness import (Report, ScriptedLLM, execute_block, solution,
+                     submission_environment)
 
 from genpipe import agent as agent_module
 from genpipe import capabilities
@@ -98,6 +99,9 @@ def seed(store, work):
 
 
 def main():
+    # This suite now drives a generation to the gate, which preflight will
+    # refuse without an allocation -- see harness.submission_environment.
+    submission_environment()
     r = Report("where a conversational turn ends")
     work = tempfile.mkdtemp(prefix="genpipe_turn_")
     store = os.path.join(work, "biomni_data")
@@ -114,12 +118,57 @@ def main():
             # draws the same panel its slash command draws; the flag exists so
             # that a future lookup with no screen of its own is not mistaken
             # for an answer.
+            # RENDERS AND ENDS_TURN ARE SEPARATE CLAIMS, and this section used
+            # to assert they were the same -- "every capability renders its own
+            # answer" -- which is what made the defect below unfixable without
+            # turning this suite red. Drawing a panel is not the same as being
+            # the whole answer, and `where` is both drawn and intermediate.
             for name, spec in sorted(capabilities.TABLE.items()):
-                r.check(f"{name} renders its own answer", spec.renders, spec)
+                r.check(f"{name} draws its own panel", spec.renders, spec)
+            # EVERY entry classified, explicitly. The factory refuses a row
+            # that leaves it unstated, so a capability added later cannot
+            # inherit "terminal" by silence -- which is exactly how `where`
+            # became terminal without anybody deciding it should be.
+            r.equal("and every one is classified terminal or intermediate",
+                    sorted(n for n, c in capabilities.TABLE.items()
+                           if isinstance(c.ends_turn, bool)),
+                    sorted(capabilities.TABLE))
+            try:
+                capabilities._c("bogus", (), (), capabilities.READS, "x",
+                                renders=True)
+                stated = False
+            except ValueError:
+                stated = True
+            r.check("a new capability must state it rather than inherit it",
+                    stated)
+            r.equal("the six that answer the person end the turn",
+                    sorted(n for n, c in capabilities.TABLE.items()
+                           if c.ends_turn),
+                    ["check_run", "diagnose_run", "inspect_jobs", "list_runs",
+                     "run_history", "show_run"])
+            r.equal("and orientation does not", 
+                    sorted(n for n, c in capabilities.TABLE.items()
+                           if not c.ends_turn),
+                    ["where"])
+
             r.contains("and the model is told so, from the table itself",
                        capabilities.protocol(), "the turn ENDS there")
             r.contains("including how to say it needs more",
                        capabilities.protocol(), f"{capabilities.CONTINUE}=True")
+            # The protocol names the intermediate one separately, and no longer
+            # claims it prints what /where prints -- cli._cmd_where builds its
+            # own richer rows and never goes through this table.
+            r.contains("the intermediate capability is named as different",
+                       capabilities.protocol(), "where is different")
+            r.contains("and said not to end the turn",
+                       capabilities.protocol(), "does NOT")
+            r.check("the false claim about /where's panel is gone",
+                    "same panel the matching command prints"
+                    not in capabilities.protocol(), capabilities.protocol())
+            for terminal in ("check_run", "list_runs"):
+                r.check(f"{terminal} is still listed as ending the turn",
+                        terminal in capabilities.protocol().split(
+                            "where is different")[0])
 
             # ============================================================== #
             r.section("the prompt and the renderer agree on what <solution> "
@@ -159,6 +208,123 @@ def main():
                                 "1. numbered", "~~struck~~", "_italic_"):
                 r.equal(f"{unsupported!r} is printed as written",
                         display._prose(unsupported), [unsupported])
+
+            # ============================================================== #
+            r.section("an orientation lookup does not end a run's turn")
+            # THE REGRESSION, and it reached a user. Asked to run a pipeline,
+            # the model wrote its plan and called where() to find out where the
+            # artifacts would land -- a reasonable first move, and the only way
+            # to get that fact, since intake.brief() deliberately stops passing
+            # os.getcwd(). where() drew its panel and the turn ENDED: no
+            # generation, no gate, no run recorded, and nothing on screen
+            # saying so. The model did the right thing; the table punished it.
+            #
+            # Driven through the REAL graph -- real router, real capability
+            # node, real gate -- against the fake cluster, because the bug was
+            # in the edge out of that node and a unit test of the flag would
+            # not have seen it.
+            #
+            # ITS OWN DIRECTORY AND ITS OWN REGISTRY. This section is the only
+            # one here that creates a run, and the sections below count what
+            # /list shows -- so sharing `work` would make this suite's results
+            # depend on the order its sections happen to run in.
+            gen = ("module load mugqic/genpipes/6.1.1 && genpipes rnaseq "
+                   "-t stringtie -s 1-5 -c rnaseq.base.ini "
+                   "common_ini/rorqual.ini -r readset.tsv -d design.tsv "
+                   "-g cmd.sh")
+            runwork = tempfile.mkdtemp(prefix="genpipe_turn_run_")
+            os.makedirs(os.path.join(runwork, "common_ini"), exist_ok=True)
+            for path in ("rnaseq.base.ini",
+                         os.path.join("common_ini", "rorqual.ini")):
+                with open(os.path.join(runwork, path), "w") as f:
+                    f.write("[DEFAULT]\ncluster_server=rorqual\n")
+            for path in ("readset.tsv", "design.tsv"):
+                with open(os.path.join(runwork, path), "w") as f:
+                    f.write("Sample\tReadset\n")
+
+            os.chdir(runwork)
+            agent = fresh(runwork, [
+                # Exactly what the real model did: a plan, then where(), with
+                # no more=True anywhere.
+                "1. [ ] check where this lands\n2. [ ] generate\n"
+                + call("where()"),
+                "Generating the pipeline script.\n" + execute_block(gen),
+                "That looks right. Submitting.\n"
+                + execute_block("bash cmd.sh"),
+            ])
+            status = agent.run("run rnaseq stringtie steps 1-5 on my readset",
+                               thread_id="w1")
+            r.equal("where ran", agent.capabilities_seen, ["where"])
+            r.equal("and the turn did not end there -- it reached the gate",
+                    status["status"], "paused")
+            r.equal("holding the command the model went on to generate",
+                    status["proposal"]["command"], "bash cmd.sh")
+            r.equal("with the slots parsed from that generation",
+                    status["proposal"]["slots"]["protocol"], "stringtie")
+            r.truthy("the generation really ran",
+                     os.path.exists(os.path.join(runwork, "cmd.sh")))
+
+            reg_w = runs_store.Registry(os.path.join(runwork, "biomni_data"))
+            held_now = [h for h in reg_w.held() if h["thread_id"] == "w1"]
+            r.equal("one run is held on disk", len(held_now), 1)
+
+            r.section("...and the approval boundary is where it always was")
+            # Continuing past `where` must reach the gate and stop there. The
+            # fix moves an edge inside the reasoning loop; it must not move the
+            # one edge that matters.
+            r.check("nothing was submitted",
+                    not os.path.isdir(os.path.join(runwork, "job_output")),
+                    os.listdir(runwork))
+            r.equal("the run is held, not submitted",
+                    held_now[0]["status"], runs_store.HELD)
+
+            r.section("a run's turn still ends at the gate, not after where")
+            # The complement: where() is not a licence to keep going forever.
+            # The graph stopped because a human has to decide, which is a
+            # different reason from the model having finished. Three calls --
+            # the plan-and-where turn, the generation, the submission -- and
+            # the gate caught the third.
+            r.equal("the model was called once per step and no more",
+                    agent.llm.calls, 3)
+            os.chdir(work)
+
+            # ============================================================== #
+            r.section("/where is a command, and the capability change misses it")
+            # THE TWO ARE NOT ONE PATH, which is why `where` could be made
+            # non-terminal for the model without special-casing anything.
+            # cli._cmd_where builds its own rows and calls display.where
+            # directly; it never consults capabilities.TABLE, never enters the
+            # graph and never reads ends_turn. Asserted rather than assumed --
+            # if the two are ever reconciled (see TODO.md) this is the test
+            # that has to be rewritten deliberately.
+            import io as _io
+            from contextlib import redirect_stdout
+            quiet = fresh(work, [])          # a script with nothing in it:
+            before = quiet.llm.calls         # any model call would exhaust it
+            buf = _io.StringIO()
+            with redirect_stdout(buf):
+                cli._cmd_where(quiet, [])
+            panel = buf.getvalue()
+            r.equal("no model call", quiet.llm.calls, before)
+            r.equal("no capability ran", quiet.capabilities_seen, [])
+            r.equal("exactly one panel",
+                    panel.count("Where this session reads and writes"), 1)
+            for row in ("cluster", "launched from", "agent workdir",
+                        "run registry", "checkpoints", "settings",
+                        "this copy"):
+                r.contains(f"the {row!r} row is still there", panel, row)
+            # Seven label rows, no more and no fewer -- a row silently added
+            # to or dropped from the command should be a deliberate edit here.
+            import re as _re
+            bare = _re.sub(r"\033\[[0-9;]*[A-Za-z]", "", panel)
+            labels = [l.split("\u258c", 1)[1].strip() for l in bare.splitlines()
+                      if "\u258c" in l and l.split("\u258c", 1)[1].strip()]
+            r.equal("seven rows, as before",
+                    sum(1 for l in labels
+                        if l.startswith(("cluster", "launched from",
+                                         "agent workdir", "run registry",
+                                         "checkpoints", "settings",
+                                         "this copy"))), 7)
 
             r.section("`more` is a statement about the turn, not an argument")
             args, more = capabilities.continues({"name": "x", "more": True})

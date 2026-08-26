@@ -1062,16 +1062,26 @@ class GenpipeA1(A1):
             #   seconds AFTER the last panel was rendered, wandering through
             #   inspect_jobs, show_run, where and run_history.
             #
-            # A capability that renders has answered the person. It ends the
-            # turn unless the model said, in the call itself, that it is not
-            # finished -- see capabilities.continues. The observation is
-            # appended either way, so the conversation remembers what happened
-            # and a later turn can build on it; what does not happen is another
-            # generation in THIS one.
+            # A capability that ANSWERS the person ends the turn, unless the
+            # model said in the call itself that it is not finished -- see
+            # capabilities.continues. The observation is appended either way,
+            # so the conversation remembers what happened and a later turn can
+            # build on it; what does not happen is another generation in THIS
+            # one.
+            #
+            # ends_turn, NOT renders, and the difference is a real defect that
+            # reached a user. They were one field, so every capability that
+            # drew a panel was treated as the end of the turn -- including
+            # `where`, which is orientation. A model preparing a run asked
+            # where the artifacts would land, the panel printed, and the turn
+            # ended: no command generated, no gate, no run recorded, and
+            # nothing on screen saying the work had been abandoned. Drawing a
+            # panel and being the answer are separate claims and are separate
+            # fields now.
             #
             # A complaint is never terminal: nothing was rendered, so the model
             # has to be given the chance to fix the call it wrote.
-            done = spec is not None and spec.renders and not more
+            done = spec is not None and spec.ends_turn and not more
             state["next_step"] = "end" if done else "generate"
             return state
 

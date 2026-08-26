@@ -91,18 +91,34 @@ class Capability:
     two kinds the same is what let a rendered diagnosis be treated as a tool
     observation and a rendered list of twenty runs be followed by "no runs
     currently recorded".
+
+    `ends_turn` IS A SEPARATE CLAIM FROM `renders`, and separating them is what
+    this field exists for. `renders` says the action draws a panel somebody
+    reads. `ends_turn` says the result is normally the whole of what was asked
+    for, so the reasoning loop stops there. Six of the seven entries are both.
+    `where` is the one that is neither the same nor reducible: it draws a real
+    panel AND is orientation a model reaches for on its way to something else,
+    which is exactly the case the paragraph above anticipated.
+
+    Both are declared explicitly on every entry -- there is no default here on
+    purpose. A new capability that inherited "terminal" silently would fail the
+    way `where` did: the model calls it mid-task, the turn ends, and nothing on
+    screen says the work was abandoned. Classifying it is one word and it is
+    the author's to write down.
     """
 
-    __slots__ = ("name", "args", "required", "kind", "summary", "renders")
+    __slots__ = ("name", "args", "required", "kind", "summary", "renders",
+                 "ends_turn")
 
     def __init__(self, name, args=(), required=(), kind=READS, summary="",
-                 renders=False):
+                 renders=False, ends_turn=False):
         self.name = name
         self.args = tuple(args)
         self.required = tuple(required)
         self.kind = kind
         self.summary = summary
         self.renders = bool(renders)
+        self.ends_turn = bool(ends_turn)
 
     @property
     def enabled(self):
@@ -112,8 +128,19 @@ class Capability:
         return f"<Capability {self.name}({', '.join(self.args)}) {self.kind}>"
 
 
-def _c(name, args=(), required=(), kind=READS, summary="", renders=False):
-    return Capability(name, args, required, kind, summary, renders)
+def _c(name, args=(), required=(), kind=READS, summary="", renders=False,
+       ends_turn=None):
+    """One table row. `ends_turn` is required -- see Capability.
+
+    Not defaulted. A missing classification raises here rather than picking a
+    value, because both answers are wrong for some capability and the one that
+    is wrong silently is the one that ends a turn nobody asked to end.
+    """
+    if ends_turn is None:
+        raise ValueError(
+            f"{name}: ends_turn must be stated. True if this action is normally "
+            f"the whole answer, False if it is evidence on the way to one.")
+    return Capability(name, args, required, kind, summary, renders, ends_turn)
 
 
 # The table. Read-only for now; every entry is backed by a method the
@@ -125,30 +152,43 @@ TABLE = {
            "the overall state of one run as the scheduler reports it: how many "
            "jobs are queued, running, done or broken, and the root cause if "
            "something failed. `name` may be \"all\" for every run.",
-           renders=True),
+           renders=True, ends_turn=True),
         _c("inspect_jobs", ("name", "failed"), ("name",), READS,
            "every individual job inside a run and its state, grouped by step. "
            "`failed` true narrows it to the ones that did not complete.",
-           renders=True),
+           renders=True, ends_turn=True),
         _c("diagnose_run", ("name", "question"), ("name",), READS,
            "read the logs of a run's failed jobs and explain what went wrong. "
            "Gathers the evidence first, then reasons over it. `question` "
            "narrows the investigation.",
-           renders=True),
+           renders=True, ends_turn=True),
         _c("show_run", ("name",), ("name",), READS,
            "the exact GenPipes command a run is, flag by flag, and what can "
            "still be done to it.",
-           renders=True),
+           renders=True, ends_turn=True),
         _c("list_runs", (), (), READS,
            "the runs that currently need attention or are still going.",
-           renders=True),
+           renders=True, ends_turn=True),
         _c("run_history", (), (), READS,
            "every run ever recorded, including finished and abandoned ones.",
-           renders=True),
+           renders=True, ends_turn=True),
+        # THE ONE INTERMEDIATE ENTRY. It draws a panel, so renders is True;
+        # it is almost never the whole of what was asked, so ends_turn is not.
+        #
+        # A model preparing a run wants to know where the artifacts will land
+        # before it writes a command, which is a reasonable thing to want and
+        # was the only way to get it. With ends_turn tied to renders, asking
+        # ended the turn: the panel printed, the plan was abandoned, and
+        # nothing said so. See the note above _run_capability.
+        #
+        # Someone who asks "where does this write?" therefore costs one extra
+        # model call -- the rows come back as an observation and the model says
+        # a sentence over them. That is the right trade against silently
+        # dropping a run somebody asked for.
         _c("where", (), (), READS,
            "the directories this session is using: the cluster, the working "
            "directory, the run registry and the checkpoint store.",
-           renders=True),
+           renders=True, ends_turn=False),
     )
 }
 
@@ -247,19 +287,34 @@ def catalogue():
 def protocol():
     """How a call ends a turn, stated for the model. Generated, not written.
 
-    Derived from the table's own `renders` flags for the same reason
+    Derived from the table's own `ends_turn` flags for the same reason
     catalogue() is generated: what the model is told and what the code does
     cannot be allowed to drift, and this particular sentence decides whether a
     person gets their prompt back.
+
+    READ OFF ends_turn, NOT renders. Those were the same field once, and the
+    sentence this produced then told the model that every drawn panel was the
+    end of its turn -- true of six entries and false of `where`, which is
+    orientation rather than an answer.
+
+    It also claimed each of them prints "the same panel the matching command
+    prints". That is the rule for the other six (agent._CAPABILITY handlers
+    call the same methods the slash commands call) and it is not true of
+    `where`: cli._cmd_where builds its own richer rows and never goes through
+    this table at all. The claim is dropped rather than qualified -- what the
+    model needs to know is which calls END, and the panel's provenance is not
+    its business.
     """
-    drawn = sorted(n for n, c in TABLE.items() if c.enabled and c.renders)
+    drawn = sorted(n for n, c in TABLE.items() if c.enabled and c.ends_turn)
+    more_first = sorted(n for n, c in TABLE.items()
+                        if c.enabled and not c.ends_turn)
     if not drawn:
         return ""
-    return (
-        f"EACH OF THESE ANSWERS THE PERSON ITSELF. {', '.join(drawn)} print the "
-        f"same panel the matching command prints, Actions block included, and "
-        f"the turn ENDS there -- you are not called again to summarise it, and "
-        f"you must not, because they are already reading it.\n\n"
+    out = (
+        f"EACH OF THESE ANSWERS THE PERSON ITSELF. {', '.join(drawn)} draw the "
+        f"complete answer on screen, Actions block included, and the turn ENDS "
+        f"there -- you are not called again to summarise it, and you must not, "
+        f"because they are already reading it.\n\n"
         f"If the panel is not the whole of what you were asked for, say so IN "
         f"THE CALL by adding {CONTINUE}=True:\n\n"
         f"    check_run(name=\"run-a\", {CONTINUE}=True)\n\n"
@@ -267,3 +322,12 @@ def protocol():
         f"what \"check it, and diagnose it if it failed\" needs, and what "
         f"\"how are my runs doing\" does not. Leave it off when the panel "
         f"answers the question.")
+    if more_first:
+        out += (
+            f"\n\n{', '.join(more_first)} {'is' if len(more_first) == 1 else 'are'} "
+            f"different: {'it draws' if len(more_first) == 1 else 'they draw'} a "
+            f"panel too, but the result comes back to you and the turn does NOT "
+            f"end. Use {'it' if len(more_first) == 1 else 'them'} freely on the "
+            f"way to something else -- you do not need {CONTINUE} to carry on "
+            f"afterwards, and you should carry on.")
+    return out
