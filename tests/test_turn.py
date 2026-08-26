@@ -121,6 +121,45 @@ def main():
             r.contains("including how to say it needs more",
                        capabilities.protocol(), f"{capabilities.CONTINUE}=True")
 
+            # ============================================================== #
+            r.section("the prompt and the renderer agree on what <solution> "
+                      "may contain")
+            # A DRIFT TEST, not a wording test. display._prose renders exactly
+            # three markers; the prompt asks for exactly those three. Either
+            # side can be reworded freely -- what must not happen is one side
+            # growing or losing a marker on its own, because the failure that
+            # produces is invisible: the model writes something reasonable and
+            # the terminal prints it as punctuation.
+            contract = agent_module.SYSTEM_PROMPT
+            for marker, why in (("**", "emphasis"),
+                                ("`", "inline code"),
+                                ("- ", "a leading bullet")):
+                r.check(f"the prompt names {why}", marker in contract, why)
+
+            # And the renderer really does handle each of them, so the prompt
+            # is not promising a rendering that does not exist.
+            r.equal("emphasis renders",
+                    display._prose("**a**"), [f"{display.BOLD}a{display.RESET}"])
+            r.equal("inline code renders",
+                    display._prose("`a`"),
+                    [f"{display.SECONDARY}a{display.RESET}"])
+            r.equal("a bullet renders",
+                    display._prose("- a"),
+                    [f"{display.GREY}\u2022{display.RESET} a"])
+
+            # The unsupported forms are named as unsupported. Concepts, not
+            # sentences -- the wording around them is free to change.
+            for word in ("heading", "table", "nested", "fence"):
+                r.check(f"{word}s are addressed", word in contract.lower(), word)
+
+            # The boundary that keeps this honest: nothing else is rendered, so
+            # a fourth marker added to the renderer without a line in the
+            # prompt fails here.
+            for unsupported in ("## Heading", "| a | b |", "> quote",
+                                "1. numbered", "~~struck~~", "_italic_"):
+                r.equal(f"{unsupported!r} is printed as written",
+                        display._prose(unsupported), [unsupported])
+
             r.section("`more` is a statement about the turn, not an argument")
             args, more = capabilities.continues({"name": "x", "more": True})
             r.equal("it is stripped before the handler sees it", args, {"name": "x"})

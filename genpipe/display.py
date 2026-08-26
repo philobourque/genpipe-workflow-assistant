@@ -1511,6 +1511,102 @@ def _tty():
         return False
 
 
+# ---------------------------------------------------------------------------
+# Model prose, and the three markers a real model habitually uses.
+#
+# WHY THIS EXISTS. <solution> is the one output path in this module whose
+# presentation was never decided. It was drawn with _rule until 4b9393f, which
+# replaced that with a raw print loop -- for label-and-rule reasons, not
+# content ones -- and _rule then learned to wrap without the prose path
+# following. So the agent's own reply was the only block printed exactly as the
+# model typed it, asterisks and backticks included.
+#
+# NARROW ON PURPOSE, and this is not a markdown renderer. diagnosis.py settled
+# the question of whether a real model emits markup when asked for a shape --
+# "the model's habitual markdown bolding", diagnosis.py:133 -- and answered it
+# the same way: ask for a small subset in the prompt, then tolerate what turns
+# up. Three markers are understood here. Everything else is printed as the
+# characters the model wrote, because unsupported markup must stay readable and
+# must never be silently deleted.
+#
+# NO WRAPPING, deliberately. Every other block in this module wraps; this one
+# does not, because re-flowing a line would put a newline into a command
+# somebody is about to paste. That is a separate decision from this one.
+#
+# Colours are read at call time and never bound at import -- retheme() rebinds
+# these globals, and under NO_COLOR every token is "" so the markers are simply
+# stripped.
+
+# A fence opens or closes a block that is passed through untouched, fence lines
+# and all. Rewriting one would mean reflowing or restyling a command, and a
+# fenced command is the single most likely thing on the screen to be copied.
+_FENCE = re.compile(r"^\s*```")
+
+# A bullet is a line-leading -, * or bullet glyph followed by space and content.
+# The space is what keeps "**bold**" from reading as a bullet.
+_BULLET = re.compile(r"^(\s*)[-*\u2022][ \t]+(?=\S)")
+
+# One pass, alternation ordered so a code span wins at the same position: the
+# `**` inside `a ** b` written as code is text, not emphasis. Both alternatives
+# are single-line -- markup never spans a newline, so an unclosed marker stops
+# at the end of its own line instead of swallowing the paragraph under it.
+_INLINE = re.compile(r"`([^`\n]+)`|\*\*(\S(?:[^*\n]*\S)?)\*\*")
+
+# Code inside a bold span. The nesting is one level and one direction: bold may
+# contain code, code contains nothing.
+_CODE_ONLY = re.compile(r"`([^`\n]+)`")
+
+
+def _inline(text):
+    """`code` and **bold** as styles. Unpaired markers stay literal.
+
+    THE NESTED CASE IS WHY THIS IS NOT TWO SUBSTITUTIONS. A real model writes
+    **`germline_snv`** and **the `germline_snv` protocol** -- code inside
+    emphasis -- and the naive rendering closes the inner span with RESET, which
+    clears every attribute rather than just the colour. The word after it then
+    loses the bold it was meant to keep. So an inner span ends by restoring
+    BOLD, and bold is never switched off before the colour is applied, which is
+    what makes nested code read as bold AND coloured rather than as a hole in
+    the emphasis.
+    """
+    def one(m):
+        if m.group(1) is not None:
+            return f"{SECONDARY}{m.group(1)}{RESET}"
+        inner = _CODE_ONLY.sub(
+            lambda c: f"{SECONDARY}{c.group(1)}{RESET}{BOLD}", m.group(2))
+        # A restore left at the very end would enable an attribute nothing goes
+        # on to use, so it is trimmed rather than emitted and immediately reset.
+        if BOLD and inner.endswith(BOLD):
+            inner = inner[:-len(BOLD)]
+            return f"{BOLD}{inner}"
+        return f"{BOLD}{inner}{RESET}"
+    return _INLINE.sub(one, text)
+
+
+def _prose(text):
+    """Model prose as terminal lines. Returns a list; prints nothing.
+
+    Line count is preserved exactly -- one line in, one line out -- which is
+    the property that says no wrapping was introduced here.
+    """
+    out, fenced = [], False
+    for raw in (text or "").splitlines():
+        if _FENCE.match(raw):
+            fenced = not fenced
+            out.append(raw)
+            continue
+        if fenced or not raw.strip():
+            out.append(raw)
+            continue
+        bullet = _BULLET.match(raw)
+        if bullet:
+            out.append(f"{bullet.group(1)}{GREY}\u2022{RESET} "
+                       f"{_inline(raw[bullet.end():])}")
+            continue
+        out.append(_inline(raw))
+    return out
+
+
 def _draw(event):
     """Draw one parsed event."""
     k = event["kind"]
@@ -1570,11 +1666,15 @@ def _draw(event):
         print(f"{GREY}\u258f{RESET} {_answer_line(event['text'])}\n")
 
     elif k == "solution":
-        # The reply itself. Plain text, no rule, no label -- this is the agent
-        # talking, and in a two-party conversation the second party does not
-        # need to be introduced. "SOLUTION" was Biomni's word for the tag and
-        # made every answer sound like the end of an exercise.
-        for line in (event["text"] or "").splitlines():
+        # The reply itself. No rule, no label -- this is the agent talking, and
+        # in a two-party conversation the second party does not need to be
+        # introduced. "SOLUTION" was Biomni's word for the tag and made every
+        # answer sound like the end of an exercise.
+        #
+        # Through _prose, which renders the three markers the prompt asks for
+        # and leaves everything else as typed. It does not wrap: the indent
+        # below is the only thing added to a line.
+        for line in _prose(event["text"]):
             print(f"  {line}" if line.strip() else "")
         print()
 

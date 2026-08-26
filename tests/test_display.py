@@ -2815,6 +2815,121 @@ def main():
     r.contains("a straggler is named rather than hidden", left,
                "a tool is still finishing")
 
+    # ====================================================================== #
+    r.section("model prose: the three markers, and everything else left alone")
+    # THE FIXTURES ARE REAL MODEL OUTPUT. The scripted stand-in in
+    # fakecluster._chat() cannot emit markdown -- deliberately, it refuses to
+    # invent GenPipes prose -- so no suite here could observe what a real model
+    # actually writes until these went in. Two of them are copied verbatim from
+    # a session transcript.
+
+    def prose(text):
+        return "\n".join(display._prose(text))
+
+    def painted_prose(text):
+        return "\n".join(display._prose(text))
+
+    plain = lambda t: strip(prose(t))
+
+    r.equal("**bold** loses its asterisks", plain("**What they're for**"),
+            "What they're for")
+    r.check("and is emphasised", display.BOLD in painted_prose("**a**"),
+            painted_prose("**a**"))
+    r.equal("`code` loses its backticks", plain("run `PAIRED_END` here"),
+            "run PAIRED_END here")
+    r.check("and is set in the secondary role, never the command green",
+            display.SECONDARY in painted_prose("`x`")
+            and display.GREEN not in painted_prose("`x`"),
+            painted_prose("`x`"))
+    r.equal("a leading bullet becomes one glyph",
+            plain("- **Sample** \u2014 the name"),
+            "\u2022 Sample \u2014 the name")
+    r.equal("an indented bullet keeps its indent",
+            plain("    - two"), "    \u2022 two")
+
+    # ---- the nested case, from the transcript --------------------------- #
+    # Code inside emphasis. The naive rendering closes the inner span with
+    # RESET, which clears every attribute rather than the colour alone, and the
+    # word after it silently loses the bold it was meant to keep.
+    r.equal("**`code`** keeps its content exactly once",
+            plain("**`germline_snv`**"), "germline_snv")
+
+    nested = painted_prose("**the `germline_snv` protocol**")
+    r.equal("and in a sentence the content is whole",
+            strip(nested), "the germline_snv protocol")
+    r.check("the nested span is coloured", display.SECONDARY in nested, nested)
+    # The property that matters, stated as a property: whatever follows the
+    # inner span is still bold. Read off the bytes rather than asserted about
+    # one fixture -- the text after the code span must be preceded by a BOLD
+    # with no RESET between it and the text.
+    tail = nested.split("germline_snv")[1]
+    r.check("and the emphasis after it is restored, not cancelled",
+            tail.index(display.BOLD) < tail.index(" protocol"), repr(tail))
+
+    # ---- degrade to literal, never delete -------------------------------- #
+    for text, why in (
+            ("a ** b ** c", "spaced asterisks are not emphasis"),
+            ("2 * 3 * 4", "arithmetic is not emphasis"),
+            ("`unclosed backtick", "a lone backtick stays a backtick"),
+            ("50% of **", "a trailing marker is text"),
+    ):
+        r.equal(why, plain(text), text)
+
+    r.equal("a marker never spans a newline", plain("**a\nb**"), "**a\nb**")
+
+    # A valid **pair** around an unpaired backtick: the emphasis is real and is
+    # consumed, the backtick is not and stays on screen. Content is what must
+    # survive, not the markers that happened to be around it.
+    r.equal("an unpaired backtick inside real emphasis stays literal",
+            plain("**a `b**"), "a `b")
+    r.check("and the emphasis around it still applies",
+            display.BOLD in painted_prose("**a `b**"),
+            painted_prose("**a `b**"))
+
+    # ---- fenced blocks: byte-for-byte ------------------------------------ #
+    fence = ("Here is one:\n\n```bash\n"
+             "module load mugqic/genpipes/6.1.1 && genpipes rnaseq_light \\\n"
+             "  -c $GENPIPES_INIS/rnaseq_light/rnaseq_light.base.ini \\\n"
+             "  -r readset.rnaseq.txt -s 1-5 -g cmd.sh\n"
+             "```\n\nThen `bash cmd.sh` submits it.")
+    out = prose(fence)
+    body = fence.split("```bash\n")[1].split("\n```")[0]
+    r.check("a fenced command is passed through untouched", body in strip(out),
+            out)
+    r.check("including the fence lines themselves", "```bash" in strip(out), out)
+    r.check("nothing inside a fence is styled",
+            display.SECONDARY not in painted_prose(fence).split("```")[1],
+            painted_prose(fence))
+    r.contains("while prose outside it is still rendered", strip(out),
+               "Then bash cmd.sh submits it")
+
+    # ---- the two hard constraints, as properties ------------------------- #
+    cases = ["**a**", "`b`", "- c", "**the `d` e**", "a ** b", fence,
+             "x" * 300]
+    r.equal("no line is ever split -- this patch adds no wrapping",
+            [len(display._prose(t)) for t in cases],
+            [len(t.splitlines()) for t in cases])
+    r.equal("and the visible width is the text without its markers",
+            display._vis_len(painted_prose("**the `d` e**")),
+            len("the d e"))
+
+    # ---- theme ----------------------------------------------------------- #
+    was = display.THEME
+    try:
+        display.retheme({"NO_COLOR": "1"})
+        bare = "\n".join(display._prose("**the `germline_snv` protocol**"))
+        r.equal("under NO_COLOR the markers are stripped", bare,
+                "the germline_snv protocol")
+        r.check("and nothing escaped is emitted", "\033" not in bare, repr(bare))
+    finally:
+        display.retheme({"GENPIPE_THEME": was})
+
+    # ---- and it is actually wired to <solution> -------------------------- #
+    shown = drawn(display.render, Msg("<solution>**Bold** and `code`.</solution>"))
+    r.contains("a real reply arrives rendered", shown, "Bold and code.")
+    r.check("with no markers left on screen",
+            "**" not in shown and "`" not in shown, shown)
+
     return r.finish()
 
 
