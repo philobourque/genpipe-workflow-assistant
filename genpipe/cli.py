@@ -3210,6 +3210,39 @@ _INTERRUPT_CLAIM = dict(
 )
 
 
+def _say_nothing_was_prepared(agent, outcome):
+    """A turn that generated and produced no run says so.
+
+    THE SILENCE THIS CLOSES. `agent.run()` returning normally printed nothing.
+    That is right for a turn that was only ever talk -- the answer is the
+    answer -- and wrong for one that actually ran `genpipes ... -g` and then
+    stopped: real work happened, no run exists, and the screen looked exactly
+    like a conversation that had finished. The first report of it was a turn
+    that ended on a rendered panel with a half-ticked plan above it and nothing
+    saying the run had been abandoned.
+
+    DETERMINISTIC, AND NOT AN INTENT CLASSIFIER. Two facts, both observed
+    rather than interpreted: whether the graph ran a generation block
+    (gate.is_generation, recorded by the router as it passed) and what the
+    graph returned. No sentence is read, nothing decides whether a request
+    "looked like" run preparation, and a turn that only talked is left alone --
+    which is the common case and the one that must stay quiet.
+
+    `paused` means the gate has it and the HOLD box is already on screen.
+    `asking` means a question is on screen. Both are outcomes somebody can see;
+    only a plain `done` after a generation is the silent one.
+    """
+    if (outcome or {}).get("status") != "done":
+        return
+    if not getattr(agent, "_generated_this_turn", False):
+        return
+    display.nothing(
+        "No run was prepared.",
+        "A command was generated but nothing reached the approval gate, so "
+        "there is nothing held and nothing submitted. Say what to change, or "
+        "ask again.")
+
+
 def _turn(agent, thread, text, raw=None, label="thinking", read_only=False):
     """One exchange: the user's line in, the agent's work out.
 
@@ -3230,7 +3263,8 @@ def _turn(agent, thread, text, raw=None, label="thinking", read_only=False):
     try:
         with ui.Activity(label) as act:
             agent.on_ask = _asker(act)
-            agent.run(text, thread_id=thread, on_step=_narrate(act))
+            outcome = agent.run(text, thread_id=thread, on_step=_narrate(act))
+        _say_nothing_was_prepared(agent, outcome)
     except KeyboardInterrupt as stop:
         # A tool that was still finishing when the deadline expired. Named
         # rather than swallowed: its output is muted from here on, so this line
@@ -3439,7 +3473,10 @@ def _briefed(line, already_sent, directory=None):
     look, rather than describing whatever happens to be on the floor where the
     app was launched (AGENT-FIXES.md defect 1).
     """
-    briefed = intake.brief(line, directory)
+    # os.getcwd() as the RUN OUTPUT DIRECTORY, which is a fact about the
+    # session, and never as a directory to search. intake.brief() states it and
+    # passes it to nothing that lists files -- see its docstring on defect 1a.
+    briefed = intake.brief(line, directory, workdir=os.getcwd())
     if intake.CONTEXT_MARK not in briefed:
         return line, already_sent
     context = briefed.split(intake.CONTEXT_MARK, 1)[1].strip()

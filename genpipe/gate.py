@@ -1098,6 +1098,23 @@ def submission_line(code):
     return code.strip()
 
 
+def is_generation(code):
+    """Is this block a GenPipes generation -- `genpipes ... -g <script>`?
+
+    The counterpart to is_submission, and deliberately far less consequential:
+    generating writes a script and spends nothing, which is why it runs
+    ungated. It is worth recognising anyway, because a turn that generated and
+    then ended without reaching the gate did real work and produced no run, and
+    that is the one silent outcome worth saying out loud. See cli._talk.
+
+    One definition, used by generation_command below and by the agent's
+    per-turn flag, so "what counts as a generation" cannot be answered two
+    ways.
+    """
+    text = code or ""
+    return "genpipes" in text and "-g" in text
+
+
 def generation_command(messages):
     """Find the genpipes generation command in the history, most recent first.
 
@@ -1114,7 +1131,7 @@ def generation_command(messages):
         content = getattr(m, "content", "") or ""
         blocks = re.findall(r"<execute>(.*?)</execute>", content, re.DOTALL)
         for block in reversed(blocks):
-            if "genpipes" in block and "-g" in block:
+            if is_generation(block):
                 return block
     return ""
 

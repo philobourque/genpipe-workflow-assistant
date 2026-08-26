@@ -326,6 +326,82 @@ def main():
                                          "checkpoints", "settings",
                                          "this copy"))), 7)
 
+            # ============================================================== #
+            r.section("a turn that generated and produced no run says so")
+            # THE SILENCE. agent.run() returning normally printed nothing, which
+            # is right for talk and wrong for a turn that ran `genpipes ... -g`
+            # and then stopped: real work happened, no run exists, and the
+            # screen looked like a conversation that had simply finished.
+            #
+            # Deterministic and not an intent classifier -- two observed facts,
+            # whether the router saw a generation block and what the graph
+            # returned. Nothing reads a sentence.
+            import io as _io2
+            from contextlib import redirect_stdout as _rso
+
+            genwork = tempfile.mkdtemp(prefix="genpipe_turn_gen_")
+            for path in ("readset.tsv", "design.tsv", "rnaseq.base.ini"):
+                with open(os.path.join(genwork, path), "w") as f:
+                    f.write("Sample\tReadset\n")
+            os.chdir(genwork)
+
+            # Generates, then answers in prose instead of submitting. The graph
+            # ends normally; nothing was held.
+            agent = fresh(genwork, [
+                "Generating.\n" + execute_block(
+                    "module load mugqic/genpipes/6.1.1 && genpipes rnaseq "
+                    "-t stringtie -s 1-5 -c rnaseq.base.ini -r readset.tsv "
+                    "-g cmd.sh"),
+                solution("I have written the command out for you."),
+            ])
+            buf = _io2.StringIO()
+            with _rso(buf):
+                out = agent.run("run rnaseq stringtie", thread_id="g1")
+                cli._say_nothing_was_prepared(agent, out)
+            said = buf.getvalue()
+            r.equal("the graph ended normally", out["status"], "done")
+            r.check("the router recorded that a generation ran",
+                    agent._generated_this_turn)
+            r.contains("and the turn does not end in silence", said,
+                       "No run was prepared")
+            r.contains("saying plainly that nothing is held", said,
+                       "nothing reached the approval gate")
+
+            r.section("...but ordinary talk still ends quietly")
+            # The other half, and the one that keeps this from becoming noise
+            # on every answer.
+            agent = fresh(genwork, [solution("A walltime is a time limit.")])
+            buf = _io2.StringIO()
+            with _rso(buf):
+                out = agent.run("what does cluster_walltime mean?",
+                                thread_id="g2")
+                cli._say_nothing_was_prepared(agent, out)
+            said = buf.getvalue()
+            r.check("no generation was recorded",
+                    not agent._generated_this_turn)
+            r.check("and nothing is said about runs", "No run was prepared"
+                    not in said, said)
+
+            r.section("...and a turn that reached the gate says nothing extra")
+            # `paused` means the HOLD box is already on screen. Saying "no run
+            # was prepared" under it would be false.
+            agent = fresh(genwork, [
+                "Generating.\n" + execute_block(
+                    "module load mugqic/genpipes/6.1.1 && genpipes rnaseq "
+                    "-t stringtie -s 1-5 -c rnaseq.base.ini -r readset.tsv "
+                    "-d design.tsv -g cmd.sh"),
+                "Submitting.\n" + execute_block("bash cmd.sh"),
+            ])
+            buf = _io2.StringIO()
+            with _rso(buf):
+                out = agent.run("run rnaseq stringtie", thread_id="g3")
+                cli._say_nothing_was_prepared(agent, out)
+            said = buf.getvalue()
+            r.equal("the gate has it", out["status"], "paused")
+            r.check("so the invariant stays quiet",
+                    "No run was prepared" not in said, said)
+            os.chdir(work)
+
             r.section("`more` is a statement about the turn, not an argument")
             args, more = capabilities.continues({"name": "x", "more": True})
             r.equal("it is stripped before the handler sees it", args, {"name": "x"})

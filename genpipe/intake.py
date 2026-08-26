@@ -27,6 +27,7 @@ silence: silence gets asked about, a confident wrong guess does not.
 import os
 import re
 
+from . import preflight
 from . import slots
 
 # Longest first, so rnaseq_denovo_assembly is not matched as rnaseq. Underscores
@@ -506,7 +507,7 @@ def near_miss(name, directory=None):
 CONTEXT_MARK = "--- context for you, not typed by the user ---"
 
 
-def brief(text, directory=None):
+def brief(text, directory=None, workdir=None):
     """The request, plus what can be established about it without asking.
 
     Appended rather than rewritten, so the person's own words stay in front of
@@ -540,6 +541,29 @@ def brief(text, directory=None):
                                 "can't open 'readset.rnaseq.txt'", and a wasted
                                 generation later it was asking where the file
                                 was. It can ask that first.
+
+    `workdir` is WHERE A RUN WILL BE WRITTEN -- the directory GenPipes will
+    put cmd.sh, job_output/ and the job list in. Stated, never searched, and
+    that distinction is the whole reason it is a parameter rather than an
+    os.getcwd() call in here.
+
+    The defect this is careful about (AGENT-FIXES.md defect 1a) was passing cwd
+    as the DISCOVERY ROOT: brief() listed it, bucketed anything named like a
+    readset or a design, and offered the repo's own committed design.tsv as a
+    candidate for whatever had been asked. The fix in 1594469 was to stop
+    guessing a directory, and that stands -- candidates() is still reached only
+    from directories named in the request and from the carried project
+    directory, and this value is passed to neither. It becomes one line of
+    text saying where output lands.
+
+    Without it the model has no location facts at all, which is how a run
+    request ended up calling the `where` capability just to find out where it
+    was standing. Three facts earn their place: this, and the cluster and its
+    ini, which are read from the machine here because they are literal tokens
+    in the command being written (genpipes.md section 5, layer 4: "Check
+    hostname; do not assume"). The agent workdir, the registry and the
+    checkpoint store are not here -- they are /where's business and change
+    nothing the model writes.
 
     Sent only on the first message of a conversation. After that it is in the
     history, and repeating it every turn would be a standing invitation to
@@ -599,10 +623,37 @@ def brief(text, directory=None):
         if hits:
             named[where] = hits
 
-    if not known and not seen and not missing and not named:
+    # Location facts, which unlike everything above are true of the session
+    # rather than of the request -- so they are assembled even when the request
+    # named nothing this function could resolve.
+    # ANCHORED ON workdir, and nothing is emitted without it. The cluster and
+    # its ini are readable from the machine at any time, and emitting them on
+    # their own would put a context block under "hello" -- turning every line
+    # of talk into a briefing. The caller passing a run output directory is the
+    # signal that location is relevant; this function still never guesses.
+    place = []
+    if workdir:
+        place.append(f"- run output directory: {workdir}")
+        here_now = preflight.cluster()
+        if here_now:
+            place.append(f"- cluster: {here_now}")
+            ini = preflight.cluster_ini()
+            if ini:
+                place.append(f"- cluster ini: {ini}")
+
+    if not known and not seen and not missing and not named and not place:
         return text
 
     lines = [text, "", CONTEXT_MARK]
+    if place:
+        # WHERE THIS SESSION IS, not what is in it. No directory named here is
+        # listed, searched or offered as a candidate for any slot -- see the
+        # note in this function's docstring about defect 1a.
+        lines.append("Where this session is. These are facts about the "
+                     "session, not files found in it -- nothing here is a "
+                     "candidate readset, design or pairs file:")
+        lines += place
+        lines.append("")
     if known:
         # PARSED, NOT CHOSEN. This used to read "Already settled by the request
         # above -- do not ask again", which is the same overreach that was

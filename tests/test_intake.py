@@ -811,4 +811,68 @@ try:
 finally:
     shutil.rmtree(_work, ignore_errors=True)
 
+# ========================================================================== #
+r.section("where the session is, without looking at what is in it")
+# THE BOUNDARY, as a test, because it is one line of code away from being the
+# old bug again. AGENT-FIXES.md defect 1a was brief() taking os.getcwd() as the
+# DISCOVERY ROOT: it listed that directory, bucketed anything named like a
+# readset or a design, and offered this repo's own committed design.tsv as a
+# candidate for whatever had been asked. 1594469 stopped it guessing a
+# directory at all.
+#
+# The run output directory has to come back -- without it the model has no
+# location facts and reaches for the `where` capability in the middle of
+# preparing a run -- so what must hold is that it comes back as a STATED FACT
+# and never as a place to search.
+_yard = tempfile.mkdtemp(prefix="genpipe_phantom_")
+try:
+    for _name, _head in (("design.tsv", "Sample\tContrast\n"),
+                         ("readset.tsv", "Sample\tReadset\n")):
+        with open(os.path.join(_yard, _name), "w") as _f:
+            _f.write(_head)
+
+    said = intake.brief("run rnaseq stringtie steps 1-5", workdir=_yard)
+    r.contains("the run output directory is stated", said, _yard)
+    r.contains("and labelled as where output lands", said,
+               "run output directory")
+    for ghost in ("design.tsv", "readset.tsv"):
+        r.check(f"{ghost} sitting in it is not offered", ghost not in said, said)
+    r.check("no candidate block is built from it",
+            "possible design" not in said and "possible readset" not in said,
+            said)
+    r.contains("and the brief says what these facts are not", said,
+               "not files found in it")
+
+    # The same directory NAMED in the request is a different thing and must
+    # still be read. That is the behaviour brief() exists for, and the test
+    # that stops this section being satisfied by breaking discovery entirely.
+    named = intake.brief(f"run rnaseq on the data in {_yard}", workdir=_yard)
+    r.contains("a directory the person named is still listed", named,
+               "possible readset")
+
+    r.section("...and the facts stop where /where's business begins")
+    # Three facts, each a token in the command being written or deciding its
+    # content. The rest of /where's rows change nothing the model writes.
+    r.contains("the cluster is briefed", said, "cluster:")
+    r.contains("and its ini, which lands on -c", said, "cluster ini:")
+    for unwanted in ("agent workdir", "run registry", "checkpoints",
+                     "settings", "this copy"):
+        r.check(f"{unwanted!r} is not briefed", unwanted not in said, said)
+
+    r.section("and talk is left alone")
+    # Anchored on the workdir the caller passes. The cluster is readable from
+    # the machine at any moment, so emitting it unanchored would put a context
+    # block under "hello" and turn every line of talk into a briefing.
+    r.equal("bare talk is returned exactly as typed",
+            intake.brief("hello"), "hello")
+    # A pipeline name in a question is still parsed and reported -- that is
+    # brief()'s existing job and not what this section is about. What must be
+    # absent without a workdir is the LOCATION block.
+    asked = intake.brief("what does rnaseq_light do?")
+    r.contains("a named pipeline is still reported", asked, "rnaseq_light")
+    for absent in ("run output directory", "Where this session is", "cluster:"):
+        r.check(f"but {absent!r} is not", absent not in asked, asked)
+finally:
+    shutil.rmtree(_yard, ignore_errors=True)
+
 sys.exit(r.finish())

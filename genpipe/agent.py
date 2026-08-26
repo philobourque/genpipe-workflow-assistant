@@ -785,6 +785,10 @@ class GenpipeA1(A1):
     # -- _drive() clears it at the top of every turn, and the answer before any
     # turn has started is "no". See submission_gate.
     _submitted_this_turn = False
+    # Whether this turn ran a `genpipes ... -g` block. Read by cli._talk after
+    # the graph stops, to tell a turn that did real work and produced no run
+    # from one that was only ever talk. Per-turn, cleared in _drive.
+    _generated_this_turn = False
 
     # Runs the model examined this turn, declared on the class so the gate can
     # read it on a graph that has never been driven. See _drive, which clears
@@ -928,6 +932,14 @@ class GenpipeA1(A1):
                 # reach it.
                 if code and gate.capability_request(code, self._capability_names()):
                     return "capability"
+                # Recorded on the way past, not acted on. A generation is
+                # ungated and stays ungated; this only remembers that the turn
+                # ran one, so that ending without a gate can be reported rather
+                # than being the silence it was. Set before execution, so a
+                # generation that FAILED still counts -- a turn that tried and
+                # produced no run is exactly the case worth saying out loud.
+                if code and gate.is_generation(code):
+                    self._generated_this_turn = True
                 return "execute"
             if next_step in ("generate", "end"):
                 return next_step
@@ -2078,6 +2090,7 @@ something you can do, do it rather than telling them what to type.
         would silently disarm the gate for the rest of the session.
         """
         self._submitted_this_turn = False
+        self._generated_this_turn = False
         self._gate_returns = 0
         self._capability_calls = 0
         # Which existing runs this turn has looked at. See _run_capability: a
