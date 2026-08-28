@@ -22,30 +22,87 @@ teaches the model GenPipes' invocation shape, config layering, and file formats.
 
 ## Prerequisites
 
-- An account on a cluster with GenPipes installed as a module (this was built against GenPipes
-  v6.1.1 on Rorqual — see the note on cluster-specificity below).
-- Python 3.12+.
-- An API key for an LLM provider. This tool is built and tested against Claude (Anthropic), but
-  the first-launch prompt also recognizes OpenAI, Gemini, and Groq keys. OpenAI/Gemini/Groq need
-  `langchain-openai` installed too (`pip install langchain-openai`) — only `langchain-anthropic` is
-  in `requirements.txt` by default.
+This runs on a cluster, not on a laptop. The commands the agent generates are GenPipes commands,
+loaded from a module tree; `start_agent.sh` checks for that environment and stops with a specific
+error rather than starting without it.
+
+- **A cluster with Lmod and GenPipes installed as modules.** Built and tested against GenPipes
+  v6.1.1 on the Digital Research Alliance of Canada's Rorqual — see the note on
+  cluster-specificity below.
+- **Python 3.12.** `start_agent.sh` loads `python/3.12.4`, and 3.12 is the only version the test
+  suites run on (CI included). Newer versions are untested here rather than known-broken.
+- **An API key for an LLM provider.** Built and tested against Claude (Anthropic); the first-launch
+  prompt also recognizes OpenAI, Gemini and Groq keys. Nothing extra to install per provider —
+  `requirements.txt` already carries what all four need.
+
+### The GenPipes environment
+
+The agent does not load GenPipes at launch. Every command it generates carries its own
+`module load mugqic/genpipes/6.1.1 && …` prefix, in its own subshell — that boundary is part of the
+grammar it is given (`genpipe/genpipes.md`). What your login shell has to supply is the module tree
+those commands load from, plus the two variables GenPipes interpolates straight into every `sbatch`
+line without ever validating them.
+
+In your `~/.bash_profile`, with **your own** allocation and address substituted in:
+
+```bash
+export MUGQIC_INSTALL_HOME=/cvmfs/soft.mugqic/CentOS6
+module use $MUGQIC_INSTALL_HOME/modulefiles
+
+export RAP_ID=rrg-yourgroup-ab        # your own Alliance allocation
+export JOB_MAIL=you@example.com       # your own address for job notifications
+```
+
+What each of those is for, and what happens without it — note that the last one is graded
+differently on purpose (`genpipe/preflight.py`):
+
+| What | Status | Why |
+|---|---|---|
+| `MUGQIC_INSTALL_HOME` + `module use` | **required** | without them `module load mugqic/genpipes/6.1.1` resolves to nothing and every generated command dies on its first token |
+| `RAP_ID` | **required** | the cluster ini puts `-A $RAP_ID` on every job, so an unset one has Slurm reject the entire run *after* you approved it. The agent checks at startup and at the gate, and **refuses to offer approval** without it |
+| `JOB_MAIL` | optional | addresses notification mail and nothing else. Missing or misspelled, it is a warning that never blocks a submission |
+
+Loading `mugqic/genpipes` from your profile is normal and fine, but be aware it exports a
+`PYTHONPATH` pointing at GenPipes' own Python 3.13 standard library. `start_agent.sh` unsets that
+before activating the 3.12 venv; if you ever run `python -m genpipe` by hand, do the same.
 
 ## Setup
 
 ```bash
 git clone https://github.com/philobourque/genpipe-workflow-assistant
 cd genpipe-workflow-assistant
-
-module load python/3.12.4      # or whatever gives you Python 3.12+ on your cluster
-python -m venv ~/scratch/biomni-venv
-source ~/scratch/biomni-venv/bin/activate
-pip install -r requirements.txt
+./start_agent.sh
 ```
 
-`start_agent.sh` assumes the venv lives at `~/scratch/biomni-venv`. If you put it somewhere else,
-edit the `source` line in `start_agent.sh` to match.
+That is the whole install — **there is no separate `pip install` step, and nothing inside
+`start_agent.sh` needs editing.** On its first launch it loads `python/3.12.4`, creates a virtual
+environment, installs `requirements.txt` into it, and says so while it happens:
 
-No API key setup needed here — the first launch asks for it.
+```
+  Setting up the environment. This happens once per cluster.
+  /home/you/scratch/biomni-venv
+```
+
+Every launch after that takes the fast path and prints nothing. It also re-installs by itself if a
+`requirements.txt` change ever leaves the venv behind.
+
+The venv defaults to `~/scratch/biomni-venv`. On the Alliance `~/scratch` is **cluster-local** — it
+is not shared between Rorqual, Narval, Béluga and Cedar — so this is genuinely once per cluster
+rather than once per account. Set `GENPIPE_VENV` to put it somewhere else, on a cluster where
+`~/scratch` is not the right place or is not writable:
+
+```bash
+GENPIPE_VENV=$HOME/projects/def-yourgroup/$USER/biomni-venv ./start_agent.sh
+```
+
+### Where you launch it from matters
+
+`start_agent.sh` does not change directory, and that is deliberate: **the directory you launch from
+is the run's output directory.** GenPipes writes `job_output/`, `trim/`, `alignment/` and the rest
+there, and it is where the agent looks for a run's job list afterwards. So launch it from the
+directory the run belongs in, not from the checkout — a run started somewhere else has to be
+adopted with `/track` before `/check` can find it. `/where` prints every path the current session
+is actually using.
 
 ## Launch
 
@@ -57,8 +114,15 @@ The banner prints first — who you are, which model is behind it, where this co
 key is configured yet you're then prompted below it to paste one in (masked, with the first four
 characters left visible so you can tell the paste landed). The provider is guessed from the key's
 shape (Anthropic/OpenAI/Gemini/Groq), or asked for if it isn't recognized. It's saved to a
-gitignored `.env` in the repo root along with which provider/model it's for, so every launch after
-that starts straight away with no prompt.
+gitignored `.env` in the repo root (mode `0600`) along with which provider/model it's for, so every
+launch after that starts straight away with no prompt. A key pasted here is checked against the
+provider once, immediately, so a typo or an expired key is reported at the prompt that caused it
+rather than from inside the agent a turn later.
+
+The key never has to go anywhere near the source. If you'd rather set one up non-interactively —
+or want to see every variable the app reads — copy [`.env.example`](.env.example) to `.env` and fill
+it in; it documents the API-key variables, `GENPIPE_AGENT_WORKDIR`, `GENPIPE_THEME` and the dev-mode
+switches. `/key` adds or rotates a key later without a restart.
 
 This drops you into the assistant's own interface, with the GenPipes grammar already loaded — not a
 Python interpreter. You get a prompt box:

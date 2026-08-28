@@ -1,12 +1,61 @@
 #!/bin/bash
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---------------------------------------------------------------------------
+# The supported environment, checked rather than assumed.
+#
+# This app runs on a cluster with Lmod and GenPipes available as modules. That
+# is not incidental: the model's own commands are `module load
+# mugqic/genpipes/6.1.1 && genpipes ...` (see genpipe/genpipes.md), so a machine
+# with no module system cannot run this even if the Python half installs
+# perfectly. Both checks below therefore STOP rather than continue.
+#
+# What they replace reported the wrong cause. `module` missing wrote
+# "module: command not found" to the terminal and the script carried on; the
+# venv step then failed on the next line with
+#
+#   ./start_agent.sh: line 41: python: command not found
+#   Could not create a virtual environment at $VENV.
+#   Set GENPIPE_VENV to somewhere writable and try again.
+#
+# -- a true sentence about a directory that was never the problem, pointing at
+# a variable that could not have fixed it. An accurate error costs six lines.
+# ---------------------------------------------------------------------------
+if ! command -v module >/dev/null 2>&1; then
+  echo "  No 'module' command here, so the GenPipes environment cannot be loaded." >&2
+  echo "  This assistant runs on a cluster with Lmod and GenPipes installed as" >&2
+  echo "  modules -- it was built against GenPipes 6.1.1 on the Alliance's" >&2
+  echo "  Rorqual. Log in to such a cluster and run it from there." >&2
+  exit 1
+fi
+
 # module purge complains about sticky modules it deliberately leaves loaded
 # (StdEnv and friends) -- expected every time, not something a user of this
 # tool can act on, so it's silenced here rather than left to look like an error.
 module purge >/dev/null 2>&1
-module load python/3.12.4
+# NOT silenced, unlike the purge: Lmod's own message names the module it could
+# not find, which is the half of the diagnosis this script cannot write itself.
+if ! module load python/3.12.4; then
+  echo >&2
+  echo "  Could not load python/3.12.4, which this app is built and tested on." >&2
+  echo "  See what this cluster offers with:  module spider python" >&2
+  echo "  If 3.12.4 is genuinely unavailable here, edit the 'module load' line" >&2
+  echo "  in start_agent.sh -- but 3.12 is the only version the suites run on." >&2
+  exit 1
+fi
 unset PYTHONPATH
+
+# Belt and braces: `module load` can return 0 and still leave no interpreter on
+# PATH (a modulefile that resolved but whose install is broken or unreadable).
+# The venv is built by name below, so an absent `python` has to be caught here
+# or it resurfaces as the writability error this block exists to stop telling.
+if ! command -v python >/dev/null 2>&1; then
+  echo "  python/3.12.4 loaded but put no 'python' on PATH." >&2
+  echo "  The module is present and its interpreter is not; this is a problem" >&2
+  echo "  with the cluster's module rather than with this app. Report it to" >&2
+  echo "  your support desk, quoting:  module load python/3.12.4 && which python" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # The virtual environment, created on first launch rather than assumed.
