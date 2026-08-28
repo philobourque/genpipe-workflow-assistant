@@ -26,9 +26,11 @@ This runs on a cluster, not on a laptop. The commands the agent generates are Ge
 loaded from a module tree; `start_agent.sh` checks for that environment and stops with a specific
 error rather than starting without it.
 
-- **A cluster with Lmod and GenPipes installed as modules.** Built and tested against GenPipes
-  v6.1.1 on the Digital Research Alliance of Canada's Rorqual — see the note on
-  cluster-specificity below.
+- **A cluster with Lmod and GenPipes installed as modules.** **Rorqual**, on the Digital Research
+  Alliance of Canada, is the validated reference environment, with GenPipes v6.1.1. The code reads
+  which cluster it is on from `hostname` rather than assuming one, so other Alliance clusters are
+  expected to work — but Rorqual is the only one validated end to end, and that is the environment
+  these instructions describe. See the note on cluster-specificity below.
 - **Python 3.12.** `start_agent.sh` loads `python/3.12.4`, and 3.12 is the only version the test
   suites run on (CI included). Newer versions are untested here rather than known-broken.
 - **An API key for an LLM provider.** Built and tested against Claude (Anthropic); the first-launch
@@ -49,7 +51,7 @@ In your `~/.bash_profile`, with **your own** allocation and address substituted 
 export MUGQIC_INSTALL_HOME=/cvmfs/soft.mugqic/CentOS6
 module use $MUGQIC_INSTALL_HOME/modulefiles
 
-export RAP_ID=rrg-yourgroup-ab        # your own Alliance allocation
+export RAP_ID=YOUR_ALLOCATION_ID      # e.g. rrg-yourgroup-ab — see below
 export JOB_MAIL=you@example.com       # your own address for job notifications
 ```
 
@@ -59,8 +61,23 @@ differently on purpose (`genpipe/preflight.py`):
 | What | Status | Why |
 |---|---|---|
 | `MUGQIC_INSTALL_HOME` + `module use` | **required** | without them `module load mugqic/genpipes/6.1.1` resolves to nothing and every generated command dies on its first token |
-| `RAP_ID` | **required** | the cluster ini puts `-A $RAP_ID` on every job, so an unset one has Slurm reject the entire run *after* you approved it. The agent checks at startup and at the gate, and **refuses to offer approval** without it |
+| `RAP_ID` | **required to submit** | the cluster ini puts `-A $RAP_ID` on every job, so an unset one has Slurm reject the entire run *after* you approved it. The agent checks at startup and again at the gate, and **refuses to offer approval** without it |
 | `JOB_MAIL` | optional | addresses notification mail and nothing else. Missing or misspelled, it is a warning that never blocks a submission |
+
+**If you don't have a `RAP_ID` yet.** It is your Digital Alliance *allocation* — the accounting
+code your jobs are billed to, the same string you would pass to `sbatch --account`. Every Alliance
+account has at least a default one, named `def-<pi>`; a group with an awarded allocation also has
+an `rrg-` or `rpp-` one. Find yours under your account's resources in
+[CCDB](https://ccdb.alliancecan.ca/), or in the output of `sacctmgr show associations user=$USER`.
+Background on how it is used is in the Alliance's
+[Running jobs](https://docs.alliancecan.ca/wiki/Running_jobs) guide; GenPipes' own environment
+setup is documented at [genpipes.readthedocs.io](https://genpipes.readthedocs.io/).
+
+**The assistant still opens without it.** You can launch, talk to it, ask questions, build a run
+and take it all the way to the approval gate. What you cannot do is submit: the gate reports
+`cannot submit` and withholds approval rather than sending jobs that Slurm would reject. So an
+unset `RAP_ID` costs you nothing except the last step — set it in `~/.bash_profile`, start a new
+shell, and the block clears on the next launch.
 
 Loading `mugqic/genpipes` from your profile is normal and fine, but be aware it exports a
 `PYTHONPATH` pointing at GenPipes' own Python 3.13 standard library. `start_agent.sh` unsets that
@@ -453,9 +470,13 @@ layering rule, the protocol-to-feature-ini mapping (which exists nowhere on the 
 `--help`, not in the shipped READMEs, not in the inis themselves), generate-versus-submit, the file
 formats, and how to read a failure.
 
-It is pinned to GenPipes v6.1.1 and to Rorqual's cluster ini (`common_ini/rorqual.ini`). On a
-different DRAC cluster or GenPipes version it needs updating; it is not cluster- or
-version-agnostic by design.
+It is pinned to GenPipes **v6.1.1** — `module load mugqic/genpipes/6.1.1` appears in it literally,
+and on a different GenPipes version it needs updating. It is **not** pinned to a single cluster: it
+names the cluster ini as `common_ini/<cluster>.ini` and tells the model to take it from `hostname`
+rather than from memory, and `build_agent()` resolves that at startup and states the answer as a
+fact — or, off a login node it does not recognise, tells the model to ask before generating
+anything that submits. The document itself was written against Rorqual and Narval; Rorqual is the
+environment validated end to end.
 
 When the tripwire trips, the answer is to split into `skills/` — one always-loaded core plus
 per-pipeline files loaded on demand — not to raise the number.

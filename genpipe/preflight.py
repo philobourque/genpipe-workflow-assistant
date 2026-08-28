@@ -106,7 +106,7 @@ def check_rap_id(value):
             "RAP_ID", BLOCK,
             "not set -- every job would be submitted with an empty -A and "
             "rejected by the scheduler",
-            "export RAP_ID=rrg-yourgroup-ab",
+            "export RAP_ID=YOUR_ALLOCATION_ID   # e.g. rrg-yourgroup-ab",
         )
     value = value.strip()
     if not _RAP_PATTERN.match(value):
@@ -114,7 +114,7 @@ def check_rap_id(value):
             "RAP_ID", BLOCK,
             f"{value!r} is not an allocation name -- expected one starting "
             "rrg-, def-, ctb- or rpp-",
-            "export RAP_ID=rrg-yourgroup-ab",
+            "export RAP_ID=YOUR_ALLOCATION_ID   # e.g. rrg-yourgroup-ab",
         )
     return None
 
