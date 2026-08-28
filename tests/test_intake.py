@@ -831,7 +831,32 @@ try:
         with open(os.path.join(_yard, _name), "w") as _f:
             _f.write(_head)
 
-    said = intake.brief("run rnaseq stringtie steps 1-5", workdir=_yard)
+    # THE MACHINE IS STATED, NOT INHERITED. preflight.cluster() resolves this
+    # host's name, so the two cluster facts below exist on an Alliance login
+    # node and correctly do not exist anywhere else. Asserting on whatever the
+    # host happened to answer made this suite pass on Rorqual and fail on every
+    # runner it ever ran on -- and the offline tier is precisely the one that
+    # has to run anywhere, with no cluster (.github/workflows/tests.yml).
+    #
+    # GENPIPE_CLUSTER is the override preflight already reads, so both states
+    # are reachable through it and neither assertion is weakened: the
+    # on-cluster case still demands both lines by name, the off-cluster case
+    # still demands their absence. It is restored however the call ends, so it
+    # cannot leak into a later section or a later suite.
+    _ambient_cluster = os.environ.get("GENPIPE_CLUSTER")
+
+    def _briefed_as(machine):
+        """The same brief, as if this machine were `machine`."""
+        os.environ["GENPIPE_CLUSTER"] = machine
+        try:
+            return intake.brief("run rnaseq stringtie steps 1-5", workdir=_yard)
+        finally:
+            if _ambient_cluster is None:
+                os.environ.pop("GENPIPE_CLUSTER", None)
+            else:
+                os.environ["GENPIPE_CLUSTER"] = _ambient_cluster
+
+    said = _briefed_as("rorqual")
     r.contains("the run output directory is stated", said, _yard)
     r.contains("and labelled as where output lands", said,
                "run output directory")
@@ -853,8 +878,21 @@ try:
     r.section("...and the facts stop where /where's business begins")
     # Three facts, each a token in the command being written or deciding its
     # content. The rest of /where's rows change nothing the model writes.
-    r.contains("the cluster is briefed", said, "cluster:")
-    r.contains("and its ini, which lands on -c", said, "cluster ini:")
+    r.contains("the cluster is briefed", said, "cluster: rorqual")
+    r.contains("and its ini, which lands on -c", said,
+               "cluster ini: rorqual.ini")
+
+    # The other half, and it is the half a runner actually exercises: off a
+    # recognised login node those two facts do not exist, and brief() omits
+    # them rather than inventing a cluster or failing. Same function, same
+    # yard, one different machine -- so the omission is asserted deliberately
+    # instead of being proved by accident on a host that has no cluster.
+    elsewhere = _briefed_as("not-an-alliance-login-node")
+    r.contains("off-cluster, the output directory is still stated",
+               elsewhere, _yard)
+    for gone in ("cluster:", "cluster ini:"):
+        r.check(f"but {gone!r} is not briefed off-cluster",
+                gone not in elsewhere, elsewhere)
     for unwanted in ("agent workdir", "run registry", "checkpoints",
                      "settings", "this copy"):
         r.check(f"{unwanted!r} is not briefed", unwanted not in said, said)
