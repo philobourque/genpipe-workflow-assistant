@@ -48,6 +48,44 @@ MUST_GATE = [
     # Generated and submitted in one block: the generation is fine, the last
     # line is not, and the block as a whole has to be held.
     "genpipes rnaseq -t stringtie -s 1-5 -g cmd.sh\nbash cmd.sh",
+
+    # ---------------------------------------------------------------- #
+    # DIRECT SLURM. The GenPipes patterns above cover the path the grammar
+    # teaches; these cover the scheduler's own submitters, which the grammar
+    # does not mention and therefore used to reach the interpreter untouched.
+    # A grammar is an instruction to a model, not an enforcement.
+    #
+    # All three spend an allocation: sbatch queues a job, salloc creates an
+    # interactive allocation, srun allocates and runs.
+    "sbatch job.sh",
+    "sbatch cmd.sh",
+    "sbatch --account=my-project job.sh",
+    "sbatch -A my-project job.sh",
+    "sbatch --wrap='echo hi'",
+    "srun hostname",
+    "srun --time=00:05:00 hostname",
+    "srun -n 4 ./a.out",
+    # No arguments at all, which is a valid interactive allocation and the one
+    # form with nothing after the verb to match on.
+    "salloc",
+    "salloc --account=my-project",
+    # Indented, and after every shell operator that starts a command.
+    "  sbatch cmd.sh",
+    "cd /scratch/me && sbatch job.sh",
+    "module load mugqic/genpipes/6.1.1 && srun -n 4 ./a.out",
+    "echo starting; sbatch job.sh",
+    "$(sbatch job.sh)",
+    # A loop is how one line becomes two hundred jobs, so the keyword after the
+    # separator must not hide the verb behind it.
+    "for f in *.sh; do sbatch $f; done",
+    "ls *.sh | xargs -n1 sbatch",
+    "nohup sbatch job.sh &",
+    "time srun hostname",
+    # Second line of a block: the generation is free, the submission is not.
+    "genpipes rnaseq -t stringtie -s 1-5 -g cmd.sh\nsbatch cmd.sh",
+    # Buried in python, for the same reason the bash cases above are.
+    'subprocess.run("sbatch cmd.sh", shell=True)',
+    'os.system("srun -n 4 ./a.out")',
 ]
 
 # Code that must flow through untouched. Anything that stops here makes the tool
@@ -79,6 +117,58 @@ MUST_NOT_GATE = [
     # A heredoc body is text being written to a file, not code being run. This
     # is how cmd.sh gets created in the first place.
     "cat > cmd.sh << 'EOF'\n#!/bin/bash\nbash inner.sh\nEOF\nchmod +x cmd.sh",
+    # ---------------------------------------------------------------- #
+    # SCHEDULER OBSERVATION. The boundary this file exists to draw, stated as
+    # plainly as it can be:
+    #
+    #     submitting to Slurm or allocating from it  ->  GATED
+    #     asking Slurm what is already there         ->  FREE
+    #
+    # Everything below asks. Gating any of it would make the tool unable to
+    # report on the runs it submitted, which is half of what it is for.
+    "squeue",
+    "squeue -u $USER --format=%i,%T",
+    "sacct",
+    "sacct -j 123",
+    "sacct -j 41000001 --format=JobID,State,ExitCode",
+    "scontrol show job 123",
+    "sinfo -p cpubase_bycore_b1",
+    # Cancelling and holding REMOVE or PAUSE work that was already approved.
+    # They cannot put anything on the scheduler, and /cancel and /hold call
+    # them deterministically without ever consulting this function.
+    "scancel 41000001",
+    "scontrol hold 41000001",
+    "scontrol release 41000001",
+
+    # ---------------------------------------------------------------- #
+    # THE WORD, WITHOUT THE COMMAND. Every one of these is a model looking at a
+    # script or a log that CONTAINS the word sbatch -- which is exactly what a
+    # generated GenPipes script is full of, and exactly what it reads while
+    # working out why a run failed. Matching a bare \bsbatch\b would catch all
+    # of them and reproduce the 2026-07-13 deadlock: the gate fires on a block
+    # that submits nothing, rejecting it produces another one, and the turn
+    # cannot end. This is why the pattern requires command position.
+    "grep sbatch cmd.sh",
+    "grep -c sbatch job_output/x.o",
+    "grep -n 'sbatch' cmd.sh",
+    "awk '/sbatch/{print}' cmd.sh",
+    "ls *.sh | xargs grep sbatch",
+    "scontrol show job 123 | grep sbatch",
+    # ...and as part of a filename, which is not the verb either.
+    "cat sbatch_notes.txt",
+    "ls srun_logs/",
+    "wc -l salloc.log",
+    "head -20 slurm-41000001.out",
+    # Talking about it, in both languages, as with bash above.
+    'echo "sbatch cmd.sh"',
+    'print("To submit: sbatch cmd.sh")',
+    "# sbatch cmd.sh",
+    "genpipes rnaseq -g cmd.sh   # then: sbatch cmd.sh",
+    # The generated script is WRITTEN here, not run. A GenPipes cmd.sh is
+    # nothing but sbatch lines, so this must stay free or nothing can be
+    # generated at all.
+    "cat > cmd.sh << 'EOF'\n#!/bin/bash\nsbatch step1.sh\nsbatch step2.sh\nEOF",
+
     # Nothing at all.
     "",
 ]

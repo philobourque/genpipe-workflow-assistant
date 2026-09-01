@@ -6,11 +6,12 @@ Two layers, deliberately separated:
                      Knows nothing about terminals, colours, or printing.
   render(message) -> parses, then prints to the terminal with ANSI colours.
 
-The separation is the point. If a web interface is built later it imports
-parse(), gets the same dicts, and writes its own renderer; the logic that
-understands what an agent message contains is not written twice. Nothing here is
-load-bearing: if this module breaks, run() can fall back to Biomni's
-pretty_print and lose only appearance, never behaviour.
+The separation is the point, and it is about testability rather than about
+some future second front end -- there is not going to be one; the terminal is
+the interface (see the README). parse() is what lets every renderer in here be
+asserted on without a terminal, which is why test_display can cover the whole
+surface offline. Nothing here is load-bearing: if this module breaks, run() can
+fall back to Biomni's pretty_print and lose only appearance, never behaviour.
 
 What is shown, and what is folded away
 --------------------------------------
@@ -656,7 +657,9 @@ def _left_column(user, source, model, path, returning=True):
 # description that begins at a different offset per row reads as two lists
 # rather than one.
 _CMD_W = 13
-_META_W = 9
+# Wide enough for the longest metadata label ("Working in") plus a space, so the
+# three values still line up in one column.
+_META_W = 12
 
 
 def _right_column(w, source=None, model=None, path=None):
@@ -725,11 +728,22 @@ def _right_column(w, source=None, model=None, path=None):
     lines.append("")
     lines.append(f"{DIM}{chr(0x2500) * w}{RESET}")
     lines.append("")
-    # Both read from what this session settled on, never hardcoded. On a first
-    # launch there is no key yet and no model chosen, and saying so is the
+    # All three read from what this session settled on, never hardcoded. On a
+    # first launch there is no key yet and no model chosen, and saying so is the
     # honest answer rather than naming a default nobody picked.
+    #
+    # "Working in" is the load-bearing row and it is new; the checkout used to
+    # be labelled "Project" and was the only directory on this screen. That was
+    # the wrong one to show and the wrong name for it. The directory a GenPipes
+    # run is WRITTEN INTO is the one you launched from -- job_output/, trim/,
+    # alignment/ and the job list all land there, and a run started somewhere
+    # unexpected has to be adopted with /track before /check can find it. So the
+    # banner named the one directory that decides nothing "Project", on the
+    # screen somebody reads once, while the one that decides everything was
+    # visible only from /where.
     for label, value in (("Model", model or "not configured yet"),
-                         ("Project", _tilde(path or ""))):
+                         ("Working in", _tilde(os.getcwd())),
+                         ("This copy", _tilde(path or ""))):
         lines.append(f"{DIM}{label}{RESET}"
                      f"{' ' * max(1, _META_W - len(label))}{GREY}{value}{RESET}")
     # The approval promise used to close this screen. It says more where it is
@@ -984,7 +998,14 @@ def _code_label(code):
         return "GENERATE"
     if (re.search(r"\b(?:bash|sh)\s+\S+\.sh\b", low)
             or "chunk_genpipes" in low or "submit_genpipes" in low
-            or re.search(r"\bsbatch\b", low)):
+            # srun and salloc join sbatch here because the gate now holds all
+            # three (gate._SLURM_SUBMITTERS). A block the gate stops has to be
+            # painted as the submission it is -- labelling a held salloc "CODE"
+            # would draw the one box in the product where consequences matter in
+            # the colour used for a directory listing. This is a looser match
+            # than the gate's on purpose: mislabelling here costs a word, and
+            # the docstring above says the conservative direction is SUBMIT.
+            or re.search(r"\b(?:sbatch|srun|salloc)\b", low)):
         return "SUBMIT"
     if (re.search(r"\b(?:squeue|sacct|sinfo|scontrol|scancel)\b", low)
             or "log_report" in low):
@@ -1354,8 +1375,9 @@ def _clipped(text, head=10, tail=4):
 
 # Whether the caller draws the person's own turns itself. The CLI sets this,
 # because it needs the echo to land before anything else it prints about that
-# line. Off by default so a different front end (web/server.py) still gets the
-# turn drawn for it by render().
+# line -- "Preparing run..." above the sentence that caused it reads backwards.
+# Off by default so a caller that does NOT echo still gets the turn drawn for it
+# by render(), which is what the renderer suites exercise.
 ECHOED = False
 
 

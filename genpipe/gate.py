@@ -53,6 +53,46 @@ from . import slots
 # failure.
 REJECTION_MARK = "did not approve"
 
+# ---------------------------------------------------------------------------
+# DIRECT SLURM, in command position.
+#
+# The four GenPipes patterns below cover the path the grammar teaches. They did
+# not cover the scheduler's own submitters, so `sbatch cmd.sh` -- no GenPipes
+# verb anywhere in it -- routed straight to the interpreter and put jobs on the
+# cluster with no gate and no approval. The grammar is what kept that from
+# happening in practice, and a grammar is an instruction to a model rather than
+# an enforcement: fakecluster.py stubs sbatch precisely BECAUSE a model reaching
+# for it directly is a thing that happens.
+#
+# All three of these spend an allocation. sbatch queues a batch job; salloc
+# creates an interactive allocation; srun standalone allocates and runs. The
+# read-only half of Slurm -- squeue, sacct, sinfo, scontrol show -- is
+# deliberately absent, and so are scancel and scontrol hold/release, which
+# remove or pause work that was already approved.
+#
+# WHY COMMAND POSITION AND NOT A BARE WORD. `\bsbatch\b` would also match
+# `grep sbatch cmd.sh` and `wc -l salloc.log` -- inspection commands a model
+# runs constantly while explaining a script it just generated. Gating those
+# reproduces the 2026-07-13 deadlock exactly: the gate fires on a block that
+# submits nothing, rejecting it produces another one, and the turn cannot end.
+# So the match requires the word to be where a COMMAND goes: at the start of a
+# line, or after a shell operator (`;` `&&` `||` `|` `(` backtick), optionally
+# behind a loop keyword or a wrapper that runs its argument.
+#
+# `-{1,2}\S+` in the prefix is what lets `xargs -n1 sbatch` through to the
+# match while `xargs grep sbatch` stays out: only flags may sit between a
+# recognised wrapper and the submitter, never another command.
+# The optional quote is what catches `subprocess.run("sbatch cmd.sh",
+# shell=True)` and `os.system("srun x")` -- the same python-shaped submission
+# the bash pattern above is already asserted against. It is allowed ONLY
+# immediately after a shell operator or a line start, which is the shape of a
+# call's opening bracket and is NOT the shape of `grep -n 'sbatch' cmd.sh`,
+# where the quote follows a space. That distinction is the whole reason the
+# quote is here rather than in the general character class.
+_SLURM_HEAD = r"(?:^|[;&|(`])\s*['\"]?\s*"
+_SLURM_PREFIX = r"(?:(?:do|then|else|nohup|time|xargs|env)\s+|-{1,2}\S+\s+|\d+\s+)*"
+_SLURM_SUBMITTERS = r"(?:sbatch|srun|salloc)\b"
+
 # Text that means "this really submits". Searched against executable_lines(),
 # never the raw block -- see that function for why.
 _SUBMIT_PATTERNS = [
@@ -60,6 +100,10 @@ _SUBMIT_PATTERNS = [
     r"\b(?:bash|sh)\s+\S+\.sh\b",   # bash <script>.sh -- any generated submission script
     r"\bsubmit_genpipes\b",         # DRAC submit
     r"\bchunk_genpipes\.sh\b",      # DRAC chunk (precedes submit)
+    # (?m) so ^ means "start of a line" rather than "start of the block": a
+    # submission on the second line of a block is still a submission. Scoped
+    # inline to this pattern so the four above keep matching exactly as they did.
+    r"(?m)" + _SLURM_HEAD + _SLURM_PREFIX + _SLURM_SUBMITTERS,
 ]
 
 # propose_submission("cmd.sh") is what the prompt tells the model to write when

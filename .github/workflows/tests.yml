@@ -152,6 +152,15 @@ jobs:
         # fails here rather than on somebody's laptop three weeks later.
         run: python tests/test_theme.py
 
+      - name: The launch contract
+        # start_agent.sh read as text. The install path is the one thing no
+        # other suite touches -- bash is imported by nothing in genpipe/ and
+        # every app-level suite starts below the launcher -- so a `cd` added for
+        # convenience, a path left behind from debugging on one account, or an
+        # override the README documents and the script never reads would all go
+        # unnoticed until somebody else cloned it.
+        run: python tests/test_launcher.py
+
       - name: The settings file, read by the app that writes it
         # The regression for a .env the app wrote and never read. Also the
         # allow-list: a plain text file loaded at startup with no supervision

@@ -2,11 +2,12 @@
 activity indicator shown while a run is working.
 
 Split from display.py deliberately. display.py renders what the *agent* says --
-pure output, parseable, reusable by a web front end unchanged. This module is
-the other half: it owns the terminal *input* path, which is inherently
-POSIX-and-tty specific (raw mode, escape sequences, cursor arithmetic) and has
-no meaning at all outside a real terminal. Keeping them apart means neither one
-inherits the other's constraints.
+pure output, and parseable, so it can be asserted on with no terminal at all.
+This module is the other half: it owns the terminal *input* path, which is
+inherently POSIX-and-tty specific (raw mode, escape sequences, cursor
+arithmetic) and can only be tested through a pty. Keeping them apart means
+neither one inherits the other's constraints, and the half that can be checked
+cheaply is checked on every push.
 
 Everything here degrades rather than breaks. If stdin isn't a terminal (a pipe,
 a test harness, a CI run) the editor falls back to input() and the spinner

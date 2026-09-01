@@ -48,7 +48,7 @@ cd ~/scratch/demo-1 && ~/genpipe-workflow-assistant/start_agent.sh
 than the terminal it was set up on:
 
 ```bash
-GENPIPE_THEME=light ./start_agent.sh      # or dark
+GENPIPE_THEME=light ~/genpipe-workflow-assistant/start_agent.sh    # or dark
 ```
 or put `export GENPIPE_THEME=light` in `.env` once and forget it.
 

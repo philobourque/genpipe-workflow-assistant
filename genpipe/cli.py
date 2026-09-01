@@ -2791,6 +2791,14 @@ def _cmd_where(agent, args):
         ("settings", str(ENV_PATH),
          f"key, model and name · colours are {display.THEME} "
          f"(GENPIPE_THEME=light|dark)"),
+        # The fourth of the four locations the README names. It is not a path
+        # this process chooses -- start_agent.sh built it and activated it
+        # before Python existed -- so it is read back off the interpreter
+        # rather than recomputed from GENPIPE_VENV, which would report what
+        # somebody MEANT rather than what is actually running.
+        ("venv", os.environ.get("VIRTUAL_ENV") or os.path.dirname(
+            os.path.dirname(os.path.abspath(sys.executable))),
+         "built once per cluster by start_agent.sh (GENPIPE_VENV)"),
         ("this copy", ROOT, ""),
     ])
 

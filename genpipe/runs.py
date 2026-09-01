@@ -3376,8 +3376,8 @@ def parse_log_report(raw):
     """Pull the per-state counts and timings out of log_report's text.
 
     Lives here rather than in display.py for the same reason display.parse()
-    exists: understanding what GenPipes said is not a rendering concern. A web
-    UI would want these numbers too, and a test can assert on them without a
+    exists: understanding what GenPipes said is not a rendering concern. Keeping
+    it out of the renderer is what lets a test assert on these numbers without a
     terminal.
 
     total is 0 when nothing recognisable was found, which the caller must treat

@@ -1043,7 +1043,13 @@ def main():
     # Model and project are read from the session, never hardcoded.
     r.contains("names the model in use", out, "claude-sonnet-5")
     r.contains("under a label", out, "Model")
-    r.contains("and the project directory", out, "Project")
+    # The load-bearing directory, and the checkout, under names that say which
+    # is which. It used to show the checkout alone, labelled "Project" -- the
+    # one directory on the screen that decides nothing about where a run lands.
+    r.contains("and the directory the run will be written into", out, "Working in")
+    r.contains("plus where this copy of the tool lives", out, "This copy")
+    r.check("and nothing calls the checkout the project any more",
+            "Project" not in out, out)
     other = drawn(display.banner, "Anthropic", "claude-opus-4-5")
     r.contains("a different model renders differently", other, "claude-opus-4-5")
     r.check("with no trace of the previous one",

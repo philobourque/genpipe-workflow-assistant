@@ -65,6 +65,13 @@ for c in [
     "chunk_genpipes.sh cmd.sh job_output -n 15",
     "submit_genpipes",
     "chunk_genpipes.sh script.sh && submit_genpipes",
+    # Direct Slurm, reached through GenpipeA1's own method rather than the
+    # module function -- the path the router actually takes.
+    "sbatch cmd.sh",
+    "sbatch --account=rrg-someone-ab job.sh",
+    "srun --time=00:05:00 hostname",
+    "salloc",
+    "for f in *.sh; do sbatch $f; done",
 ]:
     expect(c, gate._is_submission(c), True)
 
@@ -76,6 +83,13 @@ for c in [
     "ls /home/pbourque/scratch/rnaseq_tutorial",
     "cat cmd.sh",
     "module load mugqic/genpipes/6.1.1 && genpipes rnaseq -h",
+    # Asking Slurm what is already there, versus putting something there.
+    "sacct -j 41000001 --format=JobID,State",
+    "scontrol show job 41000001",
+    "scancel 41000001",
+    # The word without the command: reading a generated script is how the
+    # agent explains one, and a GenPipes cmd.sh is nothing but sbatch lines.
+    "grep -n sbatch cmd.sh",
 ]:
     expect(c, gate._is_submission(c), False)
 
@@ -84,6 +98,10 @@ expect("generation -> execute",
        route(state_with("genpipes rnaseq -t stringtie -s 1-5 -g cmd.sh")), "execute")
 expect("bash cmd.sh -> gate", route(state_with("bash cmd.sh")), "gate")
 expect("submit_genpipes -> gate", route(state_with("submit_genpipes")), "gate")
+expect("sbatch cmd.sh -> gate", route(state_with("sbatch cmd.sh")), "gate")
+expect("srun hostname -> gate", route(state_with("srun hostname")), "gate")
+expect("salloc -> gate", route(state_with("salloc")), "gate")
+expect("sacct -> execute", route(state_with("sacct -j 1 --format=State")), "execute")
 
 print("\n=== D. _build_proposal slot parsing ===")
 cmd = ("module load mugqic/genpipes/6.1.1 && genpipes rnaseq -t stringtie "
